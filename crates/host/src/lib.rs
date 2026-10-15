@@ -10,9 +10,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 
+pub mod input_receiver;
 pub mod ipc;
 pub mod multi_display;
 
+pub use input_receiver::HostInputReceiver;
 pub use ipc::{
     daemon_pid_path, daemon_runtime_dir, daemon_socket_path, run_ipc_server, send_daemon_request,
     DaemonRequest, DaemonResponse,
@@ -177,7 +179,11 @@ where
                 }
             }
             PacketType::InputEvent => {
-                if let Ok(event) = bincode::deserialize(&packet.payload) {
+                if let Ok(batch) = linux_quest_protocol::InputBatch::decode(&packet.payload) {
+                    for event in batch.events {
+                        self.input.inject_event(event)?;
+                    }
+                } else if let Ok(event) = bincode::deserialize(&packet.payload) {
                     self.input.inject_event(event)?;
                 }
             }

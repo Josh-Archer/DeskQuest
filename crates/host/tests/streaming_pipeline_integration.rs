@@ -4,8 +4,8 @@ use linux_quest_encoder::{EncoderConfig, MockVideoEncoder};
 use linux_quest_host::HostStreamSession;
 use linux_quest_input::MockInputInjector;
 use linux_quest_protocol::{
-    ElementState, FrameReassembler, InputEvent, Packet, PacketHeader, PacketType, VideoChunk,
-    VideoCodec,
+    ElementState, FrameReassembler, InputEvent, KeyModifiers, Packet, PacketHeader, PacketType,
+    VideoChunk, VideoCodec,
 };
 use linux_quest_transport::{LoopbackEndpoint, TransportEndpoint};
 
@@ -106,6 +106,7 @@ async fn test_bidirectional_control_and_input_flow() {
     let key_event = InputEvent::KeyboardKey {
         keycode: 30, // KEY_A
         state: ElementState::Pressed,
+        modifiers: KeyModifiers::empty(),
     };
     let key_payload = Bytes::from(bincode::serialize(&key_event).unwrap());
     let key_packet = Packet::new(

@@ -8,6 +8,7 @@ pub mod decoder;
 pub mod error;
 pub mod graphics;
 pub mod hud;
+pub mod input;
 pub mod openxr;
 pub mod receiver;
 pub mod runtime;
@@ -18,6 +19,11 @@ pub use decoder::{create_decoder, DecodedFrame, DecoderStats, HardwareVideoDecod
 pub use error::{ClientError, ClientResult};
 pub use graphics::{ImageLayoutTransition, SwapchainTexture, VulkanContext};
 pub use hud::{DebugHud, HudSnapshot};
+pub use input::{
+    android_keycode_to_evdev, android_meta_to_modifiers, AndroidKeyEvent, AndroidMotionEvent,
+    CapturedEvent, ClientInputCapture, ControllerInputEvent, InputSource, MockInputSource,
+    MouseCoalescer,
+};
 pub use openxr::{
     build_cylinder_layer, build_cylinder_layer_from_transform, build_hud_layer,
     build_passthrough_layer, build_quad_layer, build_quad_layer_from_transform,
