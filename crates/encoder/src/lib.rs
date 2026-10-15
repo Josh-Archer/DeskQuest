@@ -1,9 +1,16 @@
+pub mod audio;
 pub mod nvenc;
+pub mod opus;
 
 use async_trait::async_trait;
+pub use audio::{
+    AudioApplication, AudioEncoder, AudioEncoderConfig, AudioEncoderError, AutoAudioEncoder,
+    EncodedAudioFrame, MockAudioEncoder,
+};
 use linux_quest_capture::RawFrame;
 use linux_quest_protocol::{VideoChunk, VideoChunkMeta, VideoCodec};
 pub use nvenc::NvencEncoder;
+pub use opus::OpusAudioEncoder;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -294,5 +301,28 @@ mod tests {
 
         let encoded = auto.encode(&raw).await.expect("Encode failed");
         assert!(!encoded.chunks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_auto_audio_encoder_pipeline() {
+        let config = AudioEncoderConfig::default(); // 48kHz, stereo, 2.5ms (120 samples)
+        let mut auto = AutoAudioEncoder::new(config.clone());
+        auto.init(config)
+            .await
+            .expect("Auto audio encoder init failed");
+
+        let raw = linux_quest_capture::RawAudioFrame::new(
+            48000,
+            2,
+            linux_quest_capture::AudioSampleFormat::F32Le,
+            120,
+            10_000,
+            Bytes::from(vec![0u8; 120 * 2 * 4]),
+        );
+
+        let encoded = auto.encode(&raw).await.expect("Auto audio encode failed");
+        assert_eq!(encoded.frame_id, 1);
+        assert_eq!(encoded.pts_us, 10_000);
+        assert!(!encoded.data.is_empty());
     }
 }

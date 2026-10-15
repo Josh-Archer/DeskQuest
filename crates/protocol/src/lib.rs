@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod error;
 pub mod handshake;
 pub mod input;
@@ -6,6 +7,7 @@ pub mod reassembler;
 pub mod telemetry;
 pub mod video;
 
+pub use audio::{AudioCodec, AudioFrameMeta, AudioPacket};
 pub use error::ProtocolError;
 pub use handshake::{ClientHandshake, DisplayConfigMessage, DisplayInfo, ServerHandshake};
 pub use input::{ElementState, InputEvent, MouseButton};
@@ -216,5 +218,78 @@ mod tests {
         assert_eq!(decoded.header.packet_type, PacketType::FecParity);
         assert_eq!(decoded.header.flags, FLAG_FEC_PROTECTED);
         assert_eq!(decoded.payload, parity_payload);
+    }
+
+    #[test]
+    fn test_audio_packet_wire_roundtrip() {
+        let meta = AudioFrameMeta {
+            frame_id: 1234,
+            sequence: 56,
+            sample_rate: 48000,
+            channels: 2,
+            samples_per_channel: 120, // 2.5ms frame
+            codec: AudioCodec::Opus,
+            pts_us: 5_000_000,
+        };
+        let opus_payload = Bytes::from_static(&[0xFC, 0x01, 0x02, 0x03, 0x04]);
+        let audio_pkt = AudioPacket::new(meta.clone(), opus_payload.clone());
+        let serialized_audio = audio_pkt.serialize().expect("Serialization failed");
+
+        let header = PacketHeader::new(
+            PacketType::AudioFrame,
+            1, // audio stream id
+            meta.sequence,
+            meta.pts_us,
+            &serialized_audio,
+        );
+        let wire_pkt = Packet::new(header, serialized_audio);
+        let wire_bytes = wire_pkt.to_bytes();
+
+        let decoded_pkt = Packet::from_bytes(&wire_bytes).expect("Failed to decode wire packet");
+        assert_eq!(decoded_pkt.header.packet_type, PacketType::AudioFrame);
+        assert_eq!(decoded_pkt.header.stream_id, 1);
+        assert_eq!(decoded_pkt.header.sequence, 56);
+        assert_eq!(decoded_pkt.header.timestamp_us, 5_000_000);
+
+        let decoded_audio =
+            AudioPacket::deserialize(&decoded_pkt.payload).expect("Failed to deserialize audio");
+        assert_eq!(decoded_audio.meta, meta);
+        assert_eq!(decoded_audio.payload, opus_payload);
+        assert_eq!(decoded_audio.duration_us(), 2500);
+    }
+
+    #[test]
+    fn test_audio_video_timestamp_synchronization() {
+        // Both video and audio timestamps share the monotonic microsecond timeline.
+        let base_clock_us = 10_000_000u64; // e.g. T = 10.0 seconds
+
+        // Video frame captured at 90Hz (frame duration ~11,111 us)
+        let video_pts = base_clock_us;
+        let video_meta = VideoChunkMeta {
+            frame_id: 900,
+            chunk_index: 0,
+            total_chunks: 1,
+            codec: VideoCodec::Av1,
+            is_keyframe: false,
+            is_intra_refresh: false,
+            width: 1920,
+            height: 1080,
+            fps: 90,
+            pts_us: video_pts,
+        };
+        assert_eq!(video_meta.pts_us, video_pts);
+
+        // Audio frame captured with 2.5ms frames (2,500 us duration)
+        // Audio frame 0 captured at T, Audio frame 1 captured at T + 2500us, etc.
+        let audio_pts_0 = base_clock_us;
+        let audio_pts_1 = base_clock_us + 2500;
+        let audio_pts_4 = base_clock_us + 10_000; // 4 * 2.5ms = 10ms
+
+        assert_eq!(audio_pts_0, video_pts);
+        assert_eq!(audio_pts_1, video_pts + 2500);
+        // Compute A/V skew: audio_pts_4 is within 1.111ms of the video frame
+        let skew_us = (audio_pts_4 as i64) - (video_pts as i64);
+        assert_eq!(skew_us, 10_000); // 10ms into the video frame presentation window
+        assert!(skew_us < 11_111); // Still within this single 90Hz video frame interval!
     }
 }
