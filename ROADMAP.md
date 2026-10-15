@@ -157,7 +157,12 @@ This roadmap outlines the development trajectory of `linux-quest` from initial a
   - [x] Synchronized audio playback and jitter buffer integration on Quest client (`AudioReceiver` with adaptive jitter buffer keyed by sequence number, Opus decoding with PLC/FEC behind `AudioDecoder` trait, A/V presentation clock synchronization with drift correction by small resampling or drop/insert, and `AudioSink` trait with Android AAudio low-latency mode and mock sink).
 
 - **7.2 Host Management CLI & TUI**
-  - Lightweight terminal UI (using `ratatui`) showing real-time latency stats (capture, encode, network, decode), connected headsets, and virtual display toggles.
+  - [x] Lightweight terminal status dashboard (`ratatui` with crossterm backend via `dashboard` subcommand or `--tui` flag) showing:
+    - Active virtual displays with resolution, refresh rate, FPS, bitrate, and codec.
+    - Real-time glass-to-glass latency waterfall breakdown (Capture ➔ Encode ➔ Queue ➔ Transport ➔ Decode ➔ Render, plus audio pipeline) with budget gauges and sparklines.
+    - Connected client status (USB/ADB vs Wi-Fi, smoothed RTT, packet loss, and Reed-Solomon/XOR FEC recoveries).
+    - Audio stream telemetry (PipeWire capture, Opus low-delay codec, jitter, buffer delay, health, and PLC concealments).
+    - Pure decoupled state/model layer with rolling window aggregation and full `TestBackend` snapshot test coverage.
   - Simple tray icon / systemd service for headless background operation.
 
 - **7.3 Packaging & Distribution**

@@ -13,6 +13,7 @@ use thiserror::Error;
 pub mod audio_pipeline;
 pub mod ipc;
 pub mod multi_display;
+pub mod tui;
 
 pub use audio_pipeline::HostAudioPipeline;
 pub use ipc::{
@@ -46,6 +47,15 @@ pub enum HostError {
 
     #[error("Bincode error: {0}")]
     Bincode(#[from] Box<bincode::ErrorKind>),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("IPC error: {0}")]
+    Ipc(String),
+
+    #[error("Dashboard error: {0}")]
+    Dashboard(String),
 
     #[error("Session is not running")]
     NotRunning,
