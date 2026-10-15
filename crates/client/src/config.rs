@@ -101,6 +101,12 @@ pub struct ClientConfig {
 
     /// Force using mock decoder for testing or simulation.
     pub force_mock_decoder: bool,
+
+    /// Whether to enable Quest Passthrough (`XR_FB_passthrough`) to view real-world environment.
+    pub enable_passthrough: bool,
+
+    /// Optional file path to persist spatial screen layout across sessions.
+    pub spatial_layout_path: Option<std::path::PathBuf>,
 }
 
 impl Default for ClientConfig {
@@ -125,6 +131,8 @@ impl Default for ClientConfig {
             force_mock_decoder: false,
             #[cfg(not(target_os = "android"))]
             force_mock_decoder: true,
+            enable_passthrough: true,
+            spatial_layout_path: None,
         }
     }
 }

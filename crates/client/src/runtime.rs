@@ -12,6 +12,7 @@ use crate::graphics::VulkanContext;
 use crate::hud::DebugHud;
 use crate::openxr::{FrameLoopEngine, FramePacingMetrics, OpenXrContext};
 use crate::receiver::ClientReceiver;
+use crate::spatial::{ScreenTransform, SpatialLayoutStore, SpatialScreenLayout, Vec3};
 
 /// High-performance client runtime managing the VR spatial desktop session.
 pub struct QuestClientRuntime {
@@ -23,6 +24,8 @@ pub struct QuestClientRuntime {
     audio_receiver: AudioReceiver,
     frame_loop: FrameLoopEngine,
     hud: DebugHud,
+    screen_transform: ScreenTransform,
+    layout_store: Option<SpatialLayoutStore>,
     is_running: bool,
 }
 
@@ -34,7 +37,7 @@ impl QuestClientRuntime {
         let mut vulkan_context = VulkanContext::new_simulated();
 
         // Try live OpenXR context, falling back to simulated for CI and desktop testing
-        let openxr_context = match OpenXrContext::try_new(&config, &mut vulkan_context) {
+        let mut openxr_context = match OpenXrContext::try_new(&config, &mut vulkan_context) {
             Ok(ctx) => ctx,
             Err(e) => {
                 #[cfg(target_os = "android")]
@@ -45,6 +48,25 @@ impl QuestClientRuntime {
                 OpenXrContext::new_simulated(&config)
             }
         };
+
+        let (screen_transform, layout_store) = if let Some(path) = &config.spatial_layout_path {
+            let store = SpatialLayoutStore::new(path);
+            let mut layout = store.load_or_default();
+            let tf = layout.get_or_create(0).clone();
+            (tf, Some(store))
+        } else {
+            let mut tf = ScreenTransform::for_display(0);
+            tf.display_mode = config.display_mode;
+            tf.distance = config.quad_distance;
+            tf.quad_size = config.quad_size;
+            tf.curve_radius = config.cylinder_radius;
+            tf.curve_angle = config.cylinder_central_angle;
+            tf.aspect_ratio = config.cylinder_aspect_ratio;
+            tf.clamp();
+            (tf, None)
+        };
+
+        openxr_context.set_screen_transform(screen_transform.clone());
 
         #[cfg(target_os = "android")]
         let surface_ptr = openxr_context
@@ -74,6 +96,8 @@ impl QuestClientRuntime {
             audio_receiver,
             frame_loop,
             hud,
+            screen_transform,
+            layout_store,
             is_running: true,
         })
     }
@@ -240,6 +264,112 @@ impl QuestClientRuntime {
     /// Whether the client runtime or OpenXR session has requested termination.
     pub fn should_exit(&self) -> bool {
         !self.is_running || self.openxr_context.should_exit()
+    }
+
+    /// Returns a reference to the active spatial screen transform.
+    pub fn screen_transform(&self) -> &ScreenTransform {
+        &self.screen_transform
+    }
+
+    /// Returns a mutable reference to the active spatial screen transform.
+    pub fn screen_transform_mut(&mut self) -> &mut ScreenTransform {
+        &mut self.screen_transform
+    }
+
+    /// Sets the active spatial screen transform and propagates it to OpenXR context.
+    pub fn set_screen_transform(&mut self, transform: ScreenTransform) {
+        self.screen_transform = transform.clone();
+        self.openxr_context.set_screen_transform(transform);
+    }
+
+    /// Translates the virtual screen by `delta` in meters.
+    pub fn translate_screen(&mut self, delta: Vec3) {
+        self.screen_transform.translate(delta);
+        self.openxr_context
+            .set_screen_transform(self.screen_transform.clone());
+    }
+
+    /// Rotates the virtual screen by incremental Euler angles (pitch, yaw, roll) in radians.
+    pub fn rotate_screen(&mut self, pitch: f32, yaw: f32, roll: f32) {
+        self.screen_transform.rotate(pitch, yaw, roll);
+        self.openxr_context
+            .set_screen_transform(self.screen_transform.clone());
+    }
+
+    /// Sets the viewing distance of the virtual screen in meters.
+    pub fn set_screen_distance(&mut self, distance: f32) {
+        self.screen_transform.set_distance(distance);
+        self.openxr_context
+            .set_screen_transform(self.screen_transform.clone());
+    }
+
+    /// Pushes or pulls the virtual screen relative to the user by `delta_distance` meters.
+    pub fn push_pull_screen(&mut self, delta_distance: f32) {
+        self.screen_transform.push_pull(delta_distance);
+        self.openxr_context
+            .set_screen_transform(self.screen_transform.clone());
+    }
+
+    /// Sets the curved cylinder curvature radius and central arc angle.
+    pub fn set_screen_curve(&mut self, radius: f32, angle: f32) {
+        self.screen_transform.set_curve(radius, angle);
+        self.openxr_context
+            .set_screen_transform(self.screen_transform.clone());
+    }
+
+    /// Returns whether Quest Passthrough (`XR_FB_passthrough`) is supported.
+    pub fn is_passthrough_supported(&self) -> bool {
+        self.openxr_context.is_passthrough_supported()
+    }
+
+    /// Returns whether passthrough is currently active/enabled.
+    pub fn is_passthrough_enabled(&self) -> bool {
+        self.openxr_context.is_passthrough_enabled()
+    }
+
+    /// Enables or disables Quest Passthrough.
+    pub fn set_passthrough_enabled(&mut self, enabled: bool) -> ClientResult<()> {
+        self.openxr_context.set_passthrough_enabled(enabled)
+    }
+
+    /// Toggles Quest Passthrough on/off and returns the new enabled state.
+    pub fn toggle_passthrough(&mut self) -> ClientResult<bool> {
+        let current = self.is_passthrough_enabled();
+        let new_state = !current;
+        self.set_passthrough_enabled(new_state)?;
+        Ok(new_state)
+    }
+
+    /// Returns the active OpenXR environment blend mode.
+    pub fn passthrough_blend_mode(&self) -> openxr::EnvironmentBlendMode {
+        self.openxr_context.passthrough().blend_mode()
+    }
+
+    /// Saves the current spatial screen layout to disk at the given path.
+    pub fn save_spatial_layout(&self, path: impl AsRef<std::path::Path>) -> ClientResult<()> {
+        let store = SpatialLayoutStore::new(path.as_ref());
+        let mut layout = SpatialScreenLayout::default();
+        layout.insert(0, self.screen_transform.clone());
+        store.save(&layout)
+    }
+
+    /// Restores a spatial screen layout from disk at the given path for the specified display ID.
+    pub fn load_spatial_layout(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+        display_id: u32,
+    ) -> ClientResult<()> {
+        let store = SpatialLayoutStore::new(path.as_ref());
+        let layout = store.load()?;
+        if let Some(transform) = layout.get(display_id) {
+            self.set_screen_transform(transform.clone());
+        }
+        Ok(())
+    }
+
+    /// Returns the active layout store if one was configured.
+    pub fn layout_store(&self) -> Option<&SpatialLayoutStore> {
+        self.layout_store.as_ref()
     }
 
     /// Signals the runtime to gracefully shut down.

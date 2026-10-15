@@ -135,14 +135,19 @@ This roadmap outlines the development trajectory of `linux-quest` from initial a
 *Objective: Ergonomic 3D multi-screen layout, passthrough integration, and seamless keyboard/mouse control.*
 
 - **6.1 Spatial 3D Screen Management & Passthrough**
-  - Enable Meta Quest Passthrough (`XR_FB_passthrough`) to keep physical keyboard and desk visible.
-  - 6DoF virtual monitor positioning: curved angles, distance, height, tilt, and screen scale.
-  - Intuitive controller and hand-tracking (`XR_EXT_hand_tracking`) window manipulation.
+  - [x] Enable Meta Quest Passthrough (`XR_FB_passthrough`) with graceful fallback to opaque blend mode, reconstruction layer creation beneath screens, and mock backend for testing.
+  - [x] Pure-Rust 6DoF spatial screen model (`ScreenTransform`): 6DoF pose, push/pull distance, tilt, yaw, curvature mapped to Quad vs Cylinder (`XR_KHR_composition_layer_cylinder`) layers with ergonomic clamping.
+  - [x] Save and restore spatial screen layouts across sessions as versioned JSON with atomic writes and corrupt file recovery.
+  - [ ] Intuitive controller and hand-tracking (`XR_EXT_hand_tracking`) window manipulation.
 
 - **6.2 Kernel Input Redirection (`uinput`)**
-  - Intercept Quest mouse / trackpad / keyboard events (or Bluetooth devices connected to the headset).
-  - Forward low-latency input packets to Linux host and inject via Linux `uinput` kernel subsystem.
-  - Bi-directional clipboard sharing between Quest and Linux (X11 / Wayland clipboard protocols).
+  - [x] Remote input capture and transport (Part 1 - Issue #11):
+    - Compact zero-copy binary input protocol with sequence numbers, timestamps, and redundant key transmission.
+    - Quest client input capture module mapping Android `KeyEvent` / `MotionEvent` (Bluetooth keyboard/mouse and controller-as-mouse) to Linux evdev keycodes.
+    - 120Hz mouse motion and scroll coalescer with sub-pixel remainder preservation.
+    - Low-latency UDP input channel sender/receiver (separate from video) with stale packet dropping and host injection receiver.
+  - [ ] Linux `uinput` kernel device creation and physical event injection backend (Part 2).
+  - [ ] Bi-directional clipboard sharing between Quest and Linux (X11 / Wayland clipboard protocols).
 
 ---
 

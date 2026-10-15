@@ -10,7 +10,10 @@ pub mod video;
 pub use audio::{AudioCodec, AudioFrameMeta, AudioPacket};
 pub use error::ProtocolError;
 pub use handshake::{ClientHandshake, DisplayConfigMessage, DisplayInfo, ServerHandshake};
-pub use input::{ElementState, InputEvent, MouseButton};
+pub use input::{
+    ElementState, InputBatch, InputEvent, KeyModifiers, MouseButton, RedundantKeyEvent,
+    INPUT_BATCH_HEADER_SIZE, INPUT_BATCH_MAGIC, INPUT_BATCH_VERSION,
+};
 pub use packet::{
     Packet, PacketHeader, PacketType, FLAG_COMPRESSED, FLAG_FEC_PROTECTED, FLAG_INTRA_REFRESH,
     FLAG_KEYFRAME, FLAG_LAST_CHUNK, FLAG_NONE, HEADER_SIZE, PROTOCOL_MAGIC, PROTOCOL_VERSION,

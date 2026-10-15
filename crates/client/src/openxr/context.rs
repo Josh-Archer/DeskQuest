@@ -17,7 +17,11 @@ use openxr::{
 use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
 use crate::graphics::VulkanContext;
+use crate::openxr::passthrough::{
+    MockPassthroughBackend, OpenXrPassthroughBackend, PassthroughBackend,
+};
 use crate::openxr::refresh_rate::RefreshRateManager;
+use crate::spatial::ScreenTransform;
 
 /// OpenXR application runtime context managing instance, session, and swapchains.
 pub struct OpenXrContext {
@@ -41,6 +45,8 @@ pub struct OpenXrContext {
     supports_layer_settings: bool,
     should_exit: Arc<AtomicBool>,
     timespec_converter: Option<openxr::raw::ConvertTimespecTimeKHR>,
+    passthrough: Box<dyn PassthroughBackend>,
+    screen_transform: Option<ScreenTransform>,
     is_simulated: bool,
 }
 
@@ -71,6 +77,8 @@ impl OpenXrContext {
             supports_layer_settings: false,
             should_exit: Arc::new(AtomicBool::new(false)),
             timespec_converter: None,
+            passthrough: Box::new(MockPassthroughBackend::new(true, config.enable_passthrough)),
+            screen_transform: None,
             is_simulated: true,
         }
     }
@@ -124,6 +132,11 @@ impl OpenXrContext {
 
         if available_exts.khr_convert_timespec_time {
             required_exts.khr_convert_timespec_time = true;
+        }
+
+        let supports_passthrough = available_exts.fb_passthrough;
+        if supports_passthrough {
+            required_exts.fb_passthrough = true;
         }
 
         #[cfg(target_os = "android")]
@@ -349,6 +362,34 @@ impl OpenXrContext {
             ))
         };
 
+        // Initialize Quest Passthrough (XR_FB_passthrough)
+        let passthrough: Box<dyn PassthroughBackend> = if supports_passthrough {
+            let blend_modes = instance
+                .enumerate_environment_blend_modes(system, ViewConfigurationType::PRIMARY_STEREO)
+                .unwrap_or_default();
+            let supports_alpha_blend = blend_modes.contains(&EnvironmentBlendMode::ALPHA_BLEND);
+
+            match OpenXrPassthroughBackend::try_init(
+                &session,
+                supports_alpha_blend,
+                config.enable_passthrough,
+            ) {
+                Ok(backend) => {
+                    tracing::info!(
+                        supports_alpha_blend,
+                        "XR_FB_passthrough backend initialized"
+                    );
+                    Box::new(backend)
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "Failed to initialize OpenXR passthrough backend, falling back to opaque");
+                    Box::new(MockPassthroughBackend::unsupported())
+                }
+            }
+        } else {
+            Box::new(MockPassthroughBackend::unsupported())
+        };
+
         // Enumerate swapchain formats supported by OpenXR runtime
         let supported_formats = session.enumerate_swapchain_formats().unwrap_or_default();
         let swapchain_format =
@@ -534,6 +575,8 @@ impl OpenXrContext {
             supports_layer_settings: available_exts.fb_composition_layer_settings,
             should_exit: Arc::new(AtomicBool::new(false)),
             timespec_converter,
+            passthrough,
+            screen_transform: None,
             is_simulated: false,
         })
     }
@@ -784,9 +827,10 @@ impl OpenXrContext {
         if self.is_simulated {
             Ok(())
         } else if let Some(stream) = &self.frame_stream {
+            let blend_mode = self.passthrough.blend_mode();
             stream
                 .lock()
-                .end(display_time, EnvironmentBlendMode::OPAQUE, layers)
+                .end(display_time, blend_mode, layers)
                 .map_err(|e| ClientError::OpenXr(format!("end_frame failed: {e:?}")))
         } else {
             Err(ClientError::OpenXr("Frame stream not initialized".into()))
@@ -798,7 +842,7 @@ impl OpenXrContext {
         self.end_frame(display_time, &[])
     }
 
-    /// Composes and presents the desktop and optional HUD layers to OpenXR.
+    /// Composes and presents the desktop, passthrough, and optional HUD layers to OpenXR.
     pub fn render_and_present_layers(
         &mut self,
         display_time: Time,
@@ -823,13 +867,18 @@ impl OpenXrContext {
                 let _ = desktop_sc.release_image();
             }
 
-            let desktop_cfg = crate::openxr::layers::DesktopLayerConfig {
-                mode: config.display_mode,
-                quad_size: config.quad_size,
-                distance: config.quad_distance,
-                cylinder_radius: config.cylinder_radius,
-                cylinder_central_angle: config.cylinder_central_angle,
-                cylinder_aspect_ratio: config.cylinder_aspect_ratio,
+            let desktop_cfg = if let Some(ref tf) = self.screen_transform {
+                tf.to_desktop_layer_config()
+            } else {
+                crate::openxr::layers::DesktopLayerConfig {
+                    mode: config.display_mode,
+                    quad_size: config.quad_size,
+                    distance: config.quad_distance,
+                    cylinder_radius: config.cylinder_radius,
+                    cylinder_central_angle: config.cylinder_central_angle,
+                    cylinder_aspect_ratio: config.cylinder_aspect_ratio,
+                    pose: None,
+                }
             };
 
             let stream_mutex = self
@@ -887,8 +936,22 @@ impl OpenXrContext {
                 None
             };
 
+            let blend_mode = self.passthrough.blend_mode();
+            let pt_layer = if self.passthrough.is_enabled() {
+                self.passthrough.passthrough_layer().map(|layer_handle| {
+                    crate::openxr::layers::build_passthrough_layer(space, layer_handle)
+                })
+            } else {
+                None
+            };
+
+            let mut layers: Vec<&CompositionLayerBase<'_, Vulkan>> = Vec::with_capacity(3);
+            if let Some(ref pt) = pt_layer {
+                layers.push(pt);
+            }
+
             if self.supports_cylinder
-                && config.display_mode == crate::config::DisplayMode::CurvedCylinder
+                && desktop_cfg.mode == crate::config::DisplayMode::CurvedCylinder
             {
                 let cyl_layer = crate::openxr::layers::build_cylinder_layer(
                     space,
@@ -905,19 +968,13 @@ impl OpenXrContext {
                     cyl_layer
                 };
 
-                if let Some(hud) = &hud_layer {
-                    stream
-                        .end(
-                            display_time,
-                            EnvironmentBlendMode::OPAQUE,
-                            &[&cyl_layer, hud],
-                        )
-                        .map_err(|e| ClientError::OpenXr(format!("end_frame failed: {e:?}")))?;
-                } else {
-                    stream
-                        .end(display_time, EnvironmentBlendMode::OPAQUE, &[&cyl_layer])
-                        .map_err(|e| ClientError::OpenXr(format!("end_frame failed: {e:?}")))?;
+                layers.push(&cyl_layer);
+                if let Some(ref hud) = hud_layer {
+                    layers.push(hud);
                 }
+                stream
+                    .end(display_time, blend_mode, &layers)
+                    .map_err(|e| ClientError::OpenXr(format!("end_frame failed: {e:?}")))?;
             } else {
                 let quad_layer = crate::openxr::layers::build_quad_layer(
                     space,
@@ -934,19 +991,13 @@ impl OpenXrContext {
                     quad_layer
                 };
 
-                if let Some(hud) = &hud_layer {
-                    stream
-                        .end(
-                            display_time,
-                            EnvironmentBlendMode::OPAQUE,
-                            &[&quad_layer, hud],
-                        )
-                        .map_err(|e| ClientError::OpenXr(format!("end_frame failed: {e:?}")))?;
-                } else {
-                    stream
-                        .end(display_time, EnvironmentBlendMode::OPAQUE, &[&quad_layer])
-                        .map_err(|e| ClientError::OpenXr(format!("end_frame failed: {e:?}")))?;
+                layers.push(&quad_layer);
+                if let Some(ref hud) = hud_layer {
+                    layers.push(hud);
                 }
+                stream
+                    .end(display_time, blend_mode, &layers)
+                    .map_err(|e| ClientError::OpenXr(format!("end_frame failed: {e:?}")))?;
             }
         } else if let Some(stream_mutex) = &self.frame_stream {
             let mut stream = stream_mutex.lock();
@@ -956,6 +1007,41 @@ impl OpenXrContext {
         }
 
         Ok(())
+    }
+
+    /// Returns a reference to the active passthrough backend.
+    pub fn passthrough(&self) -> &dyn PassthroughBackend {
+        self.passthrough.as_ref()
+    }
+
+    /// Returns a mutable reference to the active passthrough backend.
+    pub fn passthrough_mut(&mut self) -> &mut dyn PassthroughBackend {
+        self.passthrough.as_mut()
+    }
+
+    /// Returns whether XR_FB_passthrough is supported.
+    pub fn is_passthrough_supported(&self) -> bool {
+        self.passthrough.is_supported()
+    }
+
+    /// Returns whether passthrough is currently enabled.
+    pub fn is_passthrough_enabled(&self) -> bool {
+        self.passthrough.is_enabled()
+    }
+
+    /// Enables or disables passthrough.
+    pub fn set_passthrough_enabled(&mut self, enabled: bool) -> ClientResult<()> {
+        self.passthrough.set_enabled(enabled)
+    }
+
+    /// Returns the active spatial screen transform if set.
+    pub fn screen_transform(&self) -> Option<&ScreenTransform> {
+        self.screen_transform.as_ref()
+    }
+
+    /// Sets or updates the active spatial screen transform.
+    pub fn set_screen_transform(&mut self, transform: ScreenTransform) {
+        self.screen_transform = Some(transform);
     }
 }
 
@@ -981,5 +1067,23 @@ mod tests {
         assert!(ctx
             .render_and_present_layers(Time::from_nanos(1), &config, &vk_ctx, None)
             .is_ok());
+
+        // Test passthrough in simulated context
+        assert!(ctx.is_passthrough_supported());
+        assert!(ctx.is_passthrough_enabled());
+        assert_eq!(
+            ctx.passthrough().blend_mode(),
+            EnvironmentBlendMode::ALPHA_BLEND
+        );
+
+        ctx.set_passthrough_enabled(false).unwrap();
+        assert!(!ctx.is_passthrough_enabled());
+        assert_eq!(ctx.passthrough().blend_mode(), EnvironmentBlendMode::OPAQUE);
+
+        // Test spatial screen transform setting
+        assert!(ctx.screen_transform().is_none());
+        let transform = ScreenTransform::for_display(0);
+        ctx.set_screen_transform(transform.clone());
+        assert_eq!(ctx.screen_transform(), Some(&transform));
     }
 }
