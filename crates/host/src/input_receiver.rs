@@ -38,7 +38,6 @@ impl<I: InputInjector> HostInputReceiver<I> {
     pub fn injector(&self) -> Arc<Mutex<I>> {
         self.injector.clone()
     }
-
     /// Process a single incoming input event batch from the transport channel,
     /// injecting each event into the `InputInjector`.
     /// Returns the number of events injected.
@@ -104,7 +103,6 @@ impl HostInputReceiver<linux_quest_input::AutoInputInjector> {
         Ok(Self::new_auto(receiver))
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,7 +150,6 @@ mod tests {
         assert_eq!(received.len(), 3);
         assert_eq!(*received, events);
     }
-
     #[tokio::test]
     async fn test_host_input_receiver_with_auto_injector() {
         let s_sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();

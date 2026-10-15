@@ -13,6 +13,7 @@ pub mod input;
 pub mod openxr;
 pub mod receiver;
 pub mod runtime;
+pub mod spatial;
 
 pub use clipboard::{
     AndroidClipboardManager, ClientClipboardSync, ClipboardManager, MockClipboardManager,
@@ -29,11 +30,18 @@ pub use input::{
     MouseCoalescer,
 };
 pub use openxr::{
-    build_cylinder_layer, build_hud_layer, build_quad_layer, DesktopLayerConfig, FrameLoopEngine,
-    FramePacingMetrics, OpenXrContext, RefreshRateManager, QUEST_REFRESH_RATES,
+    build_cylinder_layer, build_cylinder_layer_from_transform, build_hud_layer,
+    build_passthrough_layer, build_quad_layer, build_quad_layer_from_transform,
+    CompositionLayerPassthroughFB, DesktopLayerConfig, FrameLoopEngine, FramePacingMetrics,
+    MockPassthroughBackend, OpenXrContext, OpenXrPassthroughBackend, PassthroughBackend,
+    PassthroughState, RefreshRateManager, QUEST_REFRESH_RATES,
 };
 pub use receiver::ClientReceiver;
 pub use runtime::QuestClientRuntime;
+pub use spatial::{
+    CylinderLayerParams, QuadLayerParams, Quat, ScreenPose, ScreenTransform, SpatialLayoutStore,
+    SpatialScreenLayout, Vec3, CURRENT_LAYOUT_VERSION,
+};
 
 pub fn client_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
