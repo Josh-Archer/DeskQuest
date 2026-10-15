@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 pub mod adb;
 pub mod control;
 pub mod fec;
+pub mod input_channel;
 pub mod jitter_buffer;
 pub mod pacing;
 pub mod tcp;
@@ -20,6 +21,10 @@ pub use adb::{
 };
 pub use control::{ControlChannel, ControlError, ControlMessage};
 pub use fec::{FecError, FecHeader, ReedSolomonFec, XorFec};
+pub use input_channel::{
+    create_input_channel_pair, InputChannelConfig, InputChannelReceiver, InputChannelSender,
+    DEFAULT_INPUT_PORT, DEFAULT_KEY_REDUNDANCY, MAX_INPUT_PACKET_SIZE,
+};
 pub use jitter_buffer::{AdaptiveJitterBuffer, JitterBufferConfig, JitterBufferStats};
 pub use pacing::PacketPacer;
 pub use tcp::TcpEndpoint;
