@@ -22,14 +22,21 @@ pub use openxr::{
     build_cylinder_layer, build_cylinder_layer_from_transform, build_hud_layer,
     build_passthrough_layer, build_quad_layer, build_quad_layer_from_transform,
     CompositionLayerPassthroughFB, DesktopLayerConfig, FrameLoopEngine, FramePacingMetrics,
-    MockPassthroughBackend, OpenXrContext, OpenXrPassthroughBackend, PassthroughBackend,
-    PassthroughState, RefreshRateManager, QUEST_REFRESH_RATES,
+    HandTrackingBackend, InteractionBackend, MockHandTrackingBackend, MockInteractionBackend,
+    MockPassthroughBackend, OpenXrContext, OpenXrHandTrackingBackend, OpenXrInteractionBackend,
+    OpenXrPassthroughBackend, PassthroughBackend, PassthroughState, RefreshRateManager,
+    QUEST_REFRESH_RATES,
 };
 pub use receiver::ClientReceiver;
 pub use runtime::QuestClientRuntime;
 pub use spatial::{
-    CylinderLayerParams, QuadLayerParams, Quat, ScreenPose, ScreenTransform, SpatialLayoutStore,
-    SpatialScreenLayout, Vec3, CURRENT_LAYOUT_VERSION,
+    ray_intersects_cylinder, ray_intersects_quad, ControllerInputState, CylinderLayerParams,
+    GrabSession, GrabStateMachine, HandGestureDetector, HandGestureState, HandJoint, HandJointData,
+    HandTrackingData, Handedness, InteractionEvent, InteractionInput, InteractionSource,
+    InteractionState, QuadLayerParams, Quat, Ray, RayHit, ScreenPose, ScreenTransform,
+    SpatialLayoutStore, SpatialScreenLayout, Vec3, CURRENT_LAYOUT_VERSION,
+    DEFAULT_GRAB_RELEASE_THRESHOLD_M, DEFAULT_GRAB_START_THRESHOLD_M,
+    DEFAULT_PINCH_RELEASE_THRESHOLD_M, DEFAULT_PINCH_START_THRESHOLD_M, HAND_JOINT_COUNT,
 };
 
 pub fn client_version() -> &'static str {

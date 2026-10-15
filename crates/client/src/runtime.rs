@@ -11,7 +11,10 @@ use crate::graphics::VulkanContext;
 use crate::hud::DebugHud;
 use crate::openxr::{FrameLoopEngine, FramePacingMetrics, OpenXrContext};
 use crate::receiver::ClientReceiver;
-use crate::spatial::{ScreenTransform, SpatialLayoutStore, SpatialScreenLayout, Vec3};
+use crate::spatial::{
+    GrabStateMachine, HandGestureDetector, Handedness, InteractionEvent, InteractionInput,
+    InteractionState, ScreenTransform, SpatialLayoutStore, SpatialScreenLayout, Vec3,
+};
 
 /// High-performance client runtime managing the VR spatial desktop session.
 pub struct QuestClientRuntime {
@@ -24,6 +27,9 @@ pub struct QuestClientRuntime {
     hud: DebugHud,
     screen_transform: ScreenTransform,
     layout_store: Option<SpatialLayoutStore>,
+    active_layout: SpatialScreenLayout,
+    interaction_state_machine: GrabStateMachine,
+    gesture_detector: HandGestureDetector,
     is_running: bool,
 }
 
@@ -47,22 +53,25 @@ impl QuestClientRuntime {
             }
         };
 
-        let (screen_transform, layout_store) = if let Some(path) = &config.spatial_layout_path {
-            let store = SpatialLayoutStore::new(path);
-            let mut layout = store.load_or_default();
-            let tf = layout.get_or_create(0).clone();
-            (tf, Some(store))
-        } else {
-            let mut tf = ScreenTransform::for_display(0);
-            tf.display_mode = config.display_mode;
-            tf.distance = config.quad_distance;
-            tf.quad_size = config.quad_size;
-            tf.curve_radius = config.cylinder_radius;
-            tf.curve_angle = config.cylinder_central_angle;
-            tf.aspect_ratio = config.cylinder_aspect_ratio;
-            tf.clamp();
-            (tf, None)
-        };
+        let (screen_transform, layout_store, active_layout) =
+            if let Some(path) = &config.spatial_layout_path {
+                let store = SpatialLayoutStore::new(path);
+                let mut layout = store.load_or_default();
+                let tf = layout.get_or_create(0).clone();
+                (tf, Some(store), layout)
+            } else {
+                let mut tf = ScreenTransform::for_display(0);
+                tf.display_mode = config.display_mode;
+                tf.distance = config.quad_distance;
+                tf.quad_size = config.quad_size;
+                tf.curve_radius = config.cylinder_radius;
+                tf.curve_angle = config.cylinder_central_angle;
+                tf.aspect_ratio = config.cylinder_aspect_ratio;
+                tf.clamp();
+                let mut layout = SpatialScreenLayout::default();
+                layout.insert(0, tf.clone());
+                (tf, None, layout)
+            };
 
         openxr_context.set_screen_transform(screen_transform.clone());
 
@@ -83,6 +92,8 @@ impl QuestClientRuntime {
         let receiver = ClientReceiver::new(&config);
         let frame_loop = FrameLoopEngine::new();
         let hud = DebugHud::new(512, 256);
+        let interaction_state_machine = GrabStateMachine::new();
+        let gesture_detector = HandGestureDetector::new();
 
         Ok(Self {
             config,
@@ -94,6 +105,9 @@ impl QuestClientRuntime {
             hud,
             screen_transform,
             layout_store,
+            active_layout,
+            interaction_state_machine,
+            gesture_detector,
             is_running: true,
         })
     }
@@ -121,6 +135,73 @@ impl QuestClientRuntime {
         let monotonic_display_ns = self
             .openxr_context
             .convert_time_to_monotonic_ns(display_time);
+
+        // 2a. Poll controller actions and skeletal hand tracking
+        let _ = self.openxr_context.poll_interaction(display_time);
+
+        let dt_seconds = 1.0 / self.config.target_refresh_rate.max(1.0);
+
+        let right_ctrl = self
+            .openxr_context
+            .interaction()
+            .controller_state(Handedness::Right);
+        let left_ctrl = self
+            .openxr_context
+            .interaction()
+            .controller_state(Handedness::Left);
+
+        let right_joints = self
+            .openxr_context
+            .locate_hand_joints(Handedness::Right, display_time)
+            .ok()
+            .flatten();
+        let left_joints = self
+            .openxr_context
+            .locate_hand_joints(Handedness::Left, display_time)
+            .ok()
+            .flatten();
+
+        let right_gesture = right_joints
+            .as_ref()
+            .map(|j| self.gesture_detector.update(Handedness::Right, j));
+        let left_gesture = left_joints
+            .as_ref()
+            .map(|j| self.gesture_detector.update(Handedness::Left, j));
+
+        let active_source = match self.interaction_state_machine.state() {
+            InteractionState::Grabbing(session) => Some(session.source),
+            InteractionState::Hovering { source, .. } => Some(*source),
+            InteractionState::Idle => None,
+        };
+
+        let candidate_inputs: [Option<InteractionInput>; 4] = [
+            right_ctrl
+                .as_ref()
+                .map(|c| InteractionInput::from_controller(Handedness::Right, c)),
+            right_gesture
+                .as_ref()
+                .map(|g| InteractionInput::from_hand(Handedness::Right, g)),
+            left_ctrl
+                .as_ref()
+                .map(|c| InteractionInput::from_controller(Handedness::Left, c)),
+            left_gesture
+                .as_ref()
+                .map(|g| InteractionInput::from_hand(Handedness::Left, g)),
+        ];
+
+        let selected_input = if let Some(src) = active_source {
+            candidate_inputs
+                .iter()
+                .filter_map(|opt| opt.as_ref())
+                .find(|inp| inp.source == src)
+                .cloned()
+        } else {
+            candidate_inputs.into_iter().flatten().next()
+        };
+
+        if let Some(input) = selected_input {
+            let _ = self.step_interaction(&input, dt_seconds);
+        }
 
         // If OpenXR requests not to render (should_render == false), end frame with empty layers
         if !pacing.should_render {
@@ -352,6 +433,104 @@ impl QuestClientRuntime {
     /// Returns the active layout store if one was configured.
     pub fn layout_store(&self) -> Option<&SpatialLayoutStore> {
         self.layout_store.as_ref()
+    }
+
+    /// Returns the current lifecycle state of screen interaction (Idle, Hovering, or Grabbing).
+    pub fn interaction_state(&self) -> &InteractionState {
+        self.interaction_state_machine.state()
+    }
+
+    /// Returns a reference to the active screen grab state machine.
+    pub fn interaction_state_machine(&self) -> &GrabStateMachine {
+        &self.interaction_state_machine
+    }
+
+    /// Returns a mutable reference to the active screen grab state machine.
+    pub fn interaction_state_machine_mut(&mut self) -> &mut GrabStateMachine {
+        &mut self.interaction_state_machine
+    }
+
+    /// Returns a reference to the skeletal hand gesture detector.
+    pub fn gesture_detector(&self) -> &HandGestureDetector {
+        &self.gesture_detector
+    }
+
+    /// Returns a mutable reference to the skeletal hand gesture detector.
+    pub fn gesture_detector_mut(&mut self) -> &mut HandGestureDetector {
+        &mut self.gesture_detector
+    }
+
+    /// Returns a reference to the active spatial screen layout.
+    pub fn active_layout(&self) -> &SpatialScreenLayout {
+        &self.active_layout
+    }
+
+    /// Returns a reference to the underlying OpenXR context.
+    pub fn openxr_context(&self) -> &OpenXrContext {
+        &self.openxr_context
+    }
+
+    /// Returns a mutable reference to the underlying OpenXR context.
+    pub fn openxr_context_mut(&mut self) -> &mut OpenXrContext {
+        &mut self.openxr_context
+    }
+
+    /// Configures or replaces the active spatial layout store.
+    pub fn set_layout_store(&mut self, store: SpatialLayoutStore) {
+        self.layout_store = Some(store);
+    }
+
+    /// Steps the interaction state machine with the provided input, updating the active screen transform
+    /// and persisting layout changes to disk when manipulation ends.
+    pub fn step_interaction(
+        &mut self,
+        input: &InteractionInput,
+        dt_seconds: f32,
+    ) -> Option<InteractionEvent> {
+        let screens = vec![(0, &self.screen_transform)];
+        let event = self
+            .interaction_state_machine
+            .update(input, screens, dt_seconds);
+
+        if let Some(ref ev) = event {
+            match ev {
+                InteractionEvent::GrabUpdated {
+                    display_id,
+                    transform,
+                    ..
+                } => {
+                    self.screen_transform = transform.clone();
+                    self.active_layout.insert(*display_id, transform.clone());
+                    self.openxr_context.set_screen_transform(transform.clone());
+                }
+                InteractionEvent::GrabEnded {
+                    display_id,
+                    final_transform,
+                    ..
+                } => {
+                    self.screen_transform = final_transform.clone();
+                    self.active_layout
+                        .insert(*display_id, final_transform.clone());
+                    self.openxr_context
+                        .set_screen_transform(final_transform.clone());
+
+                    // Persist spatial layout to disk via layout store
+                    if let Some(store) = &self.layout_store {
+                        if let Err(e) = store.save(&self.active_layout) {
+                            tracing::warn!(error = ?e, "Failed to persist spatial layout after grab manipulation");
+                        } else {
+                            tracing::info!(
+                                display_id = *display_id,
+                                "Persisted spatial layout after grab manipulation"
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        event
     }
 
     /// Signals the runtime to gracefully shut down.
