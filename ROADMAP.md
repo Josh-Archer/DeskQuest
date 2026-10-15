@@ -140,9 +140,13 @@ This roadmap outlines the development trajectory of `linux-quest` from initial a
   - Intuitive controller and hand-tracking (`XR_EXT_hand_tracking`) window manipulation.
 
 - **6.2 Kernel Input Redirection (`uinput`)**
-  - Intercept Quest mouse / trackpad / keyboard events (or Bluetooth devices connected to the headset).
-  - Forward low-latency input packets to Linux host and inject via Linux `uinput` kernel subsystem.
-  - Bi-directional clipboard sharing between Quest and Linux (X11 / Wayland clipboard protocols).
+  - [x] Remote input capture and transport (Part 1 - Issue #11):
+    - Compact zero-copy binary input protocol with sequence numbers, timestamps, and redundant key transmission.
+    - Quest client input capture module mapping Android `KeyEvent` / `MotionEvent` (Bluetooth keyboard/mouse and controller-as-mouse) to Linux evdev keycodes.
+    - 120Hz mouse motion and scroll coalescer with sub-pixel remainder preservation.
+    - Low-latency UDP input channel sender/receiver (separate from video) with stale packet dropping and host injection receiver.
+  - [ ] Linux `uinput` kernel device creation and physical event injection backend (Part 2).
+  - [ ] Bi-directional clipboard sharing between Quest and Linux (X11 / Wayland clipboard protocols).
 
 ---
 
