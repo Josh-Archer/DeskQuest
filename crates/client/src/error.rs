@@ -36,9 +36,19 @@ pub enum ClientError {
     #[error("Android system error: {0}")]
     Android(String),
 
+    /// Spatial screen model or transform error.
+    #[error("Spatial error: {0}")]
+    Spatial(String),
+
     /// I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl From<serde_json::Error> for ClientError {
+    fn from(err: serde_json::Error) -> Self {
+        ClientError::Spatial(format!("JSON serialization error: {err}"))
+    }
 }
 
 impl From<openxr::sys::Result> for ClientError {

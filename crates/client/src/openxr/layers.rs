@@ -9,7 +9,7 @@ use openxr::{
 use crate::config::DisplayMode;
 
 /// Parameters defining the 3D spatial presentation of the virtual monitor.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DesktopLayerConfig {
     /// Display geometry mode (Flat or Curved).
     pub mode: DisplayMode,
@@ -23,6 +23,8 @@ pub struct DesktopLayerConfig {
     pub cylinder_central_angle: f32,
     /// Cylinder aspect ratio (width / height).
     pub cylinder_aspect_ratio: f32,
+    /// Optional 6DoF pose override for custom spatial positioning.
+    pub pose: Option<Posef>,
 }
 
 impl Default for DesktopLayerConfig {
@@ -34,6 +36,7 @@ impl Default for DesktopLayerConfig {
             cylinder_radius: 1.5,
             cylinder_central_angle: 1.2,
             cylinder_aspect_ratio: 16.0 / 9.0,
+            pose: None,
         }
     }
 }
@@ -56,13 +59,17 @@ pub fn build_quad_layer<'a, G: Graphics>(
             },
         });
 
-    let pose = Posef {
-        orientation: Quaternionf::IDENTITY,
-        position: Vector3f {
-            x: 0.0,
-            y: 1.4, // Eye level in stage space
-            z: -config.distance,
-        },
+    let pose = if let Some(custom_pose) = config.pose {
+        custom_pose
+    } else {
+        Posef {
+            orientation: Quaternionf::IDENTITY,
+            position: Vector3f {
+                x: 0.0,
+                y: 1.4, // Eye level in stage space
+                z: -config.distance,
+            },
+        }
     };
 
     let size = Extent2Df {
@@ -99,13 +106,17 @@ pub fn build_cylinder_layer<'a, G: Graphics>(
 
     // For curved desktop centered on the user, the cylinder axis passes through
     // the reference space origin, and radius defines the viewing distance.
-    let pose = Posef {
-        orientation: Quaternionf::IDENTITY,
-        position: Vector3f {
-            x: 0.0,
-            y: 1.4, // Eye level in stage space
-            z: 0.0,
-        },
+    let pose = if let Some(custom_pose) = config.pose {
+        custom_pose
+    } else {
+        Posef {
+            orientation: Quaternionf::IDENTITY,
+            position: Vector3f {
+                x: 0.0,
+                y: 1.4, // Eye level in stage space
+                z: 0.0,
+            },
+        }
     };
 
     CompositionLayerCylinderKHR::new()
@@ -117,6 +128,41 @@ pub fn build_cylinder_layer<'a, G: Graphics>(
         .radius(config.cylinder_radius)
         .central_angle(config.cylinder_central_angle)
         .aspect_ratio(config.cylinder_aspect_ratio)
+}
+
+/// Builds an `XrCompositionLayerPassthroughFB` to blend virtual displays with the real-world environment.
+pub fn build_passthrough_layer<'a, G: Graphics>(
+    space: &'a Space,
+    passthrough_layer: &'a openxr::PassthroughLayerFB,
+) -> crate::openxr::passthrough::CompositionLayerPassthroughFB<'a, G> {
+    crate::openxr::passthrough::CompositionLayerPassthroughFB::new()
+        .flags(CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA)
+        .space(space)
+        .layer_handle(passthrough_layer)
+}
+
+/// Builds an `XrCompositionLayerQuad` directly from a `ScreenTransform`.
+pub fn build_quad_layer_from_transform<'a, G: Graphics>(
+    space: &'a Space,
+    swapchain: &'a Swapchain<G>,
+    width_px: u32,
+    height_px: u32,
+    transform: &crate::spatial::ScreenTransform,
+) -> CompositionLayerQuad<'a, G> {
+    let config = transform.to_desktop_layer_config();
+    build_quad_layer(space, swapchain, width_px, height_px, &config)
+}
+
+/// Builds an `XrCompositionLayerCylinderKHR` directly from a `ScreenTransform`.
+pub fn build_cylinder_layer_from_transform<'a, G: Graphics>(
+    space: &'a Space,
+    swapchain: &'a Swapchain<G>,
+    width_px: u32,
+    height_px: u32,
+    transform: &crate::spatial::ScreenTransform,
+) -> CompositionLayerCylinderKHR<'a, G> {
+    let config = transform.to_desktop_layer_config();
+    build_cylinder_layer(space, swapchain, width_px, height_px, &config)
 }
 
 /// Builds a head-locked performance telemetry HUD quad layer.
