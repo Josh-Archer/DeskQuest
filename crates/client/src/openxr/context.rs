@@ -154,7 +154,6 @@ impl OpenXrContext {
         if supports_hand_tracking {
             required_exts.ext_hand_tracking = true;
         }
-
         #[cfg(target_os = "android")]
         {
             if !config.force_mock_decoder {
@@ -435,7 +434,6 @@ impl OpenXrContext {
         } else {
             Box::new(MockHandTrackingBackend::unsupported())
         };
-
         // Enumerate swapchain formats supported by OpenXR runtime
         let supported_formats = session.enumerate_swapchain_formats().unwrap_or_default();
         let swapchain_format =
@@ -1091,7 +1089,6 @@ impl OpenXrContext {
     pub fn set_screen_transform(&mut self, transform: ScreenTransform) {
         self.screen_transform = Some(transform);
     }
-
     /// Returns a reference to the active controller interaction backend.
     pub fn interaction(&self) -> &dyn InteractionBackend {
         self.interaction.as_ref()

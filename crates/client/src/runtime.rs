@@ -532,7 +532,6 @@ impl QuestClientRuntime {
 
         event
     }
-
     /// Signals the runtime to gracefully shut down.
     pub fn stop(&mut self) {
         self.is_running = false;
