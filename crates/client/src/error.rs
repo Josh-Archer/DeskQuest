@@ -36,6 +36,18 @@ pub enum ClientError {
     #[error("Android system error: {0}")]
     Android(String),
 
+    /// Audio receiver or jitter buffer error.
+    #[error("Audio error: {0}")]
+    Audio(String),
+
+    /// Audio decoder error.
+    #[error("Audio decoder error: {0}")]
+    AudioDecoder(String),
+
+    /// Audio sink error.
+    #[error("Audio sink error: {0}")]
+    AudioSink(String),
+
     /// I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

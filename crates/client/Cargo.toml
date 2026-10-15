@@ -24,12 +24,16 @@ parking_lot.workspace = true
 crc32fast.workspace = true
 serde = { workspace = true, features = ["derive"] }
 libc.workspace = true
+audiopus = "0.3.0-rc.0"
+audiopus_sys = { version = "0.2.2", features = ["static"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
-ndk = { version = "0.9", features = ["media", "nativewindow", "sync", "api-level-30"] }
+ndk = { version = "0.9", features = ["audio", "media", "nativewindow", "sync", "api-level-30"] }
 ndk-sys = "0.6"
 ndk-context = "0.1"
 android-activity = { version = "0.6", features = ["native-activity"] }
 jni = "0.21"
 
 [dev-dependencies]
+linux-quest-capture = { path = "../capture" }
+linux-quest-encoder = { path = "../encoder" }

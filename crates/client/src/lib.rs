@@ -3,6 +3,7 @@
 //! Meta Quest 3 OpenXR client and hardware video decoder runtime.
 
 pub mod android;
+pub mod audio;
 pub mod config;
 pub mod decoder;
 pub mod error;
@@ -12,6 +13,15 @@ pub mod openxr;
 pub mod receiver;
 pub mod runtime;
 
+#[cfg(target_os = "android")]
+pub use audio::AAudioSink;
+pub use audio::{
+    create_default_audio_sink, AudioDecoder, AudioDecoderError, AudioJitterBuffer,
+    AudioPlayoutItem, AudioReceiver, AudioReceiverConfig, AudioReceiverStats, AudioSink,
+    AudioSinkConfig, AudioSinkError, AudioStepSummary, AvSyncConfig, AvSyncMetrics, AvSynchronizer,
+    ClientAudioPipeline, DecodedAudioFrame, DriftCorrectionMode, MockAudioDecoder, MockAudioSink,
+    OpusAudioDecoder,
+};
 pub use config::{ClientConfig, ClientVideoCodec, DisplayMode, TransportMode};
 pub use decoder::{create_decoder, DecodedFrame, DecoderStats, HardwareVideoDecoder};
 pub use error::{ClientError, ClientResult};
