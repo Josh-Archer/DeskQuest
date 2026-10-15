@@ -3,6 +3,7 @@
 //! Meta Quest 3 OpenXR client and hardware video decoder runtime.
 
 pub mod android;
+pub mod clipboard;
 pub mod config;
 pub mod decoder;
 pub mod error;
@@ -13,6 +14,10 @@ pub mod openxr;
 pub mod receiver;
 pub mod runtime;
 
+pub use clipboard::{
+    AndroidClipboardManager, ClientClipboardSync, ClipboardManager, MockClipboardManager,
+    DEFAULT_CLIENT_CLIPBOARD_DEBOUNCE_DURATION, DEFAULT_CLIENT_CLIPBOARD_POLL_INTERVAL,
+};
 pub use config::{ClientConfig, ClientVideoCodec, DisplayMode, TransportMode};
 pub use decoder::{create_decoder, DecodedFrame, DecoderStats, HardwareVideoDecoder};
 pub use error::{ClientError, ClientResult};

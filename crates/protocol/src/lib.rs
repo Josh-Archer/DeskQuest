@@ -1,3 +1,4 @@
+pub mod clipboard;
 pub mod error;
 pub mod handshake;
 pub mod input;
@@ -6,6 +7,10 @@ pub mod reassembler;
 pub mod telemetry;
 pub mod video;
 
+pub use clipboard::{
+    chunk_clipboard_text, AssembledClipboard, ClipboardMessage, ClipboardReassembler,
+    ClipboardSyncEngine, SyncAction, DEFAULT_CLIPBOARD_CHUNK_SIZE, MAX_CLIPBOARD_TEXT_SIZE,
+};
 pub use error::ProtocolError;
 pub use handshake::{ClientHandshake, DisplayConfigMessage, DisplayInfo, ServerHandshake};
 pub use input::{
