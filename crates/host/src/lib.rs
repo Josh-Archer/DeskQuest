@@ -274,10 +274,23 @@ where
             }
             PacketType::Disconnect => {
                 self.running.store(false, Ordering::SeqCst);
+                let _ = self.input.release_all();
             }
             _ => (),
         }
         Ok(())
+    }
+}
+
+impl<C, E, T, I> Drop for HostStreamSession<C, E, T, I>
+where
+    C: DisplayCapture,
+    E: VideoEncoder,
+    T: TransportEndpoint,
+    I: InputInjector,
+{
+    fn drop(&mut self) {
+        let _ = self.input.release_all();
     }
 }
 

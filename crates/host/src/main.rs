@@ -123,6 +123,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let _ = shutdown_tx_clone.send(());
             });
 
+            // Wire input receiver service feeding remote Quest events into the injector
+            let input_bind_addr = std::net::SocketAddr::from((
+                [0, 0, 0, 0],
+                linux_quest_transport::DEFAULT_INPUT_PORT,
+            ));
+            match linux_quest_host::HostInputReceiver::bind_auto(input_bind_addr).await {
+                Ok(mut input_service) => {
+                    let running_flag = input_service.running_flag();
+                    let auto_injector = input_service.injector();
+                    let mut shutdown_rx_input = shutdown_tx.subscribe();
+                    tokio::spawn(async move {
+                        info!(
+                            addr = %input_bind_addr,
+                            "Input receiver service listening on UDP input channel"
+                        );
+                        tokio::select! {
+                            res = input_service.run() => {
+                                if let Err(e) = res {
+                                    tracing::warn!("Input receiver service exited: {e}");
+                                }
+                            }
+                            _ = shutdown_rx_input.recv() => {
+                                running_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                                if let Ok(mut inj) = auto_injector.lock() {
+                                    let _ = inj.release_all();
+                                }
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to bind UDP input channel on {input_bind_addr}; input receiver disabled"
+                    );
+                }
+            }
+
             run_ipc_server(host, shutdown_rx).await?;
             info!("Daemon stopped cleanly.");
         }

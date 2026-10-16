@@ -81,6 +81,42 @@ For an in-depth breakdown of the technical components, see [ARCHITECTURE.md](ARC
 
 ---
 
+## 🎮 Kernel Input Injection (`/dev/uinput` Setup)
+
+`linux-quest` uses the Linux kernel's `uinput` subsystem to inject input events with native kernel-level responsiveness:
+- **Virtual Mouse:** Relative movement (`REL_X`, `REL_Y`), discrete & high-resolution scrolling (`REL_WHEEL`, `REL_HWHEEL`, `REL_WHEEL_HI_RES`, `REL_HWHEEL_HI_RES`), and mouse buttons (`BTN_LEFT`, `BTN_RIGHT`, `BTN_MIDDLE`, `BTN_SIDE`, `BTN_EXTRA`).
+- **Virtual Absolute Pointer:** Absolute coordinate positioning (`ABS_X`, `ABS_Y`) and pointer buttons for spatial ray pointing.
+- **Virtual Keyboard:** Full evdev keycodes with autorepeat support and automatic held key/button release on client disconnect or drop.
+
+### Permissions & Udev Configuration
+To allow `linux-quest-host` to create virtual devices without running as `root`:
+
+1. **Load the `uinput` kernel module:**
+   ```bash
+   sudo modprobe uinput
+   ```
+
+2. **Install the udev rule:**
+   Create `/etc/udev/rules.d/99-uinput.rules`:
+   ```udev
+   KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"
+   ```
+
+3. **Add your user to the `input` group:**
+   ```bash
+   sudo usermod -aG input $USER
+   ```
+   *(Log out and log back in for the new group membership to take effect).*
+
+4. **Reload udev rules:**
+   ```bash
+   sudo udevadm control --reload-rules && sudo udevadm trigger
+   ```
+
+When `/dev/uinput` is unavailable or permissions are not yet configured, the host daemon automatically falls back to an in-memory/logging mock injector and logs actionable guidance.
+
+---
+
 ## 🗺️ Roadmap & Milestones
 
 The project is structured into 7 core phases:

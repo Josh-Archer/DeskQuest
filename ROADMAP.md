@@ -146,7 +146,12 @@ This roadmap outlines the development trajectory of `linux-quest` from initial a
     - Quest client input capture module mapping Android `KeyEvent` / `MotionEvent` (Bluetooth keyboard/mouse and controller-as-mouse) to Linux evdev keycodes.
     - 120Hz mouse motion and scroll coalescer with sub-pixel remainder preservation.
     - Low-latency UDP input channel sender/receiver (separate from video) with stale packet dropping and host injection receiver.
-  - [ ] Linux `uinput` kernel device creation and physical event injection backend (Part 2).
+  - [x] Linux `uinput` kernel device creation and physical event injection backend (Part 2 - Issue #11):
+    - Virtual mouse (`REL_X`/`REL_Y`, discrete & hi-res wheels, `BTN_LEFT`/`RIGHT`/`MIDDLE`/`SIDE`/`EXTRA`), absolute pointer (`ABS_X`/`ABS_Y`), and keyboard devices.
+    - `UinputDeviceFile` trait abstraction with mock writer enabling headless unit testing without `/dev/uinput`.
+    - Correct `SYN_REPORT` event batching and automatic release of held keys/buttons on client disconnect or drop.
+    - Clear diagnostics for missing `/dev/uinput` or permission denial with udev documentation.
+    - Host daemon wiring with automated fallback to mock/log injector when uinput is unavailable.
   - [ ] Bi-directional clipboard sharing between Quest and Linux (X11 / Wayland clipboard protocols).
 
 ---
