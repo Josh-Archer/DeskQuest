@@ -1,4 +1,4 @@
-use linux_quest_protocol::{ClientHandshake, DisplayInfo, ServerHandshake};
+use linux_quest_protocol::{ClientHandshake, ClipboardMessage, DisplayInfo, ServerHandshake};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -42,7 +42,11 @@ pub enum ControlMessage {
     Disconnect {
         reason: String,
     },
+    Clipboard(ClipboardMessage),
 }
+
+/// Default TCP port for the out-of-band reliable signaling and control channel.
+pub const DEFAULT_CONTROL_PORT: u16 = 48444;
 
 /// Maximum allowed size for a control signaling message (1MB).
 pub const MAX_CONTROL_MESSAGE_SIZE: usize = 1024 * 1024;
@@ -149,6 +153,19 @@ mod tests {
             min_mbps: 50,
             max_mbps: 200,
         };
+
+        client.send_message(&msg).await.unwrap();
+        let received = server.recv_message().await.unwrap();
+
+        assert_eq!(received, msg);
+    }
+
+    #[tokio::test]
+    async fn test_control_channel_clipboard_roundtrip() {
+        let (mut client, mut server) = ControlChannel::create_connected_pair().await.unwrap();
+
+        let clip_msg = ClipboardMessage::single(1, 42, "Rust on Meta Quest 3".to_string()).unwrap();
+        let msg = ControlMessage::Clipboard(clip_msg);
 
         client.send_message(&msg).await.unwrap();
         let received = server.recv_message().await.unwrap();

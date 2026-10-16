@@ -11,11 +11,13 @@ use std::sync::Arc;
 use thiserror::Error;
 
 pub mod audio_pipeline;
+pub mod clipboard_service;
 pub mod input_receiver;
 pub mod ipc;
 pub mod multi_display;
 
 pub use audio_pipeline::HostAudioPipeline;
+pub use clipboard_service::{HostClipboardService, HOST_CLIPBOARD_ORIGIN_ID};
 pub use input_receiver::HostInputReceiver;
 pub use ipc::{
     daemon_pid_path, daemon_runtime_dir, daemon_socket_path, run_ipc_server, send_daemon_request,
@@ -279,10 +281,23 @@ where
             }
             PacketType::Disconnect => {
                 self.running.store(false, Ordering::SeqCst);
+                let _ = self.input.release_all();
             }
             _ => (),
         }
         Ok(())
+    }
+}
+
+impl<C, E, T, I> Drop for HostStreamSession<C, E, T, I>
+where
+    C: DisplayCapture,
+    E: VideoEncoder,
+    T: TransportEndpoint,
+    I: InputInjector,
+{
+    fn drop(&mut self) {
+        let _ = self.input.release_all();
     }
 }
 

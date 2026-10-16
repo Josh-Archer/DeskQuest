@@ -11,6 +11,10 @@ linux-quest-protocol = { path = "../protocol" }
 thiserror.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
+input-linux = "0.7.1"
+libc.workspace = true
+parking_lot.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
 
 [dev-dependencies]
 tokio.workspace = true

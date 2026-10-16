@@ -35,6 +35,9 @@ impl<I: InputInjector> HostInputReceiver<I> {
         self.receiver.local_addr()
     }
 
+    pub fn injector(&self) -> Arc<Mutex<I>> {
+        self.injector.clone()
+    }
     /// Process a single incoming input event batch from the transport channel,
     /// injecting each event into the `InputInjector`.
     /// Returns the number of events injected.
@@ -67,10 +70,39 @@ impl<I: InputInjector> HostInputReceiver<I> {
                 }
             }
         }
+        if let Ok(mut inj) = self.injector.lock() {
+            let _ = inj.release_all();
+        }
         Ok(())
     }
 }
 
+impl<I: InputInjector> Drop for HostInputReceiver<I> {
+    fn drop(&mut self) {
+        if let Ok(mut inj) = self.injector.lock() {
+            let _ = inj.release_all();
+        }
+    }
+}
+
+impl HostInputReceiver<linux_quest_input::AutoInputInjector> {
+    /// Creates a new `HostInputReceiver` wired with an `AutoInputInjector`.
+    /// The `AutoInputInjector` dynamically uses `UinputInjector` if `/dev/uinput` is accessible,
+    /// or falls back to `MockInputInjector` / logging if unavailable.
+    pub fn new_auto(receiver: InputChannelReceiver) -> Self {
+        let injector = Arc::new(Mutex::new(linux_quest_input::AutoInputInjector::new()));
+        Self::new(receiver, injector)
+    }
+
+    /// Binds a UDP socket to `bind_addr` and initializes a `HostInputReceiver` with `AutoInputInjector`.
+    pub async fn bind_auto(bind_addr: SocketAddr) -> Result<Self, HostError> {
+        let socket = tokio::net::UdpSocket::bind(bind_addr)
+            .await
+            .map_err(|e| HostError::Transport(TransportError::Io(e)))?;
+        let receiver = InputChannelReceiver::new(socket, None, true);
+        Ok(Self::new_auto(receiver))
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +149,33 @@ mod tests {
         let received = &binding.received_events;
         assert_eq!(received.len(), 3);
         assert_eq!(*received, events);
+    }
+    #[tokio::test]
+    async fn test_host_input_receiver_with_auto_injector() {
+        let s_sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let s_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let addr_sender = s_sender.local_addr().unwrap();
+        let addr_receiver = s_receiver.local_addr().unwrap();
+
+        let mut sender = InputChannelSender::new(s_sender, Some(addr_receiver), 4);
+        let receiver = InputChannelReceiver::new(s_receiver, Some(addr_sender), true);
+
+        let mut host_receiver = HostInputReceiver::new_auto(receiver);
+        assert!(!host_receiver.injector().lock().unwrap().is_uinput());
+
+        let events = vec![InputEvent::MouseMoveRelative { dx: 5, dy: -3 }];
+        sender.send_events(events, 100_000).await.unwrap();
+
+        let count = host_receiver.step().await.unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_host_input_receiver_bind_auto() {
+        let host_receiver = HostInputReceiver::bind_auto("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        assert!(host_receiver.local_addr().is_ok());
     }
 }
