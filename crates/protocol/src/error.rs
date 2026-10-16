@@ -31,4 +31,13 @@ pub enum ProtocolError {
 
     #[error("Corrupt frame: chunk {chunk} exceeds total chunks {total}")]
     CorruptChunkIndex { chunk: u16, total: u16 },
+
+    #[error("Clipboard text size {size} exceeds limit {limit}")]
+    ClipboardTooLarge { size: usize, limit: usize },
+
+    #[error("Invalid clipboard chunk: index {index} exceeds or equals total chunks {total}")]
+    InvalidClipboardChunk { index: u32, total: u32 },
+
+    #[error("Clipboard reassembly mismatch: expected {expected} bytes, got {actual}")]
+    ClipboardReassemblyMismatch { expected: usize, actual: usize },
 }

@@ -19,7 +19,7 @@ pub use adb::{
     AdbBridgeHandle, AdbBridgeState, AdbCommandRunner, AdbDevice, AdbDeviceState, AdbError,
     AdbReverseRule, MockAdbRunner, SystemAdbRunner,
 };
-pub use control::{ControlChannel, ControlError, ControlMessage};
+pub use control::{ControlChannel, ControlError, ControlMessage, DEFAULT_CONTROL_PORT};
 pub use fec::{FecError, FecHeader, ReedSolomonFec, XorFec};
 pub use input_channel::{
     create_input_channel_pair, InputChannelConfig, InputChannelReceiver, InputChannelSender,
