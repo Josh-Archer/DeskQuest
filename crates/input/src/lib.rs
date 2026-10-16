@@ -4,11 +4,19 @@
 //! absolute pointer, and keyboard devices.
 
 pub mod auto;
+pub mod clipboard;
 pub mod device;
 pub mod error;
 pub mod uinput;
 
 pub use auto::{create_auto_injector, AutoInputInjector};
+pub use clipboard::{
+    AutoClipboardBackend, ClipboardBackend, ClipboardCommandRunner, ClipboardMessage,
+    ClipboardReassembler, ClipboardSyncEngine, ClipboardWatcher, ClipboardWatcherConfig,
+    CommandOutput, MockClipboardBackend, MockCommandRunner, ResolvedBackendType,
+    SystemCommandRunner, WaylandClipboardBackend, X11ClipboardBackend, X11ClipboardTool,
+    DEFAULT_CLIPBOARD_DEBOUNCE_DURATION, DEFAULT_CLIPBOARD_POLL_INTERVAL,
+};
 pub use device::{
     make_abs_event, make_key_event, make_rel_event, make_syn_report, MockDeviceOpener,
     MockDeviceState, MockUinputDeviceFile, RawInputEvent, RealDeviceOpener, RealUinputDeviceFile,

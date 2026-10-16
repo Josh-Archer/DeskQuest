@@ -151,8 +151,12 @@ This roadmap outlines the development trajectory of `linux-quest` from initial a
     - `UinputDeviceFile` trait abstraction with mock writer enabling headless unit testing without `/dev/uinput`.
     - Correct `SYN_REPORT` event batching and automatic release of held keys/buttons on client disconnect or drop.
     - Clear diagnostics for missing `/dev/uinput` or permission denial with udev documentation.
-    - Host daemon wiring with automated fallback to mock/log injector when uinput is unavailable.
-  - [ ] Bi-directional clipboard sharing between Quest and Linux (X11 / Wayland clipboard protocols).
+  - [x] Bi-directional clipboard sharing between Quest and Linux (Part 3 - Issue #11):
+    - Reliable control channel protocol messages with UTF-8 support, 4MiB size bounds, chunking for large text, and monotonic origin/version tracking.
+    - Host-side `ClipboardBackend` trait with Wayland (`wl-copy`/`wl-paste`) and X11 (`xclip`/`xsel`) auto-detection and debounced change watcher.
+    - Quest client `ClipboardManager` trait with Android JNI backend and headless mock.
+    - Deterministic shared `ClipboardSyncEngine` with deduplication, echo loop suppression, and last-writer conflict resolution.
+    - Host daemon wiring on TCP control channel alongside virtual input receivers.
 
 ---
 

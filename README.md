@@ -117,6 +117,16 @@ When `/dev/uinput` is unavailable or permissions are not yet configured, the hos
 
 ---
 
+## 📋 Bidirectional Clipboard Synchronization
+
+`linux-quest` provides seamless, bidirectional UTF-8 text clipboard synchronization between Linux desktop and Meta Quest headsets:
+- **Host Desktop Integration:** Automatically detects Wayland (`wl-copy`/`wl-paste`) vs X11 (`xclip`/`xsel`) via `WAYLAND_DISPLAY`/`DISPLAY`, polling with debounced change detection.
+- **Quest Client Integration:** `ClipboardManager` trait wrapping Android Horizon OS clipboard services (JNI) with headless mock fallbacks.
+- **Loop-Free Synchronization:** Origin tracking and monotonic versions resolve race conditions via deterministic last-writer ordering while suppressing echo loops.
+- **Large Text Chunking:** Safe slicing on UTF-8 character boundaries for payloads up to 4 MiB carried over the reliable control channel.
+
+---
+
 ## 🗺️ Roadmap & Milestones
 
 The project is structured into 7 core phases:
