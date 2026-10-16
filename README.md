@@ -137,7 +137,7 @@ The project is structured into 7 core phases:
 - [ ] **Phase 4:** Meta Quest OpenXR Client & Hardware Decoder (AMediaCodec, Vulkan, Composition Layers)
 - [ ] **Phase 5:** Virtual Multi-Monitor Management on Linux (Wayland virtual outputs, DRM/KMS, dynamic EDID)
 - [ ] **Phase 6:** Spatial Workspace, Passthrough & Input Redirection (6DoF pose, passthrough layers & layout persistence implemented; input sync in progress)
-- [ ] **Phase 7:** Audio Streaming & Production Polish (PipeWire Opus, packaging, CLI/TUI)
+- [ ] **Phase 7:** Audio Streaming & Production Polish (PipeWire Opus host capture, 2.5ms/5ms low-delay encoding, packaging, CLI/TUI)
 
 Detailed milestone descriptions, deliverables, and acceptance criteria are outlined in [ROADMAP.md](ROADMAP.md).
 

@@ -386,3 +386,231 @@ async fn test_daemon_ipc_single_owner_lock() {
         std::env::remove_var("XDG_RUNTIME_DIR");
     }
 }
+
+#[tokio::test]
+async fn test_audio_pipeline_streaming_opus_2_5ms() {
+    use linux_quest_capture::SineAudioSource;
+    use linux_quest_encoder::{AudioApplication, AudioEncoderConfig, AutoAudioEncoder};
+    use linux_quest_host::HostAudioPipeline;
+    use linux_quest_protocol::{AudioCodec, AudioPacket, PacketType};
+    use linux_quest_transport::LoopbackEndpoint;
+
+    let source = SineAudioSource::new_default(); // 48kHz, stereo, 2.5ms (120 samples), F32Le
+    let config = AudioEncoderConfig {
+        codec: AudioCodec::Opus,
+        sample_rate: 48000,
+        channels: 2,
+        frame_duration_us: 2500,
+        bitrate_bps: 96_000,
+        fec_enabled: true,
+        dtx_enabled: false,
+        application: AudioApplication::RestrictedLowDelay,
+    };
+    let encoder = AutoAudioEncoder::new(config.clone());
+    let (ep_host, mut ep_client) = LoopbackEndpoint::create_pair();
+
+    let mut pipeline = HostAudioPipeline::new(source, encoder, ep_host, 1);
+    pipeline
+        .init(config)
+        .await
+        .expect("Audio pipeline init failed");
+
+    // Stream 10 frames of 2.5ms Opus audio
+    for expected_id in 1..=10 {
+        let frame_id = pipeline
+            .step_stream_audio_frame()
+            .await
+            .expect("Step audio failed");
+        assert_eq!(frame_id, expected_id);
+    }
+
+    for expected_id in 1..=10 {
+        let pkt = ep_client
+            .recv_packet()
+            .await
+            .expect("Client recv audio failed");
+        assert_eq!(pkt.header.packet_type, PacketType::AudioFrame);
+        assert_eq!(pkt.header.stream_id, 1);
+        assert_eq!(pkt.header.sequence, expected_id as u32);
+        let expected_pts = (expected_id - 1) * 2500;
+        assert_eq!(pkt.header.timestamp_us, expected_pts);
+
+        let audio = AudioPacket::deserialize(&pkt.payload).expect("Deserialize audio failed");
+        assert_eq!(audio.meta.frame_id, expected_id);
+        assert_eq!(audio.meta.sequence, expected_id as u32);
+        assert_eq!(audio.meta.sample_rate, 48000);
+        assert_eq!(audio.meta.channels, 2);
+        assert_eq!(audio.meta.samples_per_channel, 120);
+        assert_eq!(audio.meta.codec, AudioCodec::Opus);
+        assert_eq!(audio.meta.pts_us, expected_pts);
+        assert_eq!(audio.duration_us(), 2500);
+        assert!(!audio.payload.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn test_audio_pipeline_streaming_5ms_frames() {
+    use linux_quest_capture::{AudioSampleFormat, SineAudioSource};
+    use linux_quest_encoder::{AudioApplication, AudioEncoderConfig, AutoAudioEncoder};
+    use linux_quest_host::HostAudioPipeline;
+    use linux_quest_protocol::{AudioCodec, AudioPacket, PacketType};
+    use linux_quest_transport::LoopbackEndpoint;
+
+    let source = SineAudioSource::new(48000, 2, AudioSampleFormat::I16Le, 240); // 5ms = 240 samples @ 48kHz
+    let config = AudioEncoderConfig {
+        codec: AudioCodec::Opus,
+        sample_rate: 48000,
+        channels: 2,
+        frame_duration_us: 5000,
+        bitrate_bps: 128_000,
+        fec_enabled: true,
+        dtx_enabled: false,
+        application: AudioApplication::RestrictedLowDelay,
+    };
+    let encoder = AutoAudioEncoder::new(config.clone());
+    let (ep_host, mut ep_client) = LoopbackEndpoint::create_pair();
+
+    let mut pipeline = HostAudioPipeline::new(source, encoder, ep_host, 1);
+    pipeline
+        .init(config)
+        .await
+        .expect("Audio pipeline init failed");
+
+    for expected_id in 1..=5 {
+        let frame_id = pipeline
+            .step_stream_audio_frame()
+            .await
+            .expect("Step audio failed");
+        assert_eq!(frame_id, expected_id);
+
+        let pkt = ep_client
+            .recv_packet()
+            .await
+            .expect("Client recv audio failed");
+        assert_eq!(pkt.header.packet_type, PacketType::AudioFrame);
+        let expected_pts = (expected_id - 1) * 5000;
+        assert_eq!(pkt.header.timestamp_us, expected_pts);
+
+        let audio = AudioPacket::deserialize(&pkt.payload).expect("Deserialize audio failed");
+        assert_eq!(audio.meta.frame_id, expected_id);
+        assert_eq!(audio.meta.samples_per_channel, 240);
+        assert_eq!(audio.duration_us(), 5000);
+    }
+}
+
+#[tokio::test]
+async fn test_synchronized_audio_and_video_pipeline() {
+    use linux_quest_capture::{SineAudioSource, SyntheticCapture};
+    use linux_quest_encoder::{
+        AudioEncoderConfig, AutoAudioEncoder, EncoderConfig, MockVideoEncoder,
+    };
+    use linux_quest_host::{HostAudioPipeline, HostStreamSession};
+    use linux_quest_input::MockInputInjector;
+    use linux_quest_protocol::{AudioPacket, PacketType, VideoChunk};
+    use linux_quest_transport::LoopbackEndpoint;
+
+    // Both video and audio are packetized and sent to the client.
+    // Video: 60Hz (~16,666us interval).
+    // Audio: 2.5ms (2,500us interval).
+    let (video_tx, mut client_video_rx) = LoopbackEndpoint::create_pair();
+    let (audio_tx, mut client_audio_rx) = LoopbackEndpoint::create_pair();
+
+    let video_capture = SyntheticCapture::new(0, 1920, 1080, 60);
+    let video_encoder = MockVideoEncoder::new(EncoderConfig::default());
+    let mut video_session = HostStreamSession::new(
+        video_capture,
+        video_encoder,
+        video_tx,
+        MockInputInjector::new(),
+        0,
+    );
+    video_session.init(EncoderConfig::default()).await.unwrap();
+
+    let audio_source = SineAudioSource::new_default();
+    let audio_config = AudioEncoderConfig::default();
+    let audio_encoder = AutoAudioEncoder::new(audio_config.clone());
+    let mut audio_pipeline = HostAudioPipeline::new(audio_source, audio_encoder, audio_tx, 1);
+    audio_pipeline.init(audio_config).await.unwrap();
+
+    // Stream 1 video frame and 6 audio frames (covering ~15ms of video presentation)
+    let vid_fid = video_session.step_stream_frame().await.unwrap();
+    assert_eq!(vid_fid, 1);
+
+    for _ in 0..6 {
+        audio_pipeline.step_stream_audio_frame().await.unwrap();
+    }
+
+    // Client verifies video packet
+    let vid_pkt = client_video_rx.recv_packet().await.unwrap();
+    assert_eq!(vid_pkt.header.packet_type, PacketType::VideoFrameChunk);
+    let video_chunk = VideoChunk::deserialize(&vid_pkt.payload).unwrap();
+    let video_pts = video_chunk.meta.pts_us;
+
+    // Client verifies audio packets and A/V sync clock
+    for i in 0..6 {
+        let aud_pkt = client_audio_rx.recv_packet().await.unwrap();
+        assert_eq!(aud_pkt.header.packet_type, PacketType::AudioFrame);
+        let audio_pkt = AudioPacket::deserialize(&aud_pkt.payload).unwrap();
+        let audio_pts = audio_pkt.meta.pts_us;
+
+        // Audio timestamps progress at 2500us steps
+        assert_eq!(audio_pts, i * 2500);
+
+        // Skew between audio and video timestamp is measurable and bounded
+        let diff = (audio_pts as i64) - (video_pts as i64);
+        assert!(diff.abs() < 20_000); // within 20ms
+    }
+}
+
+#[tokio::test]
+async fn test_audio_pipeline_over_tcp_and_udp() {
+    use linux_quest_capture::SineAudioSource;
+    use linux_quest_encoder::{AudioEncoderConfig, AutoAudioEncoder};
+    use linux_quest_host::HostAudioPipeline;
+    use linux_quest_protocol::{AudioPacket, PacketType};
+    use linux_quest_transport::{PacedUdpEndpoint, TcpEndpoint};
+
+    // 1. Over TCP endpoint
+    let (tcp_host, mut tcp_client) = TcpEndpoint::create_connected_pair().await.unwrap();
+    let source_tcp = SineAudioSource::new_default();
+    let mut tcp_pipeline = HostAudioPipeline::new(
+        source_tcp,
+        AutoAudioEncoder::new(AudioEncoderConfig::default()),
+        tcp_host,
+        1,
+    );
+    tcp_pipeline
+        .init(AudioEncoderConfig::default())
+        .await
+        .unwrap();
+
+    let fid = tcp_pipeline.step_stream_audio_frame().await.unwrap();
+    assert_eq!(fid, 1);
+
+    let pkt = tcp_client.recv_packet().await.unwrap();
+    assert_eq!(pkt.header.packet_type, PacketType::AudioFrame);
+    let audio = AudioPacket::deserialize(&pkt.payload).unwrap();
+    assert_eq!(audio.meta.frame_id, 1);
+
+    // 2. Over Paced UDP endpoint
+    let (udp_host, mut udp_client) = PacedUdpEndpoint::create_connected_pair(100).await.unwrap();
+    let source_udp = SineAudioSource::new_default();
+    let mut udp_pipeline = HostAudioPipeline::new(
+        source_udp,
+        AutoAudioEncoder::new(AudioEncoderConfig::default()),
+        udp_host,
+        1,
+    );
+    udp_pipeline
+        .init(AudioEncoderConfig::default())
+        .await
+        .unwrap();
+
+    let fid_udp = udp_pipeline.step_stream_audio_frame().await.unwrap();
+    assert_eq!(fid_udp, 1);
+
+    let pkt_udp = udp_client.recv_packet().await.unwrap();
+    assert_eq!(pkt_udp.header.packet_type, PacketType::AudioFrame);
+    let audio_udp = AudioPacket::deserialize(&pkt_udp.payload).unwrap();
+    assert_eq!(audio_udp.meta.frame_id, 1);
+}

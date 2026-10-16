@@ -30,6 +30,7 @@ pub enum PacketType {
     Disconnect = 10,
     FecParity = 11,
     Clipboard = 12,
+    AudioFrame = 13,
 }
 
 impl TryFrom<u8> for PacketType {
@@ -49,6 +50,7 @@ impl TryFrom<u8> for PacketType {
             10 => Ok(Self::Disconnect),
             11 => Ok(Self::FecParity),
             12 => Ok(Self::Clipboard),
+            13 => Ok(Self::AudioFrame),
             unknown => Err(ProtocolError::InvalidPacketType(unknown)),
         }
     }

@@ -15,5 +15,10 @@ tracing.workspace = true
 libloading.workspace = true
 libc.workspace = true
 
+[features]
+default = []
+pipewire-audio = []
+pipewire = ["pipewire-audio"]
+
 [dev-dependencies]
 tokio.workspace = true

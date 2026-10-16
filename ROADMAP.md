@@ -164,8 +164,11 @@ This roadmap outlines the development trajectory of `linux-quest` from initial a
 *Objective: Complete multimedia experience, intuitive host controls, and frictionless installation.*
 
 - **7.1 PipeWire Audio Streaming (Opus)**
-  - PipeWire audio capture sink on Linux host.
-  - Low-latency Opus encoding and synchronized audio playback on Quest.
+  - [x] Host audio capture (`AudioSource` trait, PipeWire sink-monitor backend behind `pipewire-audio` feature, 48kHz stereo f32/i16, synthetic sine generator).
+  - [x] Low-latency Opus encoding (`AudioEncoder` trait, 2.5ms/5ms frames, restricted low-delay application, configurable bitrate, FEC/DTX).
+  - [x] Binary protocol audio packetization (`AudioPacket`, `PacketType::AudioFrame`) with capture timestamps synchronized to video presentation clock.
+  - [x] Host streaming pipeline (`HostAudioPipeline`) transmitting audio packets over TCP, UDP, and loopback transports.
+  - [ ] Synchronized audio playback and jitter buffer integration on Quest client.
 
 - **7.2 Host Management CLI & TUI**
   - Lightweight terminal UI (using `ratatui`) showing real-time latency stats (capture, encode, network, decode), connected headsets, and virtual display toggles.
