@@ -168,7 +168,7 @@ This roadmap outlines the development trajectory of `linux-quest` from initial a
   - [x] Low-latency Opus encoding (`AudioEncoder` trait, 2.5ms/5ms frames, restricted low-delay application, configurable bitrate, FEC/DTX).
   - [x] Binary protocol audio packetization (`AudioPacket`, `PacketType::AudioFrame`) with capture timestamps synchronized to video presentation clock.
   - [x] Host streaming pipeline (`HostAudioPipeline`) transmitting audio packets over TCP, UDP, and loopback transports.
-  - [ ] Synchronized audio playback and jitter buffer integration on Quest client.
+  - [x] Synchronized audio playback and jitter buffer integration on Quest client (`AudioReceiver` with adaptive jitter buffer keyed by sequence number, Opus decoding with PLC/FEC behind `AudioDecoder` trait, A/V presentation clock synchronization with drift correction by small resampling or drop/insert, and `AudioSink` trait with Android AAudio low-latency mode and mock sink).
 
 - **7.2 Host Management CLI & TUI**
   - Lightweight terminal UI (using `ratatui`) showing real-time latency stats (capture, encode, network, decode), connected headsets, and virtual display toggles.

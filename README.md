@@ -77,6 +77,7 @@ For an in-depth breakdown of the technical components, see [ARCHITECTURE.md](ARC
 | **Video Transport** | **QUIC / Custom UDP / USB (ADB)** | Sub-millisecond packet pacing, FEC (Forward Error Correction), and USB reverse-tethering support. |
 | **VR Runtime** | **OpenXR (Android / Horizon OS)** | Industry standard cross-vendor XR runtime with native Meta extensions for Passthrough and Composition Layers. |
 | **Quest Client Core** | **Rust (`openxr` + `ash` Vulkan) / Android NDK** | Direct access to native Vulkan swapchains and `AMediaCodec` hardware decoding buffers. |
+| **Audio Streaming** | **PipeWire + Opus + Android AAudio** | Sub-3ms host capture/encode (Opus 2.5ms frames), adaptive jitter buffer, PLC/FEC loss concealment, A/V presentation sync, and native AAudio low-latency sink. |
 | **Input Redirection** | **Linux `uinput`** | Kernel-level low-overhead virtual keyboard and mouse emulation. |
 
 ---
@@ -137,7 +138,7 @@ The project is structured into 7 core phases:
 - [ ] **Phase 4:** Meta Quest OpenXR Client & Hardware Decoder (AMediaCodec, Vulkan, Composition Layers)
 - [ ] **Phase 5:** Virtual Multi-Monitor Management on Linux (Wayland virtual outputs, DRM/KMS, dynamic EDID)
 - [ ] **Phase 6:** Spatial Workspace, Passthrough & Input Redirection (6DoF pose, passthrough layers & layout persistence implemented; input sync in progress)
-- [ ] **Phase 7:** Audio Streaming & Production Polish (PipeWire Opus host capture, 2.5ms/5ms low-delay encoding, packaging, CLI/TUI)
+- [ ] **Phase 7:** Audio Streaming & Production Polish (PipeWire Opus host capture, 2.5ms/5ms low-delay encoding, Quest client AAudio playback with A/V sync, packaging, CLI/TUI)
 
 Detailed milestone descriptions, deliverables, and acceptance criteria are outlined in [ROADMAP.md](ROADMAP.md).
 
