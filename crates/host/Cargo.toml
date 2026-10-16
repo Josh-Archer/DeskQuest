@@ -25,5 +25,7 @@ tracing-subscriber.workspace = true
 async-trait.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
+parking_lot.workspace = true
 
 [dev-dependencies]
+linux-quest-client = { path = "../client" }

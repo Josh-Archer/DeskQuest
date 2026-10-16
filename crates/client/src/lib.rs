@@ -4,6 +4,7 @@
 
 pub mod android;
 pub mod audio;
+pub mod clipboard;
 pub mod config;
 pub mod decoder;
 pub mod error;
@@ -23,6 +24,10 @@ pub use audio::{
     AudioSinkConfig, AudioSinkError, AudioStepSummary, AvSyncConfig, AvSyncMetrics, AvSynchronizer,
     ClientAudioPipeline, DecodedAudioFrame, DriftCorrectionMode, MockAudioDecoder, MockAudioSink,
     OpusAudioDecoder,
+};
+pub use clipboard::{
+    AndroidClipboardManager, ClientClipboardSync, ClipboardManager, MockClipboardManager,
+    DEFAULT_CLIENT_CLIPBOARD_DEBOUNCE_DURATION, DEFAULT_CLIENT_CLIPBOARD_POLL_INTERVAL,
 };
 pub use config::{ClientConfig, ClientVideoCodec, DisplayMode, TransportMode};
 pub use decoder::{create_decoder, DecodedFrame, DecoderStats, HardwareVideoDecoder};
