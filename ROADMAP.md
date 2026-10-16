@@ -137,8 +137,7 @@ This roadmap outlines the development trajectory of `linux-quest` from initial a
 - **6.1 Spatial 3D Screen Management & Passthrough**
   - [x] Enable Meta Quest Passthrough (`XR_FB_passthrough`) with graceful fallback to opaque blend mode, reconstruction layer creation beneath screens, and mock backend for testing.
   - [x] Pure-Rust 6DoF spatial screen model (`ScreenTransform`): 6DoF pose, push/pull distance, tilt, yaw, curvature mapped to Quad vs Cylinder (`XR_KHR_composition_layer_cylinder`) layers with ergonomic clamping.
-  - [x] Save and restore spatial screen layouts across sessions as versioned JSON with atomic writes and corrupt file recovery.
-  - [ ] Intuitive controller and hand-tracking (`XR_EXT_hand_tracking`) window manipulation.
+  - [x] Intuitive controller and hand-tracking (`XR_EXT_hand_tracking`) window manipulation: aim pointing rays with ray-vs-quad and ray-vs-cylinder intersection, 6DoF grab/drag state machine with relative offset preservation, thumbstick push/pull distance and tilt/curve adjustment, pinch/grab gesture detection with hysteresis, and automatic layout persistence on manipulation release.
 
 - **6.2 Kernel Input Redirection (`uinput`)**
   - [x] Remote input capture and transport (Part 1 - Issue #11):

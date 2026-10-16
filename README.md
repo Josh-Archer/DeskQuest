@@ -160,7 +160,7 @@ The project is structured into 7 core phases:
 - [ ] **Phase 3:** Low-Latency Network & USB Transport (QUIC/UDP, FEC, ADB reverse tunnel)
 - [ ] **Phase 4:** Meta Quest OpenXR Client & Hardware Decoder (AMediaCodec, Vulkan, Composition Layers)
 - [ ] **Phase 5:** Virtual Multi-Monitor Management on Linux (Wayland virtual outputs, DRM/KMS, dynamic EDID)
-- [ ] **Phase 6:** Spatial Workspace, Passthrough & Input Redirection (6DoF pose, passthrough layers & layout persistence implemented; input sync in progress)
+- [ ] **Phase 6:** Spatial Workspace, Passthrough & Input Redirection (6DoF pose, passthrough layers, controller/hand 6DoF manipulation & layout persistence completed; host input injection in progress)
 - [ ] **Phase 7:** Audio Streaming & Production Polish (PipeWire Opus host capture, 2.5ms/5ms low-delay encoding, Quest client AAudio playback with A/V sync, packaging, CLI/TUI)
 
 Detailed milestone descriptions, deliverables, and acceptance criteria are outlined in [ROADMAP.md](ROADMAP.md).

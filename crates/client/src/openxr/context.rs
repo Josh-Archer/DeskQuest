@@ -17,10 +17,17 @@ use openxr::{
 use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
 use crate::graphics::VulkanContext;
+use crate::openxr::hand_tracking::{
+    HandTrackingBackend, MockHandTrackingBackend, OpenXrHandTrackingBackend,
+};
+use crate::openxr::interaction::{
+    InteractionBackend, MockInteractionBackend, OpenXrInteractionBackend,
+};
 use crate::openxr::passthrough::{
     MockPassthroughBackend, OpenXrPassthroughBackend, PassthroughBackend,
 };
 use crate::openxr::refresh_rate::RefreshRateManager;
+use crate::spatial::interaction::{HandTrackingData, Handedness};
 use crate::spatial::ScreenTransform;
 
 /// OpenXR application runtime context managing instance, session, and swapchains.
@@ -46,6 +53,8 @@ pub struct OpenXrContext {
     should_exit: Arc<AtomicBool>,
     timespec_converter: Option<openxr::raw::ConvertTimespecTimeKHR>,
     passthrough: Box<dyn PassthroughBackend>,
+    interaction: Box<dyn InteractionBackend>,
+    hand_tracking: Box<dyn HandTrackingBackend>,
     screen_transform: Option<ScreenTransform>,
     is_simulated: bool,
 }
@@ -78,6 +87,8 @@ impl OpenXrContext {
             should_exit: Arc::new(AtomicBool::new(false)),
             timespec_converter: None,
             passthrough: Box::new(MockPassthroughBackend::new(true, config.enable_passthrough)),
+            interaction: Box::new(MockInteractionBackend::new()),
+            hand_tracking: Box::new(MockHandTrackingBackend::new(true)),
             screen_transform: None,
             is_simulated: true,
         }
@@ -139,6 +150,10 @@ impl OpenXrContext {
             required_exts.fb_passthrough = true;
         }
 
+        let supports_hand_tracking = available_exts.ext_hand_tracking;
+        if supports_hand_tracking {
+            required_exts.ext_hand_tracking = true;
+        }
         #[cfg(target_os = "android")]
         {
             if !config.force_mock_decoder {
@@ -390,6 +405,35 @@ impl OpenXrContext {
             Box::new(MockPassthroughBackend::unsupported())
         };
 
+        // Initialize OpenXR controller interaction actions
+        let interaction: Box<dyn InteractionBackend> = match OpenXrInteractionBackend::try_init(
+            &instance, &session,
+        ) {
+            Ok(backend) => {
+                tracing::info!("OpenXR controller interaction action set initialized");
+                Box::new(backend)
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "Failed to initialize OpenXR interaction actions; falling back to mock");
+                Box::new(MockInteractionBackend::new())
+            }
+        };
+
+        // Initialize OpenXR XR_EXT_hand_tracking
+        let hand_tracking: Box<dyn HandTrackingBackend> = if supports_hand_tracking {
+            match OpenXrHandTrackingBackend::try_init(&session) {
+                Ok(backend) => {
+                    tracing::info!("XR_EXT_hand_tracking backend initialized");
+                    Box::new(backend)
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "Failed to initialize OpenXR hand tracking; falling back to mock");
+                    Box::new(MockHandTrackingBackend::unsupported())
+                }
+            }
+        } else {
+            Box::new(MockHandTrackingBackend::unsupported())
+        };
         // Enumerate swapchain formats supported by OpenXR runtime
         let supported_formats = session.enumerate_swapchain_formats().unwrap_or_default();
         let swapchain_format =
@@ -576,6 +620,8 @@ impl OpenXrContext {
             should_exit: Arc::new(AtomicBool::new(false)),
             timespec_converter,
             passthrough,
+            interaction,
+            hand_tracking,
             screen_transform: None,
             is_simulated: false,
         })
@@ -1042,6 +1088,56 @@ impl OpenXrContext {
     /// Sets or updates the active spatial screen transform.
     pub fn set_screen_transform(&mut self, transform: ScreenTransform) {
         self.screen_transform = Some(transform);
+    }
+    /// Returns a reference to the active controller interaction backend.
+    pub fn interaction(&self) -> &dyn InteractionBackend {
+        self.interaction.as_ref()
+    }
+
+    /// Returns a mutable reference to the active controller interaction backend.
+    pub fn interaction_mut(&mut self) -> &mut Box<dyn InteractionBackend> {
+        &mut self.interaction
+    }
+
+    /// Sets the controller interaction backend.
+    pub fn set_interaction_backend(&mut self, backend: Box<dyn InteractionBackend>) {
+        self.interaction = backend;
+    }
+
+    /// Returns a reference to the active skeletal hand tracking backend.
+    pub fn hand_tracking(&self) -> &dyn HandTrackingBackend {
+        self.hand_tracking.as_ref()
+    }
+
+    /// Returns a mutable reference to the active skeletal hand tracking backend.
+    pub fn hand_tracking_mut(&mut self) -> &mut Box<dyn HandTrackingBackend> {
+        &mut self.hand_tracking
+    }
+
+    /// Sets the skeletal hand tracking backend.
+    pub fn set_hand_tracking_backend(&mut self, backend: Box<dyn HandTrackingBackend>) {
+        self.hand_tracking = backend;
+    }
+
+    /// Polls controller interaction actions for the predicted display time.
+    pub fn poll_interaction(&mut self, time: openxr::Time) -> ClientResult<()> {
+        self.interaction
+            .poll_actions(time, self.stage_space.as_ref())
+    }
+
+    /// Locates all 26 skeletal hand joints for the specified hand at the given display time.
+    pub fn locate_hand_joints(
+        &mut self,
+        hand: Handedness,
+        time: openxr::Time,
+    ) -> ClientResult<Option<HandTrackingData>> {
+        self.hand_tracking
+            .locate_joints(hand, time, self.stage_space.as_ref())
+    }
+
+    /// Returns true if skeletal hand tracking (`XR_EXT_hand_tracking`) is supported.
+    pub fn is_hand_tracking_supported(&self) -> bool {
+        self.hand_tracking.is_supported()
     }
 }
 
