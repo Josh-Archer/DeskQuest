@@ -79,6 +79,29 @@ For an in-depth breakdown of the technical components, see [ARCHITECTURE.md](ARC
 | **Quest Client Core** | **Rust (`openxr` + `ash` Vulkan) / Android NDK** | Direct access to native Vulkan swapchains and `AMediaCodec` hardware decoding buffers. |
 | **Audio Streaming** | **PipeWire + Opus + Android AAudio** | Sub-3ms host capture/encode (Opus 2.5ms frames), adaptive jitter buffer, PLC/FEC loss concealment, A/V presentation sync, and native AAudio low-latency sink. |
 | **Input Redirection** | **Linux `uinput`** | Kernel-level low-overhead virtual keyboard and mouse emulation. |
+| **Management Dashboard** | **Ratatui + Crossterm** | Real-time terminal status dashboard for active virtual displays, latency waterfall, client link, and audio stream stats. |
+
+---
+
+## 🖥️ Host Status Dashboard (TUI)
+
+Launch the real-time terminal status dashboard powered by `ratatui`:
+
+```bash
+# Live dashboard connecting to the running background daemon
+linux-quest-host dashboard
+
+# Standalone simulation / demo mode with synthetic telemetry
+linux-quest-host dashboard --demo
+
+# Run background daemon holding virtual monitors with interactive dashboard
+linux-quest-host daemon --tui
+```
+
+Hotkeys:
+- `q` or `Esc`: Exit dashboard (restores terminal cleanly)
+- `r`: Reset rolling telemetry history
+- `Space`: Pause / Resume real-time updates
 
 ---
 

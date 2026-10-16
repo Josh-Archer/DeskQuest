@@ -24,7 +24,10 @@ pub use packet::{
     FLAG_KEYFRAME, FLAG_LAST_CHUNK, FLAG_NONE, HEADER_SIZE, PROTOCOL_MAGIC, PROTOCOL_VERSION,
 };
 pub use reassembler::{AssembledFrame, FrameReassembler};
-pub use telemetry::FrameLatencyBreakdown;
+pub use telemetry::{
+    AudioLatencyBreakdown, AudioStreamTelemetry, ClientConnectionMode, ClientTransportTelemetry,
+    FrameLatencyBreakdown,
+};
 pub use video::{VideoChunk, VideoChunkMeta, VideoCodec};
 
 #[cfg(test)]

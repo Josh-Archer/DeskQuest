@@ -1,9 +1,11 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use linux_quest_display::DisplayLayoutMode;
+use linux_quest_host::tui::{run_dashboard_with_source, IpcTelemetrySource, MockTelemetrySource};
 use linux_quest_host::{
     daemon_socket_path, run_ipc_server, send_daemon_request, DaemonRequest, DaemonResponse,
     MultiDisplayHost,
@@ -17,8 +19,12 @@ use linux_quest_host::{
     about = "Linux Quest 3 VR Streaming Host & Virtual Display Daemon"
 )]
 struct Cli {
+    /// Launch interactive terminal status dashboard directly
+    #[arg(long, global = true)]
+    tui: bool,
+
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -27,7 +33,28 @@ enum Commands {
     Display(DisplayArgs),
 
     /// Run persistent background daemon holding virtual monitors and display sessions
-    Daemon,
+    Daemon(DaemonArgs),
+
+    /// Launch interactive terminal status dashboard
+    Dashboard(DashboardArgs),
+}
+
+#[derive(Args, Debug, Default)]
+struct DaemonArgs {
+    /// Run daemon with interactive terminal status dashboard in foreground
+    #[arg(long)]
+    tui: bool,
+}
+
+#[derive(Args, Debug, Default)]
+struct DashboardArgs {
+    /// Run with simulated telemetry without requiring active Quest headset or running daemon
+    #[arg(short, long)]
+    demo: bool,
+
+    /// Dashboard refresh / tick rate in milliseconds
+    #[arg(short = 'r', long, default_value_t = 100)]
+    tick_rate_ms: u64,
 }
 
 #[derive(Args, Debug)]
@@ -101,102 +128,178 @@ impl From<CliLayoutMode> for DisplayLayoutMode {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
-        .init();
-
     let cli = Cli::parse();
 
-    match cli.command {
-        Commands::Daemon => {
+    let is_tui = cli.tui
+        || matches!(&cli.command, Some(Commands::Dashboard(_)))
+        || matches!(
+            &cli.command,
+            Some(Commands::Daemon(DaemonArgs { tui: true }))
+        );
+
+    if !is_tui {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()),
+            )
+            .init();
+    }
+
+    let command = match cli.command {
+        Some(cmd) => cmd,
+        None => {
+            if cli.tui {
+                Commands::Dashboard(DashboardArgs::default())
+            } else {
+                use clap::CommandFactory;
+                let _ = Cli::command().print_help();
+                println!();
+                return Ok(());
+            }
+        }
+    };
+
+    match command {
+        Commands::Dashboard(args) => {
+            let tick_rate = Duration::from_millis(args.tick_rate_ms.max(20));
+            if args.demo {
+                let source = MockTelemetrySource::new();
+                run_dashboard_with_source(source, tick_rate, None).await?;
+            } else {
+                let socket = daemon_socket_path();
+                if !socket.exists() {
+                    eprintln!(
+                        "Error: Cannot connect to Linux Quest daemon at {:?}",
+                        socket
+                    );
+                    eprintln!("Please start the host daemon first:");
+                    eprintln!("  linux-quest-host daemon");
+                    eprintln!("Or run the dashboard in simulation mode:");
+                    eprintln!("  linux-quest-host dashboard --demo");
+                    std::process::exit(1);
+                }
+                let source = IpcTelemetrySource;
+                run_dashboard_with_source(source, tick_rate, None).await?;
+            }
+        }
+        Commands::Daemon(daemon_args) => {
             let host = Arc::new(MultiDisplayHost::create_auto().await?);
-            info!(
-                backend = host.backend_name().await,
-                "Linux Quest host daemon starting"
-            );
+            let run_tui = daemon_args.tui || cli.tui;
 
-            let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
-            let shutdown_tx_clone = shutdown_tx.clone();
-            tokio::spawn(async move {
-                let _ = tokio::signal::ctrl_c().await;
-                info!("Ctrl-C signal received; stopping daemon...");
+            if run_tui {
+                let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+                let shutdown_tx_clone = shutdown_tx.clone();
+                let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let shutdown_flag_clone = shutdown_flag.clone();
+
+                let host_clone = host.clone();
+                let ipc_handle = tokio::spawn(async move {
+                    if let Err(e) = run_ipc_server(host_clone, shutdown_rx).await {
+                        tracing::error!("Daemon IPC server error: {e}");
+                    }
+                });
+
+                let source = MockTelemetrySource::new();
+                let _ = run_dashboard_with_source(
+                    source,
+                    Duration::from_millis(100),
+                    Some(shutdown_flag),
+                )
+                .await;
+
+                // TUI exited (user hit q or Esc), shutdown daemon cleanly
                 let _ = shutdown_tx_clone.send(());
-            });
+                shutdown_flag_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = ipc_handle.await;
+            } else {
+                info!(
+                    backend = host.backend_name().await,
+                    "Linux Quest host daemon starting"
+                );
 
-            // Wire input receiver service feeding remote Quest events into the injector
-            let input_bind_addr = std::net::SocketAddr::from((
-                [0, 0, 0, 0],
-                linux_quest_transport::DEFAULT_INPUT_PORT,
-            ));
-            match linux_quest_host::HostInputReceiver::bind_auto(input_bind_addr).await {
-                Ok(mut input_service) => {
-                    let running_flag = input_service.running_flag();
-                    let auto_injector = input_service.injector();
-                    let mut shutdown_rx_input = shutdown_tx.subscribe();
-                    tokio::spawn(async move {
-                        info!(
-                            addr = %input_bind_addr,
-                            "Input receiver service listening on UDP input channel"
+                let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+                let shutdown_tx_clone = shutdown_tx.clone();
+                tokio::spawn(async move {
+                    let _ = tokio::signal::ctrl_c().await;
+                    info!("Ctrl-C signal received; stopping daemon...");
+                    let _ = shutdown_tx_clone.send(());
+                });
+
+                // Wire input receiver service feeding remote Quest events into the injector
+                let input_bind_addr = std::net::SocketAddr::from((
+                    [0, 0, 0, 0],
+                    linux_quest_transport::DEFAULT_INPUT_PORT,
+                ));
+                match linux_quest_host::HostInputReceiver::bind_auto(input_bind_addr).await {
+                    Ok(mut input_service) => {
+                        let running_flag = input_service.running_flag();
+                        let auto_injector = input_service.injector();
+                        let mut shutdown_rx_input = shutdown_tx.subscribe();
+                        tokio::spawn(async move {
+                            info!(
+                                addr = %input_bind_addr,
+                                "Input receiver service listening on UDP input channel"
+                            );
+                            tokio::select! {
+                                res = input_service.run() => {
+                                    if let Err(e) = res {
+                                        tracing::warn!("Input receiver service exited: {e}");
+                                    }
+                                }
+                                _ = shutdown_rx_input.recv() => {
+                                    running_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                                    if let Ok(mut inj) = auto_injector.lock() {
+                                        let _ = inj.release_all();
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to bind UDP input channel on {input_bind_addr}; input receiver disabled"
                         );
-                        tokio::select! {
-                            res = input_service.run() => {
-                                if let Err(e) = res {
-                                    tracing::warn!("Input receiver service exited: {e}");
-                                }
-                            }
-                            _ = shutdown_rx_input.recv() => {
-                                running_flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                                if let Ok(mut inj) = auto_injector.lock() {
-                                    let _ = inj.release_all();
-                                }
-                            }
-                        }
-                    });
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "Failed to bind UDP input channel on {input_bind_addr}; input receiver disabled"
-                    );
-                }
-            }
 
-            // Wire clipboard synchronization service over reliable control channel
-            let control_bind_addr = std::net::SocketAddr::from((
-                [0, 0, 0, 0],
-                linux_quest_transport::DEFAULT_CONTROL_PORT,
-            ));
-            match linux_quest_host::HostClipboardService::bind_auto(control_bind_addr).await {
-                Ok(mut clipboard_service) => {
-                    let running_flag = clipboard_service.running_flag();
-                    let mut shutdown_rx_clipboard = shutdown_tx.subscribe();
-                    tokio::spawn(async move {
-                        info!(
-                            addr = %control_bind_addr,
-                            "Clipboard synchronization service listening on control channel"
+                // Wire clipboard synchronization service over reliable control channel
+                let control_bind_addr = std::net::SocketAddr::from((
+                    [0, 0, 0, 0],
+                    linux_quest_transport::DEFAULT_CONTROL_PORT,
+                ));
+                match linux_quest_host::HostClipboardService::bind_auto(control_bind_addr).await {
+                    Ok(mut clipboard_service) => {
+                        let running_flag = clipboard_service.running_flag();
+                        let mut shutdown_rx_clipboard = shutdown_tx.subscribe();
+                        tokio::spawn(async move {
+                            info!(
+                                addr = %control_bind_addr,
+                                "Clipboard synchronization service listening on control channel"
+                            );
+                            tokio::select! {
+                                res = clipboard_service.run() => {
+                                    if let Err(e) = res {
+                                        tracing::warn!("Clipboard synchronization service exited: {e}");
+                                    }
+                                }
+                                _ = shutdown_rx_clipboard.recv() => {
+                                    running_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to bind control channel on {control_bind_addr}; clipboard synchronization disabled"
                         );
-                        tokio::select! {
-                            res = clipboard_service.run() => {
-                                if let Err(e) = res {
-                                    tracing::warn!("Clipboard synchronization service exited: {e}");
-                                }
-                            }
-                            _ = shutdown_rx_clipboard.recv() => {
-                                running_flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                            }
-                        }
-                    });
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "Failed to bind control channel on {control_bind_addr}; clipboard synchronization disabled"
-                    );
-                }
-            }
 
-            run_ipc_server(host, shutdown_rx).await?;
-            info!("Daemon stopped cleanly.");
+                run_ipc_server(host, shutdown_rx).await?;
+                info!("Daemon stopped cleanly.");
+            }
         }
         Commands::Display(display_args) => {
             let req = match display_args.action {
@@ -253,6 +356,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             );
                         }
                     }
+                }
+                DaemonResponse::DashboardSnapshot(_) => {
+                    println!("Received DashboardSnapshot response from daemon.");
                 }
                 DaemonResponse::Success(msg) => {
                     println!("{msg}");
