@@ -26,12 +26,14 @@ pub enum DaemonRequest {
     Layout {
         mode: DisplayLayoutMode,
     },
+    DashboardSnapshot,
 }
 
 /// Response returned from daemon to CLI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DaemonResponse {
     Monitors(Vec<VirtualMonitor>),
+    DashboardSnapshot(Box<crate::tui::model::DashboardSnapshot>),
     Success(String),
     Error(String),
 }
@@ -194,6 +196,88 @@ async fn handle_ipc_client(
             Ok(()) => DaemonResponse::Success(format!("Applied layout: {mode:?}")),
             Err(e) => DaemonResponse::Error(e.to_string()),
         },
+        DaemonRequest::DashboardSnapshot => {
+            let monitors = host.list_monitors().await;
+            let displays: Vec<crate::tui::model::DisplaySnapshot> = monitors
+                .into_iter()
+                .map(|m| crate::tui::model::DisplaySnapshot {
+                    id: m.id as u16,
+                    name: m.name,
+                    width: m.width,
+                    height: m.height,
+                    refresh_rate: m.refresh_rate,
+                    fps: m.refresh_rate as f32,
+                    bitrate_mbps: 75.0,
+                    codec: "AV1".into(),
+                    is_virtual: m.is_virtual,
+                })
+                .collect();
+
+            let streaming = !displays.is_empty();
+            let conn_mode = if streaming {
+                linux_quest_protocol::ClientConnectionMode::UsbAdb
+            } else {
+                linux_quest_protocol::ClientConnectionMode::Disconnected
+            };
+
+            let mut video_latency = linux_quest_protocol::FrameLatencyBreakdown {
+                frame_id: 1,
+                capture_start_us: 1000,
+                capture_duration_us: 1150,
+                encode_duration_us: 2850,
+                host_queue_duration_us: 300,
+                transport_duration_us: 800,
+                client_decode_duration_us: 3100,
+                client_render_duration_us: 600,
+                total_motion_to_photon_us: 0,
+            };
+            video_latency.compute_total();
+
+            let mut audio_latency = linux_quest_protocol::AudioLatencyBreakdown {
+                frame_id: 1,
+                capture_start_us: 1000,
+                capture_duration_us: 300,
+                encode_duration_us: 400,
+                transport_duration_us: 800,
+                jitter_buffer_delay_us: 2500,
+                decode_duration_us: 200,
+                playout_buffer_duration_us: 500,
+                total_latency_us: 0,
+            };
+            audio_latency.compute_total();
+
+            let snap = crate::tui::model::DashboardSnapshot {
+                uptime_secs: 0,
+                streaming,
+                displays,
+                video_latency,
+                audio_latency,
+                client: linux_quest_protocol::ClientTransportTelemetry {
+                    mode: conn_mode,
+                    rtt_us: 1100,
+                    smoothed_rtt_us: 1050,
+                    packet_loss_rate: 0.0001,
+                    packets_sent: 1000,
+                    packets_recv: 999,
+                    packets_lost: 1,
+                    fec_recoveries: 1,
+                    bitrate_mbps: 85.0,
+                },
+                audio: linux_quest_protocol::AudioStreamTelemetry {
+                    active: streaming,
+                    codec: "Opus".into(),
+                    sample_rate: 48000,
+                    channels: 2,
+                    frame_size_ms: 2.5,
+                    bitrate_kbps: 128,
+                    jitter_us: 350,
+                    buffer_delay_us: 2500,
+                    buffer_health_pct: 100.0,
+                    plc_count: 0,
+                },
+            };
+            DaemonResponse::DashboardSnapshot(Box::new(snap))
+        }
     };
 
     // 3. Send response

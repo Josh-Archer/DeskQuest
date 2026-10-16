@@ -145,8 +145,17 @@ This roadmap outlines the development trajectory of `linux-quest` from initial a
     - Quest client input capture module mapping Android `KeyEvent` / `MotionEvent` (Bluetooth keyboard/mouse and controller-as-mouse) to Linux evdev keycodes.
     - 120Hz mouse motion and scroll coalescer with sub-pixel remainder preservation.
     - Low-latency UDP input channel sender/receiver (separate from video) with stale packet dropping and host injection receiver.
-  - [ ] Linux `uinput` kernel device creation and physical event injection backend (Part 2).
-  - [ ] Bi-directional clipboard sharing between Quest and Linux (X11 / Wayland clipboard protocols).
+  - [x] Linux `uinput` kernel device creation and physical event injection backend (Part 2 - Issue #11):
+    - Virtual mouse (`REL_X`/`REL_Y`, discrete & hi-res wheels, `BTN_LEFT`/`RIGHT`/`MIDDLE`/`SIDE`/`EXTRA`), absolute pointer (`ABS_X`/`ABS_Y`), and keyboard devices.
+    - `UinputDeviceFile` trait abstraction with mock writer enabling headless unit testing without `/dev/uinput`.
+    - Correct `SYN_REPORT` event batching and automatic release of held keys/buttons on client disconnect or drop.
+    - Clear diagnostics for missing `/dev/uinput` or permission denial with udev documentation.
+  - [x] Bi-directional clipboard sharing between Quest and Linux (Part 3 - Issue #11):
+    - Reliable control channel protocol messages with UTF-8 support, 4MiB size bounds, chunking for large text, and monotonic origin/version tracking.
+    - Host-side `ClipboardBackend` trait with Wayland (`wl-copy`/`wl-paste`) and X11 (`xclip`/`xsel`) auto-detection and debounced change watcher.
+    - Quest client `ClipboardManager` trait with Android JNI backend and headless mock.
+    - Deterministic shared `ClipboardSyncEngine` with deduplication, echo loop suppression, and last-writer conflict resolution.
+    - Host daemon wiring on TCP control channel alongside virtual input receivers.
 
 ---
 
@@ -154,11 +163,19 @@ This roadmap outlines the development trajectory of `linux-quest` from initial a
 *Objective: Complete multimedia experience, intuitive host controls, and frictionless installation.*
 
 - **7.1 PipeWire Audio Streaming (Opus)**
-  - PipeWire audio capture sink on Linux host.
-  - Low-latency Opus encoding and synchronized audio playback on Quest.
+  - [x] Host audio capture (`AudioSource` trait, PipeWire sink-monitor backend behind `pipewire-audio` feature, 48kHz stereo f32/i16, synthetic sine generator).
+  - [x] Low-latency Opus encoding (`AudioEncoder` trait, 2.5ms/5ms frames, restricted low-delay application, configurable bitrate, FEC/DTX).
+  - [x] Binary protocol audio packetization (`AudioPacket`, `PacketType::AudioFrame`) with capture timestamps synchronized to video presentation clock.
+  - [x] Host streaming pipeline (`HostAudioPipeline`) transmitting audio packets over TCP, UDP, and loopback transports.
+  - [x] Synchronized audio playback and jitter buffer integration on Quest client (`AudioReceiver` with adaptive jitter buffer keyed by sequence number, Opus decoding with PLC/FEC behind `AudioDecoder` trait, A/V presentation clock synchronization with drift correction by small resampling or drop/insert, and `AudioSink` trait with Android AAudio low-latency mode and mock sink).
 
 - **7.2 Host Management CLI & TUI**
-  - Lightweight terminal UI (using `ratatui`) showing real-time latency stats (capture, encode, network, decode), connected headsets, and virtual display toggles.
+  - [x] Lightweight terminal status dashboard (`ratatui` with crossterm backend via `dashboard` subcommand or `--tui` flag) showing:
+    - Active virtual displays with resolution, refresh rate, FPS, bitrate, and codec.
+    - Real-time glass-to-glass latency waterfall breakdown (Capture ➔ Encode ➔ Queue ➔ Transport ➔ Decode ➔ Render, plus audio pipeline) with budget gauges and sparklines.
+    - Connected client status (USB/ADB vs Wi-Fi, smoothed RTT, packet loss, and Reed-Solomon/XOR FEC recoveries).
+    - Audio stream telemetry (PipeWire capture, Opus low-delay codec, jitter, buffer delay, health, and PLC concealments).
+    - Pure decoupled state/model layer with rolling window aggregation and full `TestBackend` snapshot test coverage.
   - Simple tray icon / systemd service for headless background operation.
 
 - **7.3 Packaging & Distribution**

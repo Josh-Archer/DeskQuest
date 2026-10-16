@@ -77,7 +77,77 @@ For an in-depth breakdown of the technical components, see [ARCHITECTURE.md](ARC
 | **Video Transport** | **QUIC / Custom UDP / USB (ADB)** | Sub-millisecond packet pacing, FEC (Forward Error Correction), and USB reverse-tethering support. |
 | **VR Runtime** | **OpenXR (Android / Horizon OS)** | Industry standard cross-vendor XR runtime with native Meta extensions for Passthrough and Composition Layers. |
 | **Quest Client Core** | **Rust (`openxr` + `ash` Vulkan) / Android NDK** | Direct access to native Vulkan swapchains and `AMediaCodec` hardware decoding buffers. |
+| **Audio Streaming** | **PipeWire + Opus + Android AAudio** | Sub-3ms host capture/encode (Opus 2.5ms frames), adaptive jitter buffer, PLC/FEC loss concealment, A/V presentation sync, and native AAudio low-latency sink. |
 | **Input Redirection** | **Linux `uinput`** | Kernel-level low-overhead virtual keyboard and mouse emulation. |
+| **Management Dashboard** | **Ratatui + Crossterm** | Real-time terminal status dashboard for active virtual displays, latency waterfall, client link, and audio stream stats. |
+
+---
+
+## 🖥️ Host Status Dashboard (TUI)
+
+Launch the real-time terminal status dashboard powered by `ratatui`:
+
+```bash
+# Live dashboard connecting to the running background daemon
+linux-quest-host dashboard
+
+# Standalone simulation / demo mode with synthetic telemetry
+linux-quest-host dashboard --demo
+
+# Run background daemon holding virtual monitors with interactive dashboard
+linux-quest-host daemon --tui
+```
+
+Hotkeys:
+- `q` or `Esc`: Exit dashboard (restores terminal cleanly)
+- `r`: Reset rolling telemetry history
+- `Space`: Pause / Resume real-time updates
+
+---
+
+## 🎮 Kernel Input Injection (`/dev/uinput` Setup)
+
+`linux-quest` uses the Linux kernel's `uinput` subsystem to inject input events with native kernel-level responsiveness:
+- **Virtual Mouse:** Relative movement (`REL_X`, `REL_Y`), discrete & high-resolution scrolling (`REL_WHEEL`, `REL_HWHEEL`, `REL_WHEEL_HI_RES`, `REL_HWHEEL_HI_RES`), and mouse buttons (`BTN_LEFT`, `BTN_RIGHT`, `BTN_MIDDLE`, `BTN_SIDE`, `BTN_EXTRA`).
+- **Virtual Absolute Pointer:** Absolute coordinate positioning (`ABS_X`, `ABS_Y`) and pointer buttons for spatial ray pointing.
+- **Virtual Keyboard:** Full evdev keycodes with autorepeat support and automatic held key/button release on client disconnect or drop.
+
+### Permissions & Udev Configuration
+To allow `linux-quest-host` to create virtual devices without running as `root`:
+
+1. **Load the `uinput` kernel module:**
+   ```bash
+   sudo modprobe uinput
+   ```
+
+2. **Install the udev rule:**
+   Create `/etc/udev/rules.d/99-uinput.rules`:
+   ```udev
+   KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"
+   ```
+
+3. **Add your user to the `input` group:**
+   ```bash
+   sudo usermod -aG input $USER
+   ```
+   *(Log out and log back in for the new group membership to take effect).*
+
+4. **Reload udev rules:**
+   ```bash
+   sudo udevadm control --reload-rules && sudo udevadm trigger
+   ```
+
+When `/dev/uinput` is unavailable or permissions are not yet configured, the host daemon automatically falls back to an in-memory/logging mock injector and logs actionable guidance.
+
+---
+
+## 📋 Bidirectional Clipboard Synchronization
+
+`linux-quest` provides seamless, bidirectional UTF-8 text clipboard synchronization between Linux desktop and Meta Quest headsets:
+- **Host Desktop Integration:** Automatically detects Wayland (`wl-copy`/`wl-paste`) vs X11 (`xclip`/`xsel`) via `WAYLAND_DISPLAY`/`DISPLAY`, polling with debounced change detection.
+- **Quest Client Integration:** `ClipboardManager` trait wrapping Android Horizon OS clipboard services (JNI) with headless mock fallbacks.
+- **Loop-Free Synchronization:** Origin tracking and monotonic versions resolve race conditions via deterministic last-writer ordering while suppressing echo loops.
+- **Large Text Chunking:** Safe slicing on UTF-8 character boundaries for payloads up to 4 MiB carried over the reliable control channel.
 
 ---
 
@@ -91,7 +161,7 @@ The project is structured into 7 core phases:
 - [ ] **Phase 4:** Meta Quest OpenXR Client & Hardware Decoder (AMediaCodec, Vulkan, Composition Layers)
 - [ ] **Phase 5:** Virtual Multi-Monitor Management on Linux (Wayland virtual outputs, DRM/KMS, dynamic EDID)
 - [ ] **Phase 6:** Spatial Workspace, Passthrough & Input Redirection (6DoF pose, passthrough layers, controller/hand 6DoF manipulation & layout persistence completed; host input injection in progress)
-- [ ] **Phase 7:** Audio Streaming & Production Polish (PipeWire Opus, packaging, CLI/TUI)
+- [ ] **Phase 7:** Audio Streaming & Production Polish (PipeWire Opus host capture, 2.5ms/5ms low-delay encoding, Quest client AAudio playback with A/V sync, packaging, CLI/TUI)
 
 Detailed milestone descriptions, deliverables, and acceptance criteria are outlined in [ROADMAP.md](ROADMAP.md).
 

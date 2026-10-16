@@ -1,3 +1,6 @@
+pub mod audio;
+#[cfg(feature = "pipewire-audio")]
+pub mod audio_pipewire;
 pub mod dmabuf;
 pub mod pipewire;
 
@@ -5,6 +8,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use thiserror::Error;
 
+pub use audio::{AudioSampleFormat, AudioSource, AutoAudioSource, RawAudioFrame, SineAudioSource};
+#[cfg(feature = "pipewire-audio")]
+pub use audio_pipewire::PipeWireAudioSource;
 pub use dmabuf::DmaBufPlane;
 pub use pipewire::PipeWireCapture;
 
@@ -263,5 +269,28 @@ mod tests {
         let frame = auto.capture_frame().await.expect("Capture frame failed");
         assert_eq!(frame.width, 1280);
         assert_eq!(frame.height, 720);
+    }
+
+    #[tokio::test]
+    async fn test_audio_source_sine_stream() {
+        let mut source = SineAudioSource::new_default();
+        source.init().await.expect("Sine source init failed");
+        assert_eq!(source.sample_rate(), 48000);
+        assert_eq!(source.channels(), 2);
+        assert_eq!(source.format(), AudioSampleFormat::F32Le);
+
+        let chunk1 = source
+            .capture_chunk()
+            .await
+            .expect("Chunk 1 capture failed");
+        assert_eq!(chunk1.samples_per_channel, 120);
+        assert_eq!(chunk1.pts_us, 0);
+
+        let chunk2 = source
+            .capture_chunk()
+            .await
+            .expect("Chunk 2 capture failed");
+        assert_eq!(chunk2.samples_per_channel, 120);
+        assert_eq!(chunk2.pts_us, 2500); // 2.5ms later
     }
 }

@@ -10,10 +10,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 
+pub mod audio_pipeline;
+pub mod clipboard_service;
 pub mod input_receiver;
 pub mod ipc;
 pub mod multi_display;
+pub mod tui;
 
+pub use audio_pipeline::HostAudioPipeline;
+pub use clipboard_service::{HostClipboardService, HOST_CLIPBOARD_ORIGIN_ID};
 pub use input_receiver::HostInputReceiver;
 pub use ipc::{
     daemon_pid_path, daemon_runtime_dir, daemon_socket_path, run_ipc_server, send_daemon_request,
@@ -29,6 +34,9 @@ pub enum HostError {
     #[error("Encoder failure: {0}")]
     Encoder(#[from] linux_quest_encoder::EncoderError),
 
+    #[error("Audio encoder failure: {0}")]
+    AudioEncoder(#[from] linux_quest_encoder::AudioEncoderError),
+
     #[error("Transport failure: {0}")]
     Transport(#[from] linux_quest_transport::TransportError),
 
@@ -43,6 +51,15 @@ pub enum HostError {
 
     #[error("Bincode error: {0}")]
     Bincode(#[from] Box<bincode::ErrorKind>),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("IPC error: {0}")]
+    Ipc(String),
+
+    #[error("Dashboard error: {0}")]
+    Dashboard(String),
 
     #[error("Session is not running")]
     NotRunning,
@@ -274,10 +291,23 @@ where
             }
             PacketType::Disconnect => {
                 self.running.store(false, Ordering::SeqCst);
+                let _ = self.input.release_all();
             }
             _ => (),
         }
         Ok(())
+    }
+}
+
+impl<C, E, T, I> Drop for HostStreamSession<C, E, T, I>
+where
+    C: DisplayCapture,
+    E: VideoEncoder,
+    T: TransportEndpoint,
+    I: InputInjector,
+{
+    fn drop(&mut self) {
+        let _ = self.input.release_all();
     }
 }
 
@@ -449,5 +479,68 @@ mod tests {
             }
             _ => panic!("Expected ActiveMonitors response"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_host_audio_pipeline_multi_frame() {
+        let source = linux_quest_capture::SineAudioSource::new_default();
+        let enc_cfg = linux_quest_encoder::AudioEncoderConfig::default();
+        let encoder = linux_quest_encoder::AutoAudioEncoder::new(enc_cfg.clone());
+        let (ep_host, mut ep_client) = LoopbackEndpoint::create_pair();
+
+        let mut pipeline = HostAudioPipeline::new(source, encoder, ep_host, 1);
+        pipeline
+            .init(enc_cfg)
+            .await
+            .expect("Audio pipeline init failed");
+
+        // Stream 5 audio frames
+        for expected_id in 1..=5 {
+            let fid = pipeline
+                .step_stream_audio_frame()
+                .await
+                .expect("Step audio failed");
+            assert_eq!(fid, expected_id);
+
+            let pkt = ep_client
+                .recv_packet()
+                .await
+                .expect("Client recv audio failed");
+            assert_eq!(pkt.header.packet_type, PacketType::AudioFrame);
+            assert_eq!(pkt.header.stream_id, 1);
+            assert_eq!(pkt.header.sequence, expected_id as u32);
+
+            let audio = linux_quest_protocol::AudioPacket::deserialize(&pkt.payload)
+                .expect("Deserialize audio failed");
+            assert_eq!(audio.meta.frame_id, expected_id);
+            assert_eq!(audio.meta.sample_rate, 48000);
+            assert_eq!(audio.meta.channels, 2);
+            assert_eq!(audio.meta.samples_per_channel, 120);
+            assert_eq!(audio.duration_us(), 2500);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_host_audio_pipeline_ping_pong() {
+        let source = linux_quest_capture::SineAudioSource::new_default();
+        let encoder = linux_quest_encoder::MockAudioEncoder::new(
+            linux_quest_encoder::AudioEncoderConfig::default(),
+        );
+        let (ep_host, mut ep_client) = LoopbackEndpoint::create_pair();
+
+        let mut pipeline = HostAudioPipeline::new(source, encoder, ep_host, 1);
+
+        let ping_payload = bytes::Bytes::from_static(b"audio-ping");
+        let ping_hdr = PacketHeader::new(PacketType::Ping, 1, 1, 12345, &ping_payload);
+        let ping_pkt = Packet::new(ping_hdr, ping_payload.clone());
+
+        pipeline
+            .handle_incoming_packet(ping_pkt)
+            .await
+            .expect("Handle ping failed");
+
+        let pong_pkt = ep_client.recv_packet().await.expect("Recv pong failed");
+        assert_eq!(pong_pkt.header.packet_type, PacketType::Pong);
+        assert_eq!(pong_pkt.payload, ping_payload);
     }
 }

@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use linux_quest_protocol::packet::Packet;
 
+use crate::audio::{AudioReceiver, AudioReceiverConfig};
 use crate::config::ClientConfig;
 use crate::decoder::{create_decoder, DecoderStats, HardwareVideoDecoder};
 use crate::error::ClientResult;
@@ -23,6 +24,7 @@ pub struct QuestClientRuntime {
     openxr_context: OpenXrContext,
     vulkan_context: VulkanContext,
     receiver: ClientReceiver,
+    audio_receiver: AudioReceiver,
     frame_loop: FrameLoopEngine,
     hud: DebugHud,
     screen_transform: ScreenTransform,
@@ -90,6 +92,7 @@ impl QuestClientRuntime {
         )?;
 
         let receiver = ClientReceiver::new(&config);
+        let audio_receiver = AudioReceiver::new(AudioReceiverConfig::default());
         let frame_loop = FrameLoopEngine::new();
         let hud = DebugHud::new(512, 256);
         let interaction_state_machine = GrabStateMachine::new();
@@ -101,6 +104,7 @@ impl QuestClientRuntime {
             openxr_context,
             vulkan_context,
             receiver,
+            audio_receiver,
             frame_loop,
             hud,
             screen_transform,
@@ -283,9 +287,23 @@ impl QuestClientRuntime {
         Ok(pacing)
     }
 
-    /// Ingests an incoming network or USB packet into the jitter buffer.
+    /// Ingests an incoming network or USB packet into the appropriate jitter buffer (video or audio).
     pub fn ingest_packet(&mut self, packet: Packet, now: Instant) {
-        self.receiver.ingest_packet(packet, now);
+        if packet.header.packet_type == linux_quest_protocol::packet::PacketType::AudioFrame {
+            let _ = self.audio_receiver.ingest_packet(packet, now);
+        } else {
+            self.receiver.ingest_packet(packet, now);
+        }
+    }
+
+    /// Returns a reference to the client audio receiver.
+    pub fn audio_receiver(&self) -> &AudioReceiver {
+        &self.audio_receiver
+    }
+
+    /// Returns a mutable reference to the client audio receiver.
+    pub fn audio_receiver_mut(&mut self) -> &mut AudioReceiver {
+        &mut self.audio_receiver
     }
 
     /// Requests a dynamic display refresh rate change.
