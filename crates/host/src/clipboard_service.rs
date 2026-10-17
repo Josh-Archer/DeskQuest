@@ -250,6 +250,11 @@ impl HostClipboardService<AutoClipboardBackend> {
         (service, incoming_tx, outgoing_rx)
     }
 
+    /// Address the control listener is bound to, or `None` if no listener was bound.
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.listener.as_ref().and_then(|l| l.local_addr().ok())
+    }
+
     /// Binds a TCP listener to `bind_addr` for accepting client control channel connections.
     pub async fn bind_auto(bind_addr: SocketAddr) -> Result<Self, HostError> {
         let listener = TcpListener::bind(bind_addr)

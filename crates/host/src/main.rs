@@ -199,13 +199,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let host = Arc::new(MultiDisplayHost::create_auto().await?);
             let run_tui = daemon_args.tui || cli.tui;
 
-            // Best effort: a failure to advertise is logged and never stops the daemon.
-            let advertiser = linux_quest_host::advertise::advertise_daemon(
-                !daemon_args.no_advertise,
-                linux_quest_host::advertise::system_instance_name(),
-            )
-            .await;
-
             if run_tui {
                 let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
                 let shutdown_tx_clone = shutdown_tx.clone();
@@ -231,9 +224,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let _ = shutdown_tx_clone.send(());
                 shutdown_flag_clone.store(true, std::sync::atomic::Ordering::SeqCst);
                 let _ = ipc_handle.await;
-                if let Some(advertiser) = advertiser {
-                    advertiser.stop().await;
-                }
             } else {
                 info!(
                     backend = host.backend_name().await,
@@ -256,8 +246,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     [0, 0, 0, 0],
                     linux_quest_transport::DEFAULT_INPUT_PORT,
                 ));
+                let mut input_port = None;
                 match linux_quest_host::HostInputReceiver::bind_auto(input_bind_addr).await {
                     Ok(mut input_service) => {
+                        input_port = input_service.local_addr().ok().map(|a| a.port());
                         let running_flag = input_service.running_flag();
                         let auto_injector = input_service.injector();
                         let mut shutdown_rx_input = shutdown_tx.subscribe();
@@ -294,8 +286,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     [0, 0, 0, 0],
                     linux_quest_transport::DEFAULT_CONTROL_PORT,
                 ));
+                let mut control_port = None;
                 match linux_quest_host::HostClipboardService::bind_auto(control_bind_addr).await {
                     Ok(mut clipboard_service) => {
+                        control_port = clipboard_service.local_addr().map(|a| a.port());
                         let running_flag = clipboard_service.running_flag();
                         let mut shutdown_rx_clipboard = shutdown_tx.subscribe();
                         tokio::spawn(async move {
@@ -322,6 +316,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         );
                     }
                 }
+
+                // Advertise only the ports that were really bound above.
+                let listening = match (control_port, input_port) {
+                    (Some(control), Some(input)) => {
+                        Some(linux_quest_host::advertise::ListeningPorts { control, input })
+                    }
+                    _ => None,
+                };
+                let advertiser = linux_quest_host::advertise::advertise_daemon(
+                    !daemon_args.no_advertise,
+                    linux_quest_host::advertise::system_instance_name(),
+                    listening,
+                )
+                .await;
 
                 let served = run_ipc_server(host, shutdown_rx).await;
                 if let Some(advertiser) = advertiser {
