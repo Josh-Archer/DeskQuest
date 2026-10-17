@@ -360,6 +360,83 @@ mod tests {
         assert_eq!(receiver.highest_sequence_seen(), 1);
     }
 
+    async fn sender_to(target: SocketAddr) -> (InputChannelSender, SocketAddr) {
+        let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = s.local_addr().unwrap();
+        (InputChannelSender::new(s, Some(target), 4), addr)
+    }
+
+    fn mv(dx: i32) -> Vec<InputEvent> {
+        vec![InputEvent::MouseMoveRelative { dx, dy: 0 }]
+    }
+
+    #[tokio::test]
+    async fn test_relatches_to_new_port_after_peer_silence() {
+        let rx_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rx_addr = rx_sock.local_addr().unwrap();
+        let mut receiver = InputChannelReceiver::new(rx_sock, None, true)
+            .with_relatch_after(Duration::from_millis(50));
+
+        let (mut old, old_addr) = sender_to(rx_addr).await;
+        old.send_events(mv(1), 1).await.unwrap();
+        receiver.recv_events().await.unwrap();
+        assert_eq!(receiver.remote_addr(), Some(old_addr));
+
+        // Reconnect from a new port (sequence restarts at 1) after the silence window.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let (mut new, new_addr) = sender_to(rx_addr).await;
+        new.send_events(mv(7), 2).await.unwrap();
+        let ev = receiver.recv_events().await.unwrap();
+        assert_eq!(ev, mv(7));
+        assert_eq!(receiver.remote_addr(), Some(new_addr));
+    }
+
+    #[tokio::test]
+    async fn test_active_peer_is_not_displaced_by_other_sender() {
+        let rx_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rx_addr = rx_sock.local_addr().unwrap();
+        let mut receiver = InputChannelReceiver::new(rx_sock, None, true);
+
+        let (mut a, a_addr) = sender_to(rx_addr).await;
+        a.send_events(mv(1), 1).await.unwrap();
+        receiver.recv_events().await.unwrap();
+
+        let (mut b, _) = sender_to(rx_addr).await;
+        b.send_events(mv(9), 2).await.unwrap();
+        a.send_events(mv(2), 3).await.unwrap();
+        let ev = receiver.recv_events().await.unwrap();
+        assert_eq!(ev, mv(2));
+        assert_eq!(receiver.remote_addr(), Some(a_addr));
+    }
+
+    #[tokio::test]
+    async fn test_garbage_datagram_does_not_pin_peer() {
+        let rx_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rx_addr = rx_sock.local_addr().unwrap();
+        let mut receiver = InputChannelReceiver::new(rx_sock, None, true)
+            .with_relatch_after(Duration::from_millis(50));
+
+        // Stray garbage while unlatched: error, and the peer stays unset.
+        let stray = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        stray.send_to(&[0xFF; 16], rx_addr).await.unwrap();
+        assert!(receiver.recv_events().await.is_err());
+        assert_eq!(receiver.remote_addr(), None);
+
+        // The real client still latches afterwards.
+        let (mut real, real_addr) = sender_to(rx_addr).await;
+        real.send_events(mv(1), 1).await.unwrap();
+        receiver.recv_events().await.unwrap();
+        assert_eq!(receiver.remote_addr(), Some(real_addr));
+
+        // Garbage from another source after the silence window does not displace the peer.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        stray.send_to(&[0xFF; 16], rx_addr).await.unwrap();
+        real.send_events(mv(2), 2).await.unwrap();
+        let ev = receiver.recv_events().await.unwrap();
+        assert_eq!(ev, mv(2));
+        assert_eq!(receiver.remote_addr(), Some(real_addr));
+    }
+
     #[tokio::test]
     async fn test_drop_stale_by_sequence() {
         let (mut sender, mut receiver) = create_input_channel_pair(4).await.unwrap();
