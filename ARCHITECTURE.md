@@ -99,6 +99,15 @@ For wireless freedom:
 - Jitter buffer dynamically tuned based on round-trip time (RTT) moving averages.
 - Out-of-band reliable control channel for handshake, screen geometry, resolution updates, and encryption keys.
 
+### Ports
+| Port | Proto | Purpose |
+|------|-------|---------|
+| 48444 | TCP | Host control channel (clipboard, signaling). Also the `adb reverse` port: the Quest connects to `127.0.0.1:48444` over USB. |
+| 48442 | UDP | Low-latency input channel (Quest to host). |
+
+Status: the host has no video endpoint yet, and the daemon does not yet start the ADB bridge, so
+the reverse tunnel is not set up automatically. These are the agreed defaults only.
+
 ---
 
 ## 6. Input Injection via Kernel `uinput`

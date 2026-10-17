@@ -4,6 +4,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
 
+use linux_quest_transport::DEFAULT_CONTROL_PORT;
+
 use crate::error::{ClientError, ClientResult};
 
 /// Supported transport protocol modes.
@@ -11,7 +13,7 @@ use crate::error::{ClientError, ClientResult};
 pub enum TransportMode {
     /// Paced UDP datagrams with Reed-Solomon/XOR FEC.
     Udp,
-    /// USB ADB reverse-tethering TCP tunnel (`adb reverse tcp:42069 tcp:42069`).
+    /// USB ADB reverse-tethering TCP tunnel (`adb reverse tcp:48444 tcp:48444`, the host control port).
     AdbReverseTcp,
 }
 
@@ -54,7 +56,7 @@ pub enum DisplayMode {
 /// Configuration settings for the Quest streaming client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
-    /// Remote host address (default `127.0.0.1:42069` for ADB reverse tunnel).
+    /// Remote host address (default `127.0.0.1:48444` for the ADB reverse tunnel to the host control port).
     pub host_addr: SocketAddr,
 
     /// Transport mode (UDP or ADB Reverse TCP).
@@ -112,7 +114,10 @@ pub struct ClientConfig {
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
-            host_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 42069),
+            host_addr: SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                DEFAULT_CONTROL_PORT,
+            ),
             transport_mode: TransportMode::AdbReverseTcp,
             codec: ClientVideoCodec::Av1,
             display_mode: DisplayMode::CurvedCylinder,
@@ -203,6 +208,14 @@ impl ClientConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_default_usb_host_addr_is_control_port() {
+        assert_eq!(
+            ClientConfig::default().host_addr.to_string(),
+            "127.0.0.1:48444"
+        );
+    }
 
     #[test]
     fn test_default_config_validates() {

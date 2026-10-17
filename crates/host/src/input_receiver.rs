@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use linux_quest_input::InputInjector;
 use linux_quest_transport::{InputChannelReceiver, TransportError};
 
+use crate::link_status::SharedLinkTracker;
 use crate::HostError;
 
 /// Host-side service that listens on the low-latency input channel
@@ -16,6 +17,7 @@ pub struct HostInputReceiver<I: InputInjector> {
     receiver: InputChannelReceiver,
     injector: Arc<Mutex<I>>,
     running: Arc<AtomicBool>,
+    link: Option<SharedLinkTracker>,
 }
 
 impl<I: InputInjector> HostInputReceiver<I> {
@@ -24,7 +26,14 @@ impl<I: InputInjector> HostInputReceiver<I> {
             receiver,
             injector,
             running: Arc::new(AtomicBool::new(false)),
+            link: None,
         }
+    }
+
+    /// Reports each received packet's sender to the shared link tracker.
+    pub fn with_link_tracker(mut self, link: SharedLinkTracker) -> Self {
+        self.link = Some(link);
+        self
     }
 
     pub fn running_flag(&self) -> Arc<AtomicBool> {
@@ -43,6 +52,9 @@ impl<I: InputInjector> HostInputReceiver<I> {
     /// Returns the number of events injected.
     pub async fn step(&mut self) -> Result<usize, HostError> {
         let events = self.receiver.recv_events().await?;
+        if let (Some(link), Some(peer)) = (&self.link, self.receiver.remote_addr()) {
+            link.lock().input_packet(peer, std::time::Instant::now());
+        }
         let count = events.len();
         if count > 0 {
             let mut injector = self.injector.lock().map_err(|e| {

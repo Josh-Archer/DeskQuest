@@ -25,13 +25,11 @@ pub enum ConnectionState {
 impl ConnectionState {
     /// Maps the daemon's dashboard snapshot onto a tray state.
     ///
-    /// The daemon reports `streaming` once virtual displays exist, so a snapshot
-    /// without displays is `Disconnected` regardless of the transport field.
-    ///
-    /// The transport and streaming fields are only accurate once
-    /// Josh-Archer/linux-quest#44 (host link status) is merged. Before it, the daemon
-    /// reports USB whenever monitors exist (and never Wi-Fi), so this can show
-    /// "Connected over USB" with no headset attached.
+    /// The daemon reports real link status: `client.mode` is the transport of the
+    /// connected client (`Disconnected` when none is connected), and `streaming` is
+    /// true only when a client is connected and a virtual display exists. A snapshot
+    /// that is not streaming is therefore `Disconnected` regardless of the transport
+    /// field, and a `Disconnected` transport is never shown as connected.
     pub fn from_snapshot(snapshot: &DashboardSnapshot) -> Self {
         if !snapshot.streaming {
             return Self::Disconnected;
@@ -142,6 +140,26 @@ mod tests {
         usb.streaming = false;
         assert_eq!(
             ConnectionState::from_snapshot(&usb),
+            ConnectionState::Disconnected
+        );
+    }
+
+    #[tokio::test]
+    async fn from_snapshot_wifi_without_streaming_is_disconnected() {
+        let mut wifi = snapshot_for(ClientConnectionMode::Wifi).await;
+        wifi.streaming = false;
+        assert_eq!(
+            ConnectionState::from_snapshot(&wifi),
+            ConnectionState::Disconnected
+        );
+    }
+
+    #[tokio::test]
+    async fn from_snapshot_streaming_with_disconnected_mode_is_disconnected() {
+        let mut idle = snapshot_for(ClientConnectionMode::Disconnected).await;
+        idle.streaming = true;
+        assert_eq!(
+            ConnectionState::from_snapshot(&idle),
             ConnectionState::Disconnected
         );
     }

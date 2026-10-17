@@ -300,6 +300,7 @@ async fn test_display_config_packet_lifecycle() {
 #[tokio::test]
 async fn test_daemon_ipc_single_owner_lock() {
     use linux_quest_display::backend::mock::MockDisplayBackend;
+    use linux_quest_host::link_status::{new_shared_link_tracker, DEFAULT_INPUT_LIVENESS};
     use linux_quest_host::{
         daemon_pid_path, daemon_runtime_dir, daemon_socket_path, run_ipc_server, MultiDisplayHost,
     };
@@ -316,7 +317,14 @@ async fn test_daemon_ipc_single_owner_lock() {
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
     let host_clone = host.clone();
 
-    let server_task = tokio::spawn(async move { run_ipc_server(host_clone, shutdown_rx).await });
+    let server_task = tokio::spawn(async move {
+        run_ipc_server(
+            host_clone,
+            new_shared_link_tracker(DEFAULT_INPUT_LIVENESS),
+            shutdown_rx,
+        )
+        .await
+    });
 
     let socket_path = daemon_socket_path();
     let pid_path = daemon_pid_path();
@@ -358,7 +366,12 @@ async fn test_daemon_ipc_single_owner_lock() {
 
     // Attempt to start a second daemon server on the same socket
     let (_shutdown_tx2, shutdown_rx2) = tokio::sync::broadcast::channel(1);
-    let second_res = run_ipc_server(host.clone(), shutdown_rx2).await;
+    let second_res = run_ipc_server(
+        host.clone(),
+        new_shared_link_tracker(DEFAULT_INPUT_LIVENESS),
+        shutdown_rx2,
+    )
+    .await;
     assert!(
         second_res.is_err(),
         "Second daemon instance must be rejected"
