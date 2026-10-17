@@ -246,6 +246,8 @@ jobs:
             -f tag_name="${RELEASE_TAG}" --jq '.body' >> "${NOTES_FILE}"
           if gh release view "${RELEASE_TAG}" > /dev/null 2>&1; then
             gh release upload "${RELEASE_TAG}" release-artifacts/* --clobber
+            # Re-apply the pre-release flag and notes in case the release was created by hand.
+            gh release edit "${RELEASE_TAG}" --notes-file "${NOTES_FILE}" ${PRERELEASE_FLAG}
           else
             gh release create "${RELEASE_TAG}" release-artifacts/* \
               --title "linux-quest ${RELEASE_TAG}" \
