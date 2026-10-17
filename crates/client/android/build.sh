@@ -94,7 +94,7 @@ echo "========================================================"
 
 # Step 1: Compile native shared library with cargo-ndk
 echo "[1/6] Compiling native cdylib with cargo-ndk (arm64-v8a, API 30)..."
-cargo ndk -t arm64-v8a -P 30 build ${CARGO_PROFILE_FLAG} --manifest-path "${CLIENT_DIR}/Cargo.toml"
+cargo ndk -t arm64-v8a -P 30 build ${CARGO_PROFILE_FLAG} --locked --manifest-path "${CLIENT_DIR}/Cargo.toml"
 
 SO_FILE="${TARGET_DIR}/liblinux_quest_client.so"
 if [[ ! -f "${SO_FILE}" ]]; then

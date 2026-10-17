@@ -6,6 +6,9 @@ Files for running `linux-quest-host` as a background service on Ubuntu / systemd
 | :--- | :--- |
 | `systemd/linux-quest-host.service` | systemd **user** unit running `linux-quest-host daemon` |
 | `udev/99-uinput.rules` | Grants the `input` group access to `/dev/uinput` |
+| `modules-load/linux-quest.conf` | Loads the `uinput` module at boot |
+| `debian/postinst`, `debian/copyright` | Debian maintainer script (reloads udev) and copyright file, used by `cargo deb` |
+| `arch/PKGBUILD` | AUR package recipe (see below) |
 
 The tray icon is not included yet (tracked in #32).
 
@@ -74,3 +77,32 @@ systemd-analyze --user verify packaging/systemd/linux-quest-host.service
 ```
 
 `verify` warns if `/usr/bin/linux-quest-host` does not exist yet. That is expected before installing the binary.
+
+## Packages and the Quest sideload script
+
+Release builds (see `.github/workflows/release.yml`) attach these to each GitHub Release:
+
+| Artifact | Built with | Installs |
+| :--- | :--- | :--- |
+| `linux-quest-host_<ver>-1_amd64.deb` | `cargo deb -p linux-quest-host --no-build` | host binary, udev rule, `uinput` modules-load config, user unit, licenses |
+| `linux-quest-host-<ver>-1.x86_64.rpm` | `cargo generate-rpm -p crates/host` | same files as the `.deb` |
+| `linux-quest-host-<tag>-x86_64-linux.tar.gz` | plain tar of the binary | binary, udev rule, licenses (copy the rest by hand) |
+| `linux-quest-<tag>-debugsigned.apk` | `crates/client/android/build.sh --release` | Quest client APK, debug-signed |
+
+The `.deb` and `.rpm` run `udevadm control --reload` and `udevadm trigger` after install (best effort), so the uinput rule applies without a reboot. Neither loads the `uinput` module immediately; the modules-load config does that at the next boot.
+
+The AUR package (`arch/PKGBUILD`) builds from the tagged source tarball. It installs the binary, udev rule, modules-load config, user unit and licenses, but no maintainer scripts, so run the `udevadm` reload yourself after install. Its `optdepends` list covers clipboard tools, PipeWire, and `nvidia-utils` for NVENC. Its `check()` runs only the unit tests (`--lib`).
+
+The release APK is signed with the debug keystore that `build.sh` generates. It is installable by sideloading, but it is not production-signed. Releases stay marked as pre-releases until a release keystore is configured.
+
+### Sideloading the APK with `scripts/install-quest.sh`
+
+With a Quest connected over USB and Developer Mode on:
+
+```bash
+scripts/install-quest.sh                       # newest APK in crates/client/target/android-apk/
+scripts/install-quest.sh ~/Downloads/linux-quest-v0.1.0-debugsigned.apk
+ANDROID_SERIAL=<serial> scripts/install-quest.sh   # pick one device when several are connected
+```
+
+With no path argument, the script installs the newer of `linux-quest-release.apk` and `linux-quest-debug.apk` and warns when both exist. It needs `adb` on `PATH` and accepts the headset's "Allow USB debugging" prompt.
