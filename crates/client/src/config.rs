@@ -6,12 +6,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ClientError, ClientResult};
 
+/// Port of the USB/ADB path. The device side is `adb reverse tcp:42069 tcp:42069`. This port is
+/// separate from the Wi-Fi/LAN ports (control `48444`, input `48442`, video UDP `48440`), and
+/// manual or discovered Wi-Fi hosts never default to it.
+pub const ADB_REVERSE_PORT: u16 = 42069;
+
 /// Supported transport protocol modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransportMode {
-    /// Paced UDP datagrams with Reed-Solomon/XOR FEC.
+    /// Paced UDP datagrams with Reed-Solomon/XOR FEC, received on UDP port 48440. Video is
+    /// accepted only from the IP of `ClientConfig::host_addr`.
     Udp,
-    /// USB ADB reverse-tethering TCP tunnel (`adb reverse tcp:42069 tcp:42069`).
+    /// USB ADB reverse-tethering TCP tunnel to `127.0.0.1:ADB_REVERSE_PORT`.
     AdbReverseTcp,
 }
 
@@ -54,7 +60,14 @@ pub enum DisplayMode {
 /// Configuration settings for the Quest streaming client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
-    /// Remote host address (default `127.0.0.1:42069` for ADB reverse tunnel).
+    /// Remote host address.
+    ///
+    /// - `AdbReverseTcp`: the local end of the ADB reverse tunnel, `127.0.0.1:42069` by default.
+    /// - `Udp`: the host's address on the LAN. Its IP is the only source video datagrams are
+    ///   accepted from. An unspecified IP (`0.0.0.0`) means no source filter.
+    ///
+    /// Discovery (`discovery::apply_selection`) sets this to a found host's control address
+    /// (port `48444`).
     pub host_addr: SocketAddr,
 
     /// Transport mode (UDP or ADB Reverse TCP).
@@ -112,7 +125,7 @@ pub struct ClientConfig {
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
-            host_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 42069),
+            host_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), ADB_REVERSE_PORT),
             transport_mode: TransportMode::AdbReverseTcp,
             codec: ClientVideoCodec::Av1,
             display_mode: DisplayMode::CurvedCylinder,

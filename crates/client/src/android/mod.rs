@@ -6,8 +6,29 @@ use std::time::Duration;
 #[cfg(target_os = "android")]
 use android_activity::{AndroidApp, MainEvent, PollEvent};
 
-use crate::config::ClientConfig;
+use std::net::{IpAddr, SocketAddr};
+
+use crate::config::{ClientConfig, TransportMode};
 use crate::runtime::QuestClientRuntime;
+
+/// Source IP that UDP video datagrams must come from, or `None` to accept any source.
+///
+/// Only the UDP transport filters, and only by IP: the host sends from an ephemeral port, so
+/// its port is not known. The ADB/USB path connects to `host_addr` and never filters.
+/// An unspecified IP (`0.0.0.0`) in `host_addr` means "unset", so no filter is applied.
+pub fn udp_source_filter(config: &ClientConfig) -> Option<IpAddr> {
+    match config.transport_mode {
+        TransportMode::Udp if !config.host_addr.ip().is_unspecified() => {
+            Some(config.host_addr.ip())
+        }
+        _ => None,
+    }
+}
+
+/// Whether a datagram from `source` may be passed to the packet parser.
+pub fn accept_udp_source(filter: Option<IpAddr>, source: SocketAddr) -> bool {
+    filter.is_none_or(|ip| source.ip() == ip)
+}
 
 /// Native entry point for Android NativeActivity on Meta Quest.
 #[cfg(target_os = "android")]
@@ -44,6 +65,7 @@ pub fn android_main(app: AndroidApp) {
     let bg_running = running_flag.clone();
     let host_addr = config.host_addr;
     let transport_mode = config.transport_mode;
+    let udp_filter = udp_source_filter(&config);
 
     let receiver_handle = std::thread::spawn(move || {
         match transport_mode {
@@ -141,7 +163,11 @@ pub fn android_main(app: AndroidApp) {
 
                 while bg_running.load(std::sync::atomic::Ordering::Relaxed) {
                     match socket.recv_from(&mut buf) {
-                        Ok((len, _src)) => {
+                        Ok((len, source)) => {
+                            if !accept_udp_source(udp_filter, source) {
+                                tracing::trace!(%source, "Dropping UDP datagram from unexpected source");
+                                continue;
+                            }
                             match linux_quest_protocol::packet::Packet::from_bytes(&buf[..len]) {
                                 Ok(packet) => {
                                     let _ = packet_tx.try_send(packet);
@@ -232,6 +258,59 @@ pub fn simulated_android_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn udp_filter_uses_host_ip_only_in_udp_mode() {
+        let lan = SocketAddr::from(([192, 168, 1, 20], 48444));
+        let udp = ClientConfig {
+            transport_mode: TransportMode::Udp,
+            host_addr: lan,
+            ..Default::default()
+        };
+        assert_eq!(
+            udp_source_filter(&udp),
+            Some(IpAddr::from([192, 168, 1, 20]))
+        );
+
+        let adb = ClientConfig {
+            transport_mode: TransportMode::AdbReverseTcp,
+            host_addr: lan,
+            ..Default::default()
+        };
+        assert_eq!(udp_source_filter(&adb), None);
+    }
+
+    #[test]
+    fn udp_filter_unspecified_host_means_no_filter() {
+        let config = ClientConfig {
+            transport_mode: TransportMode::Udp,
+            host_addr: SocketAddr::from(([0, 0, 0, 0], 48444)),
+            ..Default::default()
+        };
+        assert_eq!(udp_source_filter(&config), None);
+    }
+
+    #[test]
+    fn udp_loopback_datagrams_are_filtered_by_source() {
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender
+            .send_to(b"datagram", receiver.local_addr().unwrap())
+            .unwrap();
+
+        let mut buf = [0u8; 64];
+        let (_, source) = receiver.recv_from(&mut buf).unwrap();
+        let loopback = IpAddr::from([127, 0, 0, 1]);
+        assert!(accept_udp_source(None, source));
+        assert!(accept_udp_source(Some(loopback), source));
+        assert!(!accept_udp_source(
+            Some(IpAddr::from([10, 9, 9, 9])),
+            source
+        ));
+    }
 
     #[test]
     fn test_simulated_android_entry() {
