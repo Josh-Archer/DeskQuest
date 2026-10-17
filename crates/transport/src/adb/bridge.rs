@@ -6,6 +6,7 @@ use tokio::sync::broadcast;
 
 use super::device::{AdbDevice, AdbDeviceState};
 use super::runner::{AdbCommandRunner, AdbError};
+use crate::control::DEFAULT_CONTROL_PORT;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdbBridgeState {
@@ -41,11 +42,13 @@ pub struct AdbBridgeConfig {
     pub target_serial: Option<String>,
 }
 
+/// Default reverses the host control TCP port ([`DEFAULT_CONTROL_PORT`], 48444), the only TCP
+/// port the host daemon listens on.
 impl Default for AdbBridgeConfig {
     fn default() -> Self {
         Self {
-            remote_port: 8088,
-            local_port: 8088,
+            remote_port: DEFAULT_CONTROL_PORT,
+            local_port: DEFAULT_CONTROL_PORT,
             poll_interval: Duration::from_millis(500),
             max_reconnect_attempts: 10,
             require_quest_filter: true,
@@ -311,6 +314,13 @@ impl<R: AdbCommandRunner + 'static> AdbBridge<R> {
 mod tests {
     use super::*;
     use crate::adb::runner::MockAdbRunner;
+
+    #[test]
+    fn default_config_reverses_the_control_port() {
+        let config = AdbBridgeConfig::default();
+        assert_eq!(config.remote_port, DEFAULT_CONTROL_PORT);
+        assert_eq!(config.local_port, DEFAULT_CONTROL_PORT);
+    }
 
     #[tokio::test]
     async fn test_adb_bridge_detection_and_reconnection() {

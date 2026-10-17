@@ -122,7 +122,7 @@ This roadmap outlines the development trajectory of `linux-quest` from initial a
 ---
 
 ## Phase 5: Virtual Multi-Monitor Management on Linux
-> Status: wlroots, Mutter and X11 backends done. VKMS/EVDI pending ([#31](https://github.com/Josh-Archer/linux-quest/issues/31)).
+> Status: wlroots, Mutter and X11 backends done. EVDI kernel fallback implemented but not yet validated on hardware ([#31](https://github.com/Josh-Archer/linux-quest/issues/31)).
 
 *Objective: Support multiple headless virtual monitors dynamically without physical hardware dongles.*
 
@@ -133,7 +133,7 @@ This roadmap outlines the development trajectory of `linux-quest` from initial a
 
 - **5.2 X11 & Headless DRM / Dummy Fallback**
   - Virtual display configuration via NVIDIA MetaModes / Xdummy on X11.
-  - Kernel-level dummy driver support (VKMS or EVDI module integration).
+  - Kernel-level dummy driver support via the EVDI module (VKMS was dropped: its configfs connector has no EDID attribute, so a requested resolution cannot be honoured). Needs a hardware test on a machine with `evdi-dkms` loaded and no compositor virtual-output API.
 
 ---
 

@@ -3,7 +3,9 @@ pub mod model;
 pub mod render;
 pub mod terminal;
 
-pub use data_source::{IpcTelemetrySource, MockTelemetrySource, TelemetrySource};
+pub use data_source::{
+    IpcTelemetrySource, LiveDaemonTelemetrySource, MockTelemetrySource, TelemetrySource,
+};
 pub use model::{
     AudioLatencyModel, AudioStatusModel, ClientConnectionMode, ClientStatusModel, DashboardModel,
     DashboardSnapshot, DisplayMetricModel, DisplaySnapshot, LatencyWaterfallModel, RollingWindow,

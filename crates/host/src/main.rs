@@ -5,10 +5,15 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use linux_quest_display::DisplayLayoutMode;
-use linux_quest_host::tui::{run_dashboard_with_source, IpcTelemetrySource, MockTelemetrySource};
+use linux_quest_host::link_status::{
+    new_shared_link_tracker, SharedLinkTracker, DEFAULT_INPUT_LIVENESS,
+};
+use linux_quest_host::tui::{
+    run_dashboard_with_source, IpcTelemetrySource, LiveDaemonTelemetrySource, MockTelemetrySource,
+};
 use linux_quest_host::{
     daemon_socket_path, run_ipc_server, send_daemon_request, DaemonRequest, DaemonResponse,
-    MultiDisplayHost,
+    HostClipboardService, HostInputReceiver, MultiDisplayHost,
 };
 
 #[derive(Parser, Debug)]
@@ -37,6 +42,17 @@ enum Commands {
 
     /// Launch interactive terminal status dashboard
     Dashboard(DashboardArgs),
+
+    /// Show a system tray icon with connection status and service controls
+    /// (requires a build with `--features tray`)
+    Tray(TrayArgs),
+}
+
+#[derive(Args, Debug, Default)]
+struct TrayArgs {
+    /// How often to poll the daemon, in milliseconds (minimum 500)
+    #[arg(long, default_value_t = 2000)]
+    interval_ms: u64,
 }
 
 #[derive(Args, Debug, Default)]
@@ -44,6 +60,10 @@ struct DaemonArgs {
     /// Run daemon with interactive terminal status dashboard in foreground
     #[arg(long)]
     tui: bool,
+
+    /// Do not advertise this daemon on the LAN via mDNS (Quest clients then need manual IP entry)
+    #[arg(long)]
+    no_advertise: bool,
 }
 
 #[derive(Args, Debug, Default)]
@@ -135,6 +155,89 @@ async fn wait_for_shutdown_signal(mut term: tokio::signal::unix::Signal) {
     }
 }
 
+/// Starts the Quest-facing services: the UDP input receiver and the TCP control/clipboard
+/// listener. Both report connection events to `link`, and both stop on the shutdown broadcast.
+///
+/// Returns the ports actually bound, as `(control, input)`; `None` where a bind failed.
+async fn start_stream_services(
+    shutdown_tx: &tokio::sync::broadcast::Sender<()>,
+    link: SharedLinkTracker,
+) -> (Option<u16>, Option<u16>) {
+    let mut input_port = None;
+    let mut control_port = None;
+    let input_bind_addr =
+        std::net::SocketAddr::from(([0, 0, 0, 0], linux_quest_transport::DEFAULT_INPUT_PORT));
+    match HostInputReceiver::bind_auto(input_bind_addr).await {
+        Ok(input_service) => {
+            let mut input_service = input_service.with_link_tracker(link.clone());
+            input_port = input_service.local_addr().ok().map(|a| a.port());
+            let running_flag = input_service.running_flag();
+            let auto_injector = input_service.injector();
+            let mut shutdown_rx_input = shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                info!(
+                    addr = %input_bind_addr,
+                    "Input receiver service listening on UDP input channel"
+                );
+                tokio::select! {
+                    res = input_service.run() => {
+                        if let Err(e) = res {
+                            tracing::warn!("Input receiver service exited: {e}");
+                        }
+                    }
+                    _ = shutdown_rx_input.recv() => {
+                        running_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                        if let Ok(mut inj) = auto_injector.lock() {
+                            let _ = inj.release_all();
+                        }
+                    }
+                }
+            });
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Failed to bind UDP input channel on {input_bind_addr}; input receiver disabled"
+            );
+        }
+    }
+
+    let control_bind_addr =
+        std::net::SocketAddr::from(([0, 0, 0, 0], linux_quest_transport::DEFAULT_CONTROL_PORT));
+    match HostClipboardService::bind_auto(control_bind_addr).await {
+        Ok(clipboard_service) => {
+            let mut clipboard_service = clipboard_service.with_link_tracker(link);
+            control_port = clipboard_service.local_addr().map(|a| a.port());
+            let running_flag = clipboard_service.running_flag();
+            let mut shutdown_rx_clipboard = shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                info!(
+                    addr = %control_bind_addr,
+                    "Clipboard synchronization service listening on control channel"
+                );
+                tokio::select! {
+                    res = clipboard_service.run() => {
+                        if let Err(e) = res {
+                            tracing::warn!("Clipboard synchronization service exited: {e}");
+                        }
+                    }
+                    _ = shutdown_rx_clipboard.recv() => {
+                        running_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            });
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Failed to bind control channel on {control_bind_addr}; clipboard synchronization disabled"
+            );
+        }
+    }
+
+    (control_port, input_port)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
@@ -143,7 +246,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         || matches!(&cli.command, Some(Commands::Dashboard(_)))
         || matches!(
             &cli.command,
-            Some(Commands::Daemon(DaemonArgs { tui: true }))
+            Some(Commands::Daemon(DaemonArgs { tui: true, .. }))
         );
 
     if !is_tui {
@@ -191,9 +294,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 run_dashboard_with_source(source, tick_rate, None).await?;
             }
         }
+        Commands::Tray(args) => {
+            #[cfg(feature = "tray")]
+            {
+                let interval = Duration::from_millis(args.interval_ms.max(500));
+                linux_quest_host::tray::run_tray(IpcTelemetrySource, interval).await?;
+            }
+            #[cfg(not(feature = "tray"))]
+            {
+                let _ = args;
+                eprintln!("This build has no tray support.");
+                eprintln!("Rebuild with the `tray` feature:");
+                eprintln!(
+                    "  cargo install --path crates/host --bin linux-quest-host --features tray"
+                );
+                std::process::exit(2);
+            }
+        }
         Commands::Daemon(daemon_args) => {
             let host = Arc::new(MultiDisplayHost::create_auto().await?);
             let run_tui = daemon_args.tui || cli.tui;
+            let link = new_shared_link_tracker(DEFAULT_INPUT_LIVENESS);
 
             if run_tui {
                 let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
@@ -201,14 +322,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let shutdown_flag_clone = shutdown_flag.clone();
 
+                // The TUI run binds the listeners but does not advertise them.
+                let _ = start_stream_services(&shutdown_tx, link.clone()).await;
+
                 let host_clone = host.clone();
+                let link_clone = link.clone();
                 let ipc_handle = tokio::spawn(async move {
-                    if let Err(e) = run_ipc_server(host_clone, shutdown_rx).await {
+                    if let Err(e) = run_ipc_server(host_clone, link_clone, shutdown_rx).await {
                         tracing::error!("Daemon IPC server error: {e}");
                     }
                 });
 
-                let source = MockTelemetrySource::new();
+                let source = LiveDaemonTelemetrySource::new(host.clone(), link.clone());
                 let _ = run_dashboard_with_source(
                     source,
                     Duration::from_millis(100),
@@ -237,79 +362,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let _ = shutdown_tx_clone.send(());
                 });
 
-                // Wire input receiver service feeding remote Quest events into the injector
-                let input_bind_addr = std::net::SocketAddr::from((
-                    [0, 0, 0, 0],
-                    linux_quest_transport::DEFAULT_INPUT_PORT,
-                ));
-                match linux_quest_host::HostInputReceiver::bind_auto(input_bind_addr).await {
-                    Ok(mut input_service) => {
-                        let running_flag = input_service.running_flag();
-                        let auto_injector = input_service.injector();
-                        let mut shutdown_rx_input = shutdown_tx.subscribe();
-                        tokio::spawn(async move {
-                            info!(
-                                addr = %input_bind_addr,
-                                "Input receiver service listening on UDP input channel"
-                            );
-                            tokio::select! {
-                                res = input_service.run() => {
-                                    if let Err(e) = res {
-                                        tracing::warn!("Input receiver service exited: {e}");
-                                    }
-                                }
-                                _ = shutdown_rx_input.recv() => {
-                                    running_flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                                    if let Ok(mut inj) = auto_injector.lock() {
-                                        let _ = inj.release_all();
-                                    }
-                                }
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "Failed to bind UDP input channel on {input_bind_addr}; input receiver disabled"
-                        );
-                    }
-                }
+                let (control_port, input_port) =
+                    start_stream_services(&shutdown_tx, link.clone()).await;
 
-                // Wire clipboard synchronization service over reliable control channel
-                let control_bind_addr = std::net::SocketAddr::from((
-                    [0, 0, 0, 0],
-                    linux_quest_transport::DEFAULT_CONTROL_PORT,
-                ));
-                match linux_quest_host::HostClipboardService::bind_auto(control_bind_addr).await {
-                    Ok(mut clipboard_service) => {
-                        let running_flag = clipboard_service.running_flag();
-                        let mut shutdown_rx_clipboard = shutdown_tx.subscribe();
-                        tokio::spawn(async move {
-                            info!(
-                                addr = %control_bind_addr,
-                                "Clipboard synchronization service listening on control channel"
-                            );
-                            tokio::select! {
-                                res = clipboard_service.run() => {
-                                    if let Err(e) = res {
-                                        tracing::warn!("Clipboard synchronization service exited: {e}");
-                                    }
-                                }
-                                _ = shutdown_rx_clipboard.recv() => {
-                                    running_flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                                }
-                            }
-                        });
+                // Advertise only the ports that were really bound above.
+                let listening = match (control_port, input_port) {
+                    (Some(control), Some(input)) => {
+                        Some(linux_quest_host::advertise::ListeningPorts { control, input })
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "Failed to bind control channel on {control_bind_addr}; clipboard synchronization disabled"
-                        );
-                    }
-                }
+                    _ => None,
+                };
+                let advertiser = linux_quest_host::advertise::advertise_daemon(
+                    !daemon_args.no_advertise,
+                    linux_quest_host::advertise::system_instance_name(),
+                    listening,
+                )
+                .await;
 
-                run_ipc_server(host, shutdown_rx).await?;
+                let served = run_ipc_server(host, link, shutdown_rx).await;
+                if let Some(advertiser) = advertiser {
+                    advertiser.stop().await;
+                }
+                served?;
                 info!("Daemon stopped cleanly.");
             }
         }
