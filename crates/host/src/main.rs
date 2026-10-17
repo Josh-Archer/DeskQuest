@@ -44,6 +44,10 @@ struct DaemonArgs {
     /// Run daemon with interactive terminal status dashboard in foreground
     #[arg(long)]
     tui: bool,
+
+    /// Do not advertise this daemon on the LAN via mDNS (Quest clients then need manual IP entry)
+    #[arg(long)]
+    no_advertise: bool,
 }
 
 #[derive(Args, Debug, Default)]
@@ -143,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         || matches!(&cli.command, Some(Commands::Dashboard(_)))
         || matches!(
             &cli.command,
-            Some(Commands::Daemon(DaemonArgs { tui: true }))
+            Some(Commands::Daemon(DaemonArgs { tui: true, .. }))
         );
 
     if !is_tui {
@@ -195,6 +199,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let host = Arc::new(MultiDisplayHost::create_auto().await?);
             let run_tui = daemon_args.tui || cli.tui;
 
+            // Best effort: a failure to advertise is logged and never stops the daemon.
+            let advertiser = linux_quest_host::advertise::advertise_daemon(
+                !daemon_args.no_advertise,
+                linux_quest_host::advertise::system_instance_name(),
+            )
+            .await;
+
             if run_tui {
                 let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
                 let shutdown_tx_clone = shutdown_tx.clone();
@@ -220,6 +231,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let _ = shutdown_tx_clone.send(());
                 shutdown_flag_clone.store(true, std::sync::atomic::Ordering::SeqCst);
                 let _ = ipc_handle.await;
+                if let Some(advertiser) = advertiser {
+                    advertiser.stop().await;
+                }
             } else {
                 info!(
                     backend = host.backend_name().await,
@@ -309,7 +323,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                 }
 
-                run_ipc_server(host, shutdown_rx).await?;
+                let served = run_ipc_server(host, shutdown_rx).await;
+                if let Some(advertiser) = advertiser {
+                    advertiser.stop().await;
+                }
+                served?;
                 info!("Daemon stopped cleanly.");
             }
         }

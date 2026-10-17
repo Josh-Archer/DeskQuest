@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 
+pub mod advertise;
 pub mod audio_pipeline;
 pub mod clipboard_service;
 pub mod input_receiver;
