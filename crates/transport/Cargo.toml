@@ -18,5 +18,11 @@ bincode.workspace = true
 parking_lot.workspace = true
 crc32fast.workspace = true
 libc = { workspace = true }
+# Real mDNS LAN discovery. Off by default so default builds and tests never touch multicast.
+mdns-sd = { version = "0.21", default-features = false, features = ["async"], optional = true }
+
+[features]
+default = []
+mdns = ["dep:mdns-sd"]
 
 [dev-dependencies]

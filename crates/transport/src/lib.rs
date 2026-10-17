@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 
 pub mod adb;
 pub mod control;
+pub mod discovery;
 pub mod fec;
 pub mod input_channel;
 pub mod jitter_buffer;
@@ -20,6 +21,12 @@ pub use adb::{
     AdbReverseRule, MockAdbRunner, SystemAdbRunner,
 };
 pub use control::{ControlChannel, ControlError, ControlMessage, DEFAULT_CONTROL_PORT};
+#[cfg(feature = "mdns")]
+pub use discovery::MdnsDiscoveryBackend;
+pub use discovery::{
+    refresh, DiscoveredHost, DiscoveryBackend, DiscoveryError, HostAdvertisement, HostDirectory,
+    MockDiscoveryBackend, DEFAULT_STALE_AFTER, DISCOVERY_SERVICE_TYPE,
+};
 pub use fec::{FecError, FecHeader, ReedSolomonFec, XorFec};
 pub use input_channel::{
     create_input_channel_pair, InputChannelConfig, InputChannelReceiver, InputChannelSender,
