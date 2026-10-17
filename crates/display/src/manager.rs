@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use tracing::info;
 
+use crate::backend::kernel_drm::KernelDrmDisplayBackend;
 use crate::backend::mutter::MutterDisplayBackend;
 use crate::backend::wlr::WlrDisplayBackend;
 use crate::backend::x11::X11DisplayBackend;
@@ -29,8 +30,12 @@ impl VirtualDisplayManager {
 
     /// Automatically discovers and selects the best available display backend for the current environment.
     ///
-    /// Returns `DisplayError::BackendUnavailable` if no supported physical display server
-    /// (Sway, Hyprland, GNOME Mutter, or X11) is found.
+    /// Selection order: wlroots (Sway/Hyprland), GNOME Mutter, X11, then the kernel DRM
+    /// dummy-display fallback (VKMS/EVDI, see [`crate::backend::kernel_drm`]).
+    ///
+    /// Returns `DisplayError::BackendUnavailable` if none of these is usable. The message
+    /// includes the kernel fallback's diagnostics (missing module, permissions) so the user
+    /// knows what to fix.
     pub async fn create_auto() -> Result<Self, DisplayError> {
         // 1. Check wlroots / Sway / Hyprland (preferred when Wayland socket is active)
         let wlr = WlrDisplayBackend::new();
@@ -60,10 +65,24 @@ impl VirtualDisplayManager {
             return Ok(mgr);
         }
 
-        // No physical display server found
-        Err(DisplayError::BackendUnavailable(
-            "No supported display server detected (GNOME Mutter, Sway, Hyprland, or X11)".into(),
-        ))
+        // 4. Kernel DRM dummy display (VKMS / EVDI): last resort for compositors without a
+        // virtual output API. Needs no session socket, only the kernel module and access.
+        let kernel = KernelDrmDisplayBackend::new();
+        if kernel.is_available() {
+            info!(
+                "Selected kernel DRM dummy-display backend: {}",
+                kernel.name()
+            );
+            let mut mgr = Self::new(Box::new(kernel));
+            mgr.backend.init().await?;
+            return Ok(mgr);
+        }
+
+        Err(DisplayError::BackendUnavailable(format!(
+            "No supported display server detected (GNOME Mutter, Sway, Hyprland, or X11), \
+             and the kernel DRM fallback (VKMS/EVDI) is unavailable: {}",
+            kernel.diagnostics().join("; ")
+        )))
     }
 
     /// Returns the name of the active backend.

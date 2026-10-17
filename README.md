@@ -116,7 +116,18 @@ systemctl --user daemon-reload
 systemctl --user enable --now linux-quest-host
 ```
 
-See [`packaging/README.md`](packaging/README.md) for installation, the `/dev/uinput` udev rule and operating notes. The tray icon is not included yet (tracked in #32).
+See [`packaging/README.md`](packaging/README.md) for installation, the `/dev/uinput` udev rule and operating notes.
+
+### Optional tray icon
+
+`linux-quest-host tray` shows connection state in the system tray, with Open dashboard, Restart service and Quit. It is a separate process, and it is off by default, so build it with the `tray` feature:
+
+```bash
+cargo install --path crates/host --bin linux-quest-host --features tray --root ~/.local
+linux-quest-host tray
+```
+
+It needs a StatusNotifierItem host (KDE Plasma, GNOME with the AppIndicator extension, or a bar with a tray module). It can start before or after the daemon, and the systemd unit above does not change. The ordering, a sample user unit and known limitations are in [`packaging/README.md`](packaging/README.md#optional-tray-icon).
 
 ---
 
