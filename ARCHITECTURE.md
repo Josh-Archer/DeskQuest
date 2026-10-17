@@ -81,7 +81,7 @@ To support multi-monitor productivity without requiring physical HDMI/DisplayPor
 
 ### X11 Support:
 - Dynamic virtual monitors using NVIDIA MetaModes or `xrandr` virtual outputs.
-- Integration with Linux kernel Virtual Kernel Modesetting (`vkms`) or EVDI drivers as a universal fallback.
+- Integration with the out-of-tree EVDI kernel module as a last-resort fallback (`crates/display/src/backend/kernel_drm.rs`): the backend reuses an idle EVDI card or adds one, connects a generated EDID, and keeps the card fd open (and serviced by a small thread) for as long as the monitor should exist; closing the fd disconnects it. VKMS is not supported because its configfs connector cannot take an EDID.
 
 ---
 
