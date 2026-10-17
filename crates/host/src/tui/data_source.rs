@@ -6,9 +6,12 @@ use linux_quest_protocol::{
     FrameLatencyBreakdown,
 };
 
-use crate::ipc::{send_daemon_request, DaemonRequest, DaemonResponse};
+use std::sync::Arc;
+
+use crate::ipc::{build_dashboard_snapshot, send_daemon_request, DaemonRequest, DaemonResponse};
+use crate::link_status::SharedLinkTracker;
 use crate::tui::model::{DashboardSnapshot, DisplaySnapshot};
-use crate::HostError;
+use crate::{HostError, MultiDisplayHost};
 
 /// Trait abstracting telemetry acquisition for the TUI dashboard.
 #[async_trait]
@@ -171,6 +174,28 @@ impl TelemetrySource for MockTelemetrySource {
                 plc_count: 0,
             },
         })
+    }
+}
+
+/// Telemetry source for the dashboard running inside the daemon process (`daemon --tui`).
+/// Reads the live link state directly instead of simulated data.
+pub struct LiveDaemonTelemetrySource {
+    host: Arc<MultiDisplayHost>,
+    link: SharedLinkTracker,
+}
+
+impl LiveDaemonTelemetrySource {
+    pub fn new(host: Arc<MultiDisplayHost>, link: SharedLinkTracker) -> Self {
+        Self { host, link }
+    }
+}
+
+#[async_trait]
+impl TelemetrySource for LiveDaemonTelemetrySource {
+    async fn fetch_snapshot(&mut self) -> Result<DashboardSnapshot, HostError> {
+        let monitors = self.host.list_monitors().await;
+        let status = self.link.lock().status(Instant::now());
+        Ok(build_dashboard_snapshot(monitors, status, 0))
     }
 }
 

@@ -6,6 +6,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::Mutex;
 use tokio::net::{TcpListener, TcpStream};
@@ -18,6 +19,7 @@ use linux_quest_input::{
 use linux_quest_protocol::{ClipboardMessage, ClipboardSyncEngine, SyncAction};
 use linux_quest_transport::{ControlChannel, ControlMessage, TransportError};
 
+use crate::link_status::SharedLinkTracker;
 use crate::HostError;
 
 /// Host origin ID for clipboard synchronization.
@@ -33,6 +35,7 @@ pub struct HostClipboardService<B: ClipboardBackend + 'static = AutoClipboardBac
     incoming_rx: mpsc::UnboundedReceiver<ClipboardMessage>,
     listener: Option<TcpListener>,
     peer_writers: Arc<Mutex<Vec<mpsc::UnboundedSender<ControlMessage>>>>,
+    link: Option<SharedLinkTracker>,
 }
 
 impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
@@ -60,7 +63,14 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
             incoming_rx,
             listener: None,
             peer_writers: Arc::new(Mutex::new(Vec::new())),
+            link: None,
         }
+    }
+
+    /// Reports accepted and closed control connections to the shared link tracker.
+    pub fn with_link_tracker(mut self, link: SharedLinkTracker) -> Self {
+        self.link = Some(link);
+        self
     }
 
     /// Customizes the watcher polling and debouncing configuration.
@@ -165,7 +175,10 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
                 match listener.accept().await {
                     Ok((stream, peer_addr)) => {
                         tracing::info!(peer = %peer_addr, "New control channel connection for clipboard sync");
-                        self.spawn_peer_handler(stream);
+                        if let Some(link) = &self.link {
+                            link.lock().control_accepted(peer_addr, Instant::now());
+                        }
+                        self.spawn_peer_handler(stream, peer_addr);
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => {
@@ -180,7 +193,7 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
         Ok(())
     }
 
-    fn spawn_peer_handler(&self, stream: TcpStream) {
+    fn spawn_peer_handler(&self, stream: TcpStream, peer_addr: SocketAddr) {
         let (reader, writer) = stream.into_split();
         let mut ctrl_reader = ControlChannel::new(reader, tokio::io::sink());
         let mut ctrl_writer = ControlChannel::new(tokio::io::empty(), writer);
@@ -207,7 +220,8 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
             }
         });
 
-        // Task receiving incoming messages from peer
+        // Task receiving incoming messages from peer; reports the close when it ends
+        let link = self.link.clone();
         tokio::spawn(async move {
             while running.load(Ordering::Relaxed) {
                 match ctrl_reader.recv_message().await {
@@ -226,6 +240,9 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
                     Ok(_) => {}
                     Err(_) => break,
                 }
+            }
+            if let Some(link) = link {
+                link.lock().control_closed(peer_addr);
             }
         });
     }

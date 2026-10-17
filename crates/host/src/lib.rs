@@ -14,6 +14,7 @@ pub mod audio_pipeline;
 pub mod clipboard_service;
 pub mod input_receiver;
 pub mod ipc;
+pub mod link_status;
 pub mod multi_display;
 pub mod tui;
 
