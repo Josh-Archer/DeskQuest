@@ -19,8 +19,29 @@
 //! - The host does not authenticate clients. Any peer that reaches the UDP port can open a control
 //!   session, the same as the existing TCP control port.
 //!
+//! # Security notes
+//!
+//! There is no client authentication. Pinning only authenticates the host to the client. Anyone on
+//! the LAN who can reach the host's UDP port and knows its certificate fingerprint can connect and
+//! use clipboard control. The fingerprint is not a secret in the way a password is, because it is
+//! displayed and copied around by design. Resource limits (one bidirectional stream, no
+//! unidirectional streams, no datagrams, bounded flow-control windows, a 5 s deadline for the first
+//! stream, address validation with Retry) limit what an unauthenticated peer can consume, but they
+//! do not authenticate it.
+//!
+//! TODO(security): add client authentication (for example a paired client certificate or a
+//! pairing token bound to the TLS session) before QUIC becomes the default control transport.
+//! Until then QUIC must stay opt-in behind the `quic` feature.
+//!
 //! # Connection management
 //!
+//! - The host's [`QuicControlServer::accept`] only completes the QUIC handshake inline. Waiting for
+//!   the client's control stream happens in a per-connection task with a
+//!   [`QUIC_FIRST_STREAM_TIMEOUT`] deadline, so a peer that handshakes and then goes quiet cannot
+//!   block other clients. Such a connection is closed.
+//! - Dropping a [`QuicControlSession`] or a [`QuicControlServer`] closes the connection(s) with an
+//!   application error code, best effort. Dropping the server therefore also ends sessions it
+//!   accepted.
 //! - Keepalive pings are sent every [`QUIC_KEEP_ALIVE_INTERVAL`], and an idle connection is
 //!   dropped after [`QUIC_MAX_IDLE_TIMEOUT`]. Both values are tuned for a LAN, so a silent peer
 //!   is detected within a few seconds.
@@ -66,6 +87,27 @@ pub const QUIC_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Initial RTT estimate, used before the first sample. quinn's default is 333 ms, which is far
 /// above a LAN round trip and delays early retransmission timers.
 pub const QUIC_INITIAL_RTT: Duration = Duration::from_millis(20);
+
+/// Time a connection may take, after its handshake, to open the control stream. A peer that does
+/// not open it within this time is disconnected.
+pub const QUIC_FIRST_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Application close code for a normal, requested shutdown ([`QuicControlSession::close`],
+/// [`QuicControlServer::close`]).
+pub const QUIC_CLOSE_SHUTDOWN: u32 = 0;
+/// Application close code used when a session or server handle is dropped.
+pub const QUIC_CLOSE_DROPPED: u32 = 1;
+/// Application close code used when a peer did not open the control stream in time.
+pub const QUIC_CLOSE_FIRST_STREAM_TIMEOUT: u32 = 2;
+
+/// Connection-level flow-control window (bytes the peer may have in flight across all streams).
+const QUIC_RECEIVE_WINDOW: u32 = 4 * 1024 * 1024;
+/// Per-stream flow-control window. The control stream is the only stream.
+const QUIC_STREAM_RECEIVE_WINDOW: u32 = 1024 * 1024;
+/// Bytes we may have unacknowledged in flight.
+const QUIC_SEND_WINDOW: u64 = 4 * 1024 * 1024;
+/// Handshakes the server tracks at once before refusing new ones.
+const QUIC_MAX_INCOMING: usize = 64;
 
 #[derive(Error, Debug)]
 pub enum QuicError {
@@ -193,6 +235,11 @@ pub type QuicControl = ControlChannel<quinn::RecvStream, quinn::SendStream>;
 /// Host side: accepts QUIC connections that carry control sessions.
 pub struct QuicControlServer {
     endpoint: quinn::Endpoint,
+    /// Sessions (or handshake errors) produced by the per-connection tasks, waiting for `accept`.
+    ready_tx: tokio::sync::mpsc::UnboundedSender<Result<QuicControlSession, QuicError>>,
+    ready_rx: tokio::sync::Mutex<
+        tokio::sync::mpsc::UnboundedReceiver<Result<QuicControlSession, QuicError>>,
+    >,
 }
 
 impl QuicControlServer {
@@ -200,7 +247,12 @@ impl QuicControlServer {
     pub fn bind(addr: SocketAddr, identity: &HostIdentity) -> Result<Self, QuicError> {
         let config = server_config(identity)?;
         let endpoint = quinn::Endpoint::server(config, addr)?;
-        Ok(Self { endpoint })
+        let (ready_tx, ready_rx) = tokio::sync::mpsc::unbounded_channel();
+        Ok(Self {
+            endpoint,
+            ready_tx,
+            ready_rx: tokio::sync::Mutex::new(ready_rx),
+        })
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, QuicError> {
@@ -209,29 +261,84 @@ impl QuicControlServer {
 
     /// Waits for a client to connect and open its control stream.
     ///
-    /// quinn only starts an incoming handshake when this method is polled, so a client's
+    /// quinn only hands out an incoming connection when this method is polled, so a client's
     /// `connect` completes only while `accept` is running. Run this in a loop or concurrently
-    /// with the dialing side. The stream also becomes visible only once the client writes its
-    /// first control message (ClientHello). Wrap the call in a timeout if stalled peers are a
-    /// concern.
+    /// with the dialing side. The stream becomes visible only once the client writes its first
+    /// control message (ClientHello).
+    ///
+    /// Each incoming connection is driven by its own task (handshake, then waiting up to
+    /// [`QUIC_FIRST_STREAM_TIMEOUT`] for the control stream), so one slow or malicious peer never
+    /// delays another. Connections that miss the deadline are closed and never returned. A failed
+    /// handshake is returned as an error; call `accept` again to keep serving.
+    ///
+    /// Cancel-safe: dropping the future loses nothing. Connections that finish while no `accept`
+    /// is running are queued and returned by the next call. Concurrent calls are serialized.
     pub async fn accept(&self) -> Result<QuicControlSession, QuicError> {
-        let incoming = self
-            .endpoint
-            .accept()
-            .await
-            .ok_or(QuicError::EndpointClosed)?;
-        let connection = incoming.await?;
-        let (send, recv) = connection.accept_bi().await?;
-        Ok(QuicControlSession {
-            connection,
-            control: ControlChannel::new(recv, send),
-            dial: None,
-        })
+        let mut ready = self.ready_rx.lock().await;
+        loop {
+            tokio::select! {
+                biased;
+                Some(result) = ready.recv() => return result,
+                incoming = self.endpoint.accept() => {
+                    let incoming = incoming.ok_or(QuicError::EndpointClosed)?;
+                    // Make unvalidated sources prove they own their address with a Retry first,
+                    // so spoofed packets cannot make us allocate handshake state.
+                    let incoming = if incoming.remote_address_validated() {
+                        incoming
+                    } else {
+                        // Retry only fails for an already validated address, excluded here.
+                        let _ = incoming.retry();
+                        continue;
+                    };
+                    let tx = self.ready_tx.clone();
+                    tokio::spawn(async move {
+                        if let Some(result) = establish(incoming).await {
+                            // The receiver is gone only if the server was dropped.
+                            let _ = tx.send(result);
+                        }
+                    });
+                }
+            }
+        }
     }
 
     /// Closes the endpoint and all of its connections.
     pub fn close(&self) {
-        self.endpoint.close(0u32.into(), b"server shutdown");
+        self.endpoint
+            .close(QUIC_CLOSE_SHUTDOWN.into(), b"server shutdown");
+    }
+}
+
+impl Drop for QuicControlServer {
+    fn drop(&mut self) {
+        // Best effort and never panics: `close` only queues CONNECTION_CLOSE frames.
+        self.endpoint
+            .close(QUIC_CLOSE_DROPPED.into(), b"server dropped");
+    }
+}
+
+/// Completes the handshake of `incoming` and waits for its control stream. Returns `None` when
+/// the peer is dropped for not opening a stream in time.
+async fn establish(incoming: quinn::Incoming) -> Option<Result<QuicControlSession, QuicError>> {
+    let connection = match incoming.await {
+        Ok(connection) => connection,
+        Err(err) => return Some(Err(err.into())),
+    };
+    match tokio::time::timeout(QUIC_FIRST_STREAM_TIMEOUT, connection.accept_bi()).await {
+        Ok(Ok((send, recv))) => Some(Ok(QuicControlSession {
+            connection,
+            control: ControlChannel::new(recv, send),
+            dial: None,
+        })),
+        Ok(Err(err)) => Some(Err(err.into())),
+        Err(_elapsed) => {
+            tracing::warn!(
+                remote = %connection.remote_address(),
+                "closing QUIC connection that did not open the control stream in time"
+            );
+            connection.close(QUIC_CLOSE_FIRST_STREAM_TIMEOUT.into(), b"no control stream");
+            None
+        }
     }
 }
 
@@ -318,7 +425,16 @@ impl QuicControlSession {
     /// Closes the connection immediately with an application code, so the peer sees the close
     /// without waiting for the idle timeout.
     pub fn close(&self, reason: &str) {
-        self.connection.close(0u32.into(), reason.as_bytes());
+        self.connection
+            .close(QUIC_CLOSE_SHUTDOWN.into(), reason.as_bytes());
+    }
+}
+
+impl Drop for QuicControlSession {
+    fn drop(&mut self) {
+        // Best effort and never panics. Closing an already closed connection is a no-op.
+        self.connection
+            .close(QUIC_CLOSE_DROPPED.into(), b"session dropped");
     }
 }
 
@@ -330,6 +446,14 @@ fn transport_config() -> Result<Arc<quinn::TransportConfig>, QuicError> {
             .map_err(|e| QuicError::Config(e.to_string()))?,
     ));
     config.initial_rtt(QUIC_INITIAL_RTT);
+    // The protocol uses exactly one bidirectional stream, opened by the client. Refuse everything
+    // else and bound the memory a peer can make us buffer.
+    config.max_concurrent_bidi_streams(1u32.into());
+    config.max_concurrent_uni_streams(0u32.into());
+    config.datagram_receive_buffer_size(None);
+    config.receive_window(QUIC_RECEIVE_WINDOW.into());
+    config.stream_receive_window(QUIC_STREAM_RECEIVE_WINDOW.into());
+    config.send_window(QUIC_SEND_WINDOW);
     Ok(Arc::new(config))
 }
 
@@ -345,6 +469,9 @@ fn server_config(identity: &HostIdentity) -> Result<quinn::ServerConfig, QuicErr
         .map_err(|e| QuicError::Config(e.to_string()))?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     config.transport_config(transport_config()?);
+    // Validate the client's address before spending handshake work, and bound pending handshakes.
+    config.retry_token_lifetime(Duration::from_secs(15));
+    config.max_incoming(QUIC_MAX_INCOMING);
     Ok(config)
 }
 
@@ -433,6 +560,166 @@ impl ServerCertVerifier for PinnedFingerprintVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::ControlMessage;
+
+    /// Connects a raw quinn client that pins `fingerprint` but never opens a stream.
+    async fn silent_client(
+        addr: SocketAddr,
+        fingerprint: Fingerprint,
+    ) -> (quinn::Endpoint, quinn::Connection) {
+        let mut endpoint =
+            quinn::Endpoint::client((std::net::Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        endpoint.set_default_client_config(client_config(fingerprint).unwrap());
+        let connection = endpoint
+            .connect(addr, QUIC_SERVER_NAME)
+            .unwrap()
+            .await
+            .unwrap();
+        (endpoint, connection)
+    }
+
+    fn test_server() -> (QuicControlServer, SocketAddr, Fingerprint) {
+        let identity = HostIdentity::generate().unwrap();
+        let server = QuicControlServer::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = server.local_addr().unwrap();
+        (server, addr, identity.fingerprint())
+    }
+
+    fn heartbeat(sequence: u64) -> ControlMessage {
+        ControlMessage::Heartbeat {
+            sequence,
+            timestamp_us: 0,
+        }
+    }
+
+    /// Dials, sends one heartbeat and accepts on the host.
+    async fn session_pair(
+        server: &QuicControlServer,
+        addr: SocketAddr,
+        fingerprint: Fingerprint,
+    ) -> (QuicControlSession, QuicControlSession) {
+        let (client, accepted) = tokio::join!(
+            async {
+                let mut c = QuicControlSession::connect(addr, fingerprint)
+                    .await
+                    .unwrap();
+                c.control.send_message(&heartbeat(1)).await.unwrap();
+                c
+            },
+            server.accept()
+        );
+        let mut accepted = accepted.unwrap();
+        assert_eq!(accepted.control.recv_message().await.unwrap(), heartbeat(1));
+        (client, accepted)
+    }
+
+    #[tokio::test]
+    async fn stalled_peer_without_stream_does_not_block_accept() {
+        let (server, addr, fingerprint) = test_server();
+        // Both clients are in flight at once: the stalled one connects first and never opens a
+        // stream, the well-behaved one must still be accepted well before the 5 s deadline.
+        let run = async {
+            let accepting = async {
+                let mut session = server.accept().await.unwrap();
+                let msg = session.control.recv_message().await.unwrap();
+                (session, msg)
+            };
+            let dialing = async {
+                let stalled = silent_client(addr, fingerprint).await;
+                let mut good = QuicControlSession::connect(addr, fingerprint)
+                    .await
+                    .unwrap();
+                good.control.send_message(&heartbeat(9)).await.unwrap();
+                (stalled, good)
+            };
+            tokio::join!(accepting, dialing)
+        };
+        let ((_session, msg), ((_ep, stalled_conn), _good)) =
+            tokio::time::timeout(QUIC_FIRST_STREAM_TIMEOUT - Duration::from_secs(1), run)
+                .await
+                .expect("well-behaved client was blocked by a stalled peer");
+        assert_eq!(msg, heartbeat(9));
+        assert!(stalled_conn.close_reason().is_none());
+    }
+
+    #[tokio::test]
+    async fn stalled_peer_is_disconnected_after_first_stream_timeout() {
+        let (server, addr, fingerprint) = test_server();
+        let accept_loop = tokio::spawn(async move {
+            // Never returns a session for the stalled peer.
+            let _ = server.accept().await;
+            server
+        });
+        let (_ep, conn) = silent_client(addr, fingerprint).await;
+        let reason = tokio::time::timeout(
+            QUIC_FIRST_STREAM_TIMEOUT + Duration::from_secs(3),
+            conn.closed(),
+        )
+        .await
+        .expect("stalled connection was not closed");
+        match reason {
+            quinn::ConnectionError::ApplicationClosed(close) => {
+                assert_eq!(close.error_code, QUIC_CLOSE_FIRST_STREAM_TIMEOUT.into());
+            }
+            other => panic!("expected application close, got {other:?}"),
+        }
+        accept_loop.abort();
+    }
+
+    #[tokio::test]
+    async fn extra_streams_from_client_are_refused() {
+        let (server, addr, fingerprint) = test_server();
+        let (mut client, mut accepted) = session_pair(&server, addr, fingerprint).await;
+
+        // The one allowed bidirectional stream is in use and unidirectional streams are not
+        // allowed at all, so neither open can complete, and nothing reaches the host.
+        let short = Duration::from_millis(500);
+        let conn = client.connection().clone();
+        assert!(tokio::time::timeout(short, conn.open_bi()).await.is_err());
+        assert!(tokio::time::timeout(short, conn.open_uni()).await.is_err());
+        let host_conn = accepted.connection().clone();
+        assert!(tokio::time::timeout(short, host_conn.accept_bi())
+            .await
+            .is_err());
+        assert!(tokio::time::timeout(short, host_conn.accept_uni())
+            .await
+            .is_err());
+
+        // The control stream is unaffected.
+        client.control.send_message(&heartbeat(2)).await.unwrap();
+        assert_eq!(accepted.control.recv_message().await.unwrap(), heartbeat(2));
+    }
+
+    #[tokio::test]
+    async fn dropping_session_closes_connection_with_error_code() {
+        let (server, addr, fingerprint) = test_server();
+        let (client, accepted) = session_pair(&server, addr, fingerprint).await;
+        let conn = accepted.connection().clone();
+        drop(client);
+        let reason = tokio::time::timeout(Duration::from_secs(3), conn.closed())
+            .await
+            .expect("drop did not close the connection");
+        match reason {
+            quinn::ConnectionError::ApplicationClosed(close) => {
+                assert_eq!(close.error_code, QUIC_CLOSE_DROPPED.into());
+            }
+            other => panic!("expected application close, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_server_closes_its_connections() {
+        let (server, addr, fingerprint) = test_server();
+        let (client, _accepted) = session_pair(&server, addr, fingerprint).await;
+        drop(server);
+        let reason = tokio::time::timeout(Duration::from_secs(3), client.closed())
+            .await
+            .expect("dropping the server did not close the connection");
+        assert!(matches!(
+            reason,
+            quinn::ConnectionError::ApplicationClosed(_)
+        ));
+    }
 
     #[test]
     fn fingerprint_display_and_parse_round_trip() {
