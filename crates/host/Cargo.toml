@@ -27,6 +27,8 @@ async-trait.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 parking_lot.workspace = true
+# Already in the lockfile via tokio; used for TCP keepalive options tokio does not expose.
+socket2 = { version = "0.6", features = ["all"] }
 # StatusNotifierItem tray icon (`linux-quest-host tray`). Off by default so headless
 # and CI builds do not pull in D-Bus crates.
 ksni = { version = "0.3.6", optional = true }

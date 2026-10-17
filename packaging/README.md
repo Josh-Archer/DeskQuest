@@ -129,7 +129,7 @@ systemctl --user enable --now linux-quest-tray
 
 Choosing Quit exits with status 0, so `Restart=on-failure` does not start the tray again.
 
-**Known limitation.** The tray's transport and streaming state is only accurate once [#44](https://github.com/Josh-Archer/linux-quest/pull/44) (host link status) is merged. Until then the daemon's status snapshot reports a USB link whenever virtual monitors exist, and it does not report Wi-Fi. The tray can therefore show "Connected over USB" when no headset is attached. The tray shows what the daemon reports.
+**Link status.** The tray shows what the daemon reports. The daemon's status snapshot carries the real link: the transport (USB or Wi-Fi) of the connected client, and `streaming` only while a client is connected and a virtual display exists. With no client connected the tray shows "Disconnected".
 
 ## Verify the unit file
 
