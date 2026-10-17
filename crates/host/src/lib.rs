@@ -15,6 +15,7 @@ pub mod clipboard_service;
 pub mod input_receiver;
 pub mod ipc;
 pub mod multi_display;
+pub mod tray;
 pub mod tui;
 
 pub use audio_pipeline::HostAudioPipeline;
