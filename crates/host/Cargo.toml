@@ -30,6 +30,8 @@ parking_lot.workspace = true
 # StatusNotifierItem tray icon (`linux-quest-host tray`). Off by default so headless
 # and CI builds do not pull in D-Bus crates.
 ksni = { version = "0.3.6", optional = true }
+# Splits `$TERMINAL` into program and arguments without a shell (already in Cargo.lock).
+shlex = "2.0.1"
 
 [features]
 default = []

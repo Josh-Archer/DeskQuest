@@ -116,6 +116,12 @@ RestartSec=5
 WantedBy=graphical-session.target
 ```
 
+The tray needs the graphical session environment (`DISPLAY` or `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, and the D-Bus session bus) to open a terminal and reach the StatusNotifier host. Many desktops import these into the systemd user manager at login. If yours does not, run this from your session startup (for example an autostart entry) before enabling the unit, or set the variables in the unit with `Environment=`:
+
+```bash
+systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR
+```
+
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now linux-quest-tray
@@ -123,7 +129,7 @@ systemctl --user enable --now linux-quest-tray
 
 Choosing Quit exits with status 0, so `Restart=on-failure` does not start the tray again.
 
-**Known limitation.** The daemon's status snapshot reports a USB link whenever virtual monitors exist, and it does not report Wi-Fi yet. The tray can therefore show "Connected over USB" when no headset is attached. The tray shows what the daemon reports. Accurate state needs the daemon to report the real transport and whether a headset is connected.
+**Known limitation.** The tray's transport and streaming state is only accurate once [#44](https://github.com/Josh-Archer/linux-quest/pull/44) (host link status) is merged. Until then the daemon's status snapshot reports a USB link whenever virtual monitors exist, and it does not report Wi-Fi. The tray can therefore show "Connected over USB" when no headset is attached. The tray shows what the daemon reports.
 
 ## Verify the unit file
 

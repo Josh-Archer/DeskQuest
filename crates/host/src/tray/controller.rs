@@ -3,6 +3,8 @@
 //! The controller is generic over the telemetry source, the tray host (the D-Bus
 //! layer) and the command runner, so the whole flow is tested with mocks.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use tracing::{debug, info, warn};
 
@@ -24,6 +26,33 @@ pub trait TrayHost: Send {
     async fn close(&mut self) {}
 }
 
+/// Longest a single daemon poll may take. A wedged daemon must not freeze the menu or
+/// SIGTERM handling, so a slow answer counts as the daemon being offline.
+pub const POLL_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Longest the service restart may take before it is abandoned (and killed).
+pub const ACTION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Name of the host binary looked up on `$PATH` when its own path cannot be trusted.
+const HOST_BINARY: &str = "linux-quest-host";
+
+/// Turns the path reported by `current_exe()` into something safe to launch.
+///
+/// After a package upgrade Linux reports the replaced binary as `<path> (deleted)`. The
+/// suffix is stripped; if nothing exists at the stripped path the bare binary name is
+/// used so the terminal finds it on `$PATH`. `exists` is injected for testing.
+pub fn resolve_host_exe(raw: Option<&str>, exists: impl Fn(&str) -> bool) -> String {
+    const DELETED: &str = " (deleted)";
+    match raw {
+        None => HOST_BINARY.to_string(),
+        Some(path) => match path.strip_suffix(DELETED) {
+            None => path.to_string(),
+            Some(stripped) if !stripped.is_empty() && exists(stripped) => stripped.to_string(),
+            Some(_) => HOST_BINARY.to_string(),
+        },
+    }
+}
+
 /// Environment-dependent inputs, passed in so tests do not read the process environment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrayConfig {
@@ -37,9 +66,13 @@ impl TrayConfig {
     pub fn from_env() -> Self {
         Self {
             terminal: std::env::var("TERMINAL").ok(),
-            host_exe: std::env::current_exe()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| "linux-quest-host".to_string()),
+            host_exe: resolve_host_exe(
+                std::env::current_exe()
+                    .ok()
+                    .map(|p| p.display().to_string())
+                    .as_deref(),
+                |p| std::path::Path::new(p).exists(),
+            ),
         }
     }
 }
@@ -58,6 +91,8 @@ pub struct TrayController<S, H, R> {
     config: TrayConfig,
     last_published: Option<TrayView>,
     host_failing: bool,
+    poll_timeout: Duration,
+    action_timeout: Duration,
 }
 
 impl<S, H, R> TrayController<S, H, R>
@@ -74,18 +109,33 @@ where
             config,
             last_published: None,
             host_failing: false,
+            poll_timeout: POLL_TIMEOUT,
+            action_timeout: ACTION_TIMEOUT,
         }
+    }
+
+    /// Overrides the poll and action timeouts (tests use short ones).
+    #[cfg(test)]
+    fn with_timeouts(mut self, poll: Duration, action: Duration) -> Self {
+        self.poll_timeout = poll;
+        self.action_timeout = action;
+        self
     }
 
     /// Polls the daemon once and publishes the view if it changed (or was never shown).
     pub async fn refresh(&mut self) {
-        let state = match self.source.fetch_snapshot().await {
-            Ok(snapshot) => ConnectionState::from_snapshot(&snapshot),
-            Err(err) => {
-                debug!(error = %err, "daemon status unavailable");
-                ConnectionState::DaemonOffline
-            }
-        };
+        let state =
+            match tokio::time::timeout(self.poll_timeout, self.source.fetch_snapshot()).await {
+                Ok(Ok(snapshot)) => ConnectionState::from_snapshot(&snapshot),
+                Err(_elapsed) => {
+                    debug!(timeout = ?self.poll_timeout, "daemon status poll timed out");
+                    ConnectionState::DaemonOffline
+                }
+                Ok(Err(err)) => {
+                    debug!(error = %err, "daemon status unavailable");
+                    ConnectionState::DaemonOffline
+                }
+            };
         let view = TrayView::for_state(state);
         if self.last_published.as_ref() == Some(&view) {
             return;
@@ -119,7 +169,11 @@ where
         match action {
             TrayAction::OpenDashboard => {
                 let cmd = dashboard_command(self.config.terminal.as_deref(), &self.config.host_exe);
-                if let Err(err) = self.runner.spawn_detached(&cmd).await {
+                let spawned =
+                    tokio::time::timeout(self.action_timeout, self.runner.spawn_detached(&cmd))
+                        .await
+                        .unwrap_or_else(|_| Err("timed out starting terminal".to_string()));
+                if let Err(err) = spawned {
                     warn!(
                         error = %err,
                         "could not open dashboard; set $TERMINAL to a terminal emulator that accepts -e"
@@ -129,9 +183,17 @@ where
             }
             TrayAction::RestartService => {
                 let cmd = restart_command();
-                match self.runner.run_to_completion(&cmd).await {
-                    Ok(()) => info!("requested restart of linux-quest-host"),
-                    Err(err) => tracing::error!(error = %err, "could not restart linux-quest-host"),
+                match tokio::time::timeout(self.action_timeout, self.runner.run_to_completion(&cmd))
+                    .await
+                {
+                    Ok(Ok(())) => info!("requested restart of linux-quest-host"),
+                    Ok(Err(err)) => {
+                        tracing::error!(error = %err, "could not restart linux-quest-host")
+                    }
+                    Err(_elapsed) => tracing::error!(
+                        timeout = ?self.action_timeout,
+                        "restarting linux-quest-host timed out; gave up waiting"
+                    ),
                 }
                 Flow::Continue
             }
@@ -343,6 +405,83 @@ mod tests {
         );
         assert_eq!(c.handle(TrayAction::OpenDashboard).await, Flow::Continue);
         assert_eq!(c.handle(TrayAction::RestartService).await, Flow::Continue);
+    }
+
+    // A source whose daemon never answers.
+    struct HangingSource;
+
+    #[async_trait]
+    impl TelemetrySource for HangingSource {
+        async fn fetch_snapshot(&mut self) -> Result<DashboardSnapshot, HostError> {
+            std::future::pending().await
+        }
+    }
+
+    // A runner whose commands never finish.
+    struct HangingRunner;
+
+    #[async_trait]
+    impl CommandRunner for HangingRunner {
+        async fn spawn_detached(&mut self, _cmd: &LaunchCommand) -> Result<(), String> {
+            std::future::pending().await
+        }
+        async fn run_to_completion(&mut self, _cmd: &LaunchCommand) -> Result<(), String> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn hanging_daemon_poll_times_out_as_offline() {
+        let host = MockHost::default();
+        let published = host.published.clone();
+        let mut c = TrayController::new(HangingSource, host, MockRunner::default(), config(None))
+            .with_timeouts(Duration::from_millis(20), Duration::from_secs(5));
+        tokio::time::timeout(Duration::from_secs(2), c.refresh())
+            .await
+            .expect("refresh must not hang on a wedged daemon");
+        assert_eq!(states(&published), vec![ConnectionState::DaemonOffline]);
+    }
+
+    #[tokio::test]
+    async fn hanging_actions_time_out_and_continue() {
+        let mut c = TrayController::new(
+            ScriptedSource(VecDeque::new()),
+            MockHost::default(),
+            HangingRunner,
+            config(None),
+        )
+        .with_timeouts(Duration::from_secs(5), Duration::from_millis(20));
+        let flow = tokio::time::timeout(Duration::from_secs(2), async {
+            let a = c.handle(TrayAction::RestartService).await;
+            let b = c.handle(TrayAction::OpenDashboard).await;
+            (a, b)
+        })
+        .await
+        .expect("actions must time out");
+        assert_eq!(flow, (Flow::Continue, Flow::Continue));
+    }
+
+    #[test]
+    fn deleted_exe_suffix_is_stripped_when_target_exists() {
+        let exe = resolve_host_exe(Some("/usr/bin/linux-quest-host (deleted)"), |_| true);
+        assert_eq!(exe, "/usr/bin/linux-quest-host");
+    }
+
+    #[test]
+    fn deleted_exe_falls_back_to_path_lookup() {
+        assert_eq!(
+            resolve_host_exe(Some("/usr/bin/linux-quest-host (deleted)"), |_| false),
+            "linux-quest-host"
+        );
+        assert_eq!(resolve_host_exe(None, |_| true), "linux-quest-host");
+    }
+
+    #[test]
+    fn normal_exe_path_is_unchanged() {
+        assert_eq!(
+            resolve_host_exe(Some("/opt/x/linux-quest-host"), |_| false),
+            "/opt/x/linux-quest-host"
+        );
     }
 
     #[tokio::test]

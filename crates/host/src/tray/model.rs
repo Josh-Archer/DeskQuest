@@ -27,6 +27,11 @@ impl ConnectionState {
     ///
     /// The daemon reports `streaming` once virtual displays exist, so a snapshot
     /// without displays is `Disconnected` regardless of the transport field.
+    ///
+    /// The transport and streaming fields are only accurate once
+    /// Josh-Archer/linux-quest#44 (host link status) is merged. Before it, the daemon
+    /// reports USB whenever monitors exist (and never Wi-Fi), so this can show
+    /// "Connected over USB" with no headset attached.
     pub fn from_snapshot(snapshot: &DashboardSnapshot) -> Self {
         if !snapshot.streaming {
             return Self::Disconnected;
