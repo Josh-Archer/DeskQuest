@@ -24,12 +24,21 @@ fi
 
 APK="${1:-}"
 if [[ -z "${APK}" ]]; then
-    if [[ -f "${APK_DIR}/linux-quest-release.apk" ]]; then
-        APK="${APK_DIR}/linux-quest-release.apk"
-    elif [[ -f "${APK_DIR}/linux-quest-debug.apk" ]]; then
-        APK="${APK_DIR}/linux-quest-debug.apk"
-    else
+    RELEASE_APK="${APK_DIR}/linux-quest-release.apk"
+    DEBUG_APK="${APK_DIR}/linux-quest-debug.apk"
+    # Pick the most recently built candidate (by mtime). '-nt' is portable to bash 3.2.
+    if [[ -f "${RELEASE_APK}" ]]; then
+        APK="${RELEASE_APK}"
+    fi
+    if [[ -f "${DEBUG_APK}" ]] && { [[ -z "${APK}" ]] || [[ "${DEBUG_APK}" -nt "${APK}" ]]; }; then
+        APK="${DEBUG_APK}"
+    fi
+    if [[ -z "${APK}" ]]; then
         die "No APK given and none found in ${APK_DIR}. Run crates/client/android/build.sh first or pass a path."
+    fi
+    if [[ -f "${RELEASE_APK}" && -f "${DEBUG_APK}" ]]; then
+        echo "WARNING: both release and debug APKs exist in ${APK_DIR}." >&2
+        echo "WARNING: installing the newest one: ${APK}. Pass a path to choose explicitly." >&2
     fi
 fi
 
@@ -59,11 +68,13 @@ if [[ -n "${ANDROID_SERIAL:-}" ]]; then
     fi
     ADB_ARGS=(-s "${ANDROID_SERIAL}")
 elif [[ "${READY_COUNT}" -gt 1 ]]; then
-    die "Multiple devices connected. Set ANDROID_SERIAL to one of: $(printf '%s ' ${READY_SERIALS})"
+    die "Multiple devices connected. Set ANDROID_SERIAL to one of: $(printf '%s' "${READY_SERIALS}" | tr '\n' ' ')"
 fi
 
 echo "Installing ${APK} on device(s): $(printf '%s' "${READY_SERIALS}" | tr '\n' ' ')"
-INSTALL_OUTPUT="$(adb "${ADB_ARGS[@]}" install -r "${APK}" 2>&1)" || {
+# ${ADB_ARGS[@]+...} expands to nothing for an empty array; a bare "${ADB_ARGS[@]}"
+# trips 'unbound variable' under set -u on bash 3.2 and 4.3.
+INSTALL_OUTPUT="$(adb ${ADB_ARGS[@]+"${ADB_ARGS[@]}"} install -r "${APK}" 2>&1)" || {
     echo "${INSTALL_OUTPUT}" >&2
     die "adb install failed."
 }
