@@ -10,7 +10,7 @@ Files for running `linux-quest-host` as a background service on Ubuntu / systemd
 | `debian/postinst`, `debian/copyright` | Debian maintainer script (reloads udev) and copyright file, used by `cargo deb` |
 | `arch/PKGBUILD` | AUR package recipe (see below) |
 
-The tray icon is not included yet (tracked in #32).
+The optional tray icon (`linux-quest-host tray`, tracked in #32) is off by default. See [Optional tray icon](#optional-tray-icon) below.
 
 ## 1. Install the binary
 
@@ -69,6 +69,67 @@ systemctl --user disable --now linux-quest-host
 - `systemctl --user stop` sends `SIGTERM`. The daemon treats it like Ctrl-C: it stops the IPC server, releases held keys and buttons, and removes its socket and PID file. It must stop within 10 seconds (`TimeoutStopSec`), or systemd sends `SIGKILL`.
 - `Restart=on-failure` restarts the daemon after 2 seconds if it exits with an error. A clean stop does not restart it.
 - If the daemon keeps failing (for example, another instance holds the PID lock), systemd gives up after 5 starts within 60 seconds. Check `journalctl --user -u linux-quest-host`, then `systemctl --user reset-failed linux-quest-host` once fixed.
+
+## Optional tray icon
+
+`linux-quest-host tray` puts a status icon in the system tray. The icon is green for USB, blue for Wi-Fi, grey when no headset is streaming, and a hollow ring when the daemon is not running. Its menu has:
+
+- **Status**: the connection state, as the first (disabled) row.
+- **Open dashboard**: runs `linux-quest-host dashboard` in a terminal. Left-click does the same. The terminal is `$TERMINAL`, or `x-terminal-emulator` if that is unset. It must accept `-e <command>`.
+- **Restart service**: runs `systemctl --user --no-block restart linux-quest-host`.
+- **Quit**: exits the tray. The daemon keeps running.
+
+The tray is a separate process. It asks the daemon for its status over the IPC socket every 2 seconds (`--interval-ms`, minimum 500).
+
+**Build it with the `tray` feature.** The feature pulls in D-Bus (`ksni`), so it is off by default. The release packages do not include it:
+
+```bash
+cargo install --path crates/host --bin linux-quest-host --features tray --root ~/.local
+```
+
+Without the feature, `linux-quest-host tray` prints this command and exits with status 2.
+
+**It needs a StatusNotifierItem host.** KDE Plasma has one built in. GNOME needs the AppIndicator extension. Other desktops need a bar with a tray module, such as waybar's `tray`. With no host running, the tray logs one warning and keeps running. It shows the icon as soon as a host starts.
+
+**Ordering with the daemon unit.**
+
+- The tray does not depend on the daemon. While the daemon is down it shows "Daemon not running", and it recovers on its own once the daemon starts. Start order does not affect correctness.
+- The daemon unit is unchanged. `Restart service` restarts only the daemon, and the tray keeps running because it is a separate process. This is also why the tray is not built into `daemon`.
+- To start the tray with your session, install a user unit after the daemon's. The packages do not ship one. `After=` only sets the start order. It does not start the daemon.
+
+```ini
+# ~/.config/systemd/user/linux-quest-tray.service
+[Unit]
+Description=Linux Quest host tray icon
+PartOf=graphical-session.target
+After=graphical-session.target linux-quest-host.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/linux-quest-host tray
+# systemd user services do not inherit your shell's TERMINAL. Uncomment and set one if you want a specific terminal:
+# Environment=TERMINAL=kitty
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
+```
+
+The tray needs the graphical session environment (`DISPLAY` or `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, and the D-Bus session bus) to open a terminal and reach the StatusNotifier host. Many desktops import these into the systemd user manager at login. If yours does not, run this from your session startup (for example an autostart entry) before enabling the unit, or set the variables in the unit with `Environment=`:
+
+```bash
+systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now linux-quest-tray
+```
+
+Choosing Quit exits with status 0, so `Restart=on-failure` does not start the tray again.
+
+**Known limitation.** The tray's transport and streaming state is only accurate once [#44](https://github.com/Josh-Archer/linux-quest/pull/44) (host link status) is merged. Until then the daemon's status snapshot reports a USB link whenever virtual monitors exist, and it does not report Wi-Fi. The tray can therefore show "Connected over USB" when no headset is attached. The tray shows what the daemon reports.
 
 ## Verify the unit file
 
