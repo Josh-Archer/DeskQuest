@@ -1,6 +1,9 @@
 pub mod audio;
 pub mod nvenc;
 pub mod opus;
+pub mod vaapi;
+
+use std::str::FromStr;
 
 use async_trait::async_trait;
 pub use audio::{
@@ -12,6 +15,8 @@ use linux_quest_protocol::{VideoChunk, VideoChunkMeta, VideoCodec};
 pub use nvenc::NvencEncoder;
 pub use opus::OpusAudioEncoder;
 use thiserror::Error;
+use tracing::{info, warn};
+pub use vaapi::{VaLayer, VaapiEncoder};
 
 #[derive(Error, Debug)]
 pub enum EncoderError {
@@ -170,41 +175,217 @@ impl VideoEncoder for MockVideoEncoder {
     }
 }
 
-/// Dynamically discovers and initializes the best hardware encoder (NVIDIA NVENC with fallback).
+/// A concrete video encoder implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKind {
+    Nvenc,
+    Vaapi,
+    Mock,
+}
+
+impl BackendKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            BackendKind::Nvenc => "nvenc",
+            BackendKind::Vaapi => "vaapi",
+            BackendKind::Mock => "mock",
+        }
+    }
+}
+
+/// Backend selection requested by the user (config file, CLI or environment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackendPreference {
+    /// NVENC, then VA-API. Never silently picks the mock on its own.
+    #[default]
+    Auto,
+    Nvenc,
+    Vaapi,
+    /// Software mock. Only for tests and development.
+    Mock,
+}
+
+impl BackendPreference {
+    /// Environment variable read by [`BackendPreference::from_env`].
+    pub const ENV_VAR: &'static str = "LINUX_QUEST_VIDEO_ENCODER";
+
+    /// Reads [`Self::ENV_VAR`]. Unset or empty means `Auto`. Invalid values warn and mean `Auto`.
+    pub fn from_env() -> Self {
+        match std::env::var(Self::ENV_VAR) {
+            Ok(v) if !v.trim().is_empty() => v.parse().unwrap_or_else(|e| {
+                warn!("Ignoring {}: {e}", Self::ENV_VAR);
+                Self::Auto
+            }),
+            _ => Self::Auto,
+        }
+    }
+}
+
+impl FromStr for BackendPreference {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Ok(Self::Auto),
+            "nvenc" | "nvidia" => Ok(Self::Nvenc),
+            "vaapi" | "va-api" | "va" => Ok(Self::Vaapi),
+            "mock" | "software" => Ok(Self::Mock),
+            other => Err(format!(
+                "unknown video encoder '{other}' (expected auto, nvenc, vaapi or mock)"
+            )),
+        }
+    }
+}
+
+/// Hardware backends to try, in order, for a preference. The mock is never listed
+/// here; it is only chosen explicitly or as the last resort in [`AutoVideoEncoder`].
+pub fn hardware_order(preference: BackendPreference) -> &'static [BackendKind] {
+    match preference {
+        BackendPreference::Auto => &[BackendKind::Nvenc, BackendKind::Vaapi],
+        BackendPreference::Nvenc => &[BackendKind::Nvenc],
+        BackendPreference::Vaapi => &[BackendKind::Vaapi],
+        BackendPreference::Mock => &[],
+    }
+}
+
+/// Result of probing one backend without keeping it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendProbe {
+    pub kind: BackendKind,
+    pub available: bool,
+    /// Why the backend is or is not usable. Always set.
+    pub reason: String,
+}
+
+/// Probes every backend for `codec` and reports each one's status and reason.
+pub fn probe_backends(codec: VideoCodec) -> Vec<BackendProbe> {
+    let nvenc = match NvencEncoder::probe() {
+        Ok(()) => BackendProbe {
+            kind: BackendKind::Nvenc,
+            available: true,
+            reason: "NVENC runtime present (driver API >= 12.1)".into(),
+        },
+        Err(reason) => BackendProbe {
+            kind: BackendKind::Nvenc,
+            available: false,
+            reason,
+        },
+    };
+    let vaapi = match vaapi::probe(codec) {
+        Ok(report) => BackendProbe {
+            kind: BackendKind::Vaapi,
+            available: true,
+            reason: format!(
+                "VA-API usable on {} (profile {}, entrypoint {}); unverified on hardware",
+                report.vendor, report.selection.profile, report.selection.entrypoint
+            ),
+        },
+        Err(e) => BackendProbe {
+            kind: BackendKind::Vaapi,
+            available: false,
+            reason: e.to_string(),
+        },
+    };
+    vec![
+        nvenc,
+        vaapi,
+        BackendProbe {
+            kind: BackendKind::Mock,
+            available: true,
+            reason: "software mock (no encoding, test and development only)".into(),
+        },
+    ]
+}
+
+/// Builds and initialises the first hardware encoder in the preference order.
+/// Returns an error listing each backend's failure reason when none initialises.
+/// Never falls back to the mock; `BackendPreference::Mock` builds the mock directly.
+pub async fn create_encoder(
+    config: EncoderConfig,
+    preference: BackendPreference,
+) -> Result<(BackendKind, Box<dyn VideoEncoder>), EncoderError> {
+    if preference == BackendPreference::Mock {
+        let mut mock: Box<dyn VideoEncoder> = Box::new(MockVideoEncoder::new(config.clone()));
+        mock.init(config).await?;
+        return Ok((BackendKind::Mock, mock));
+    }
+    let mut failures = Vec::new();
+    for &kind in hardware_order(preference) {
+        let mut candidate = build_backend(kind, &config);
+        match candidate.init(config.clone()).await {
+            Ok(()) => {
+                info!("Video encoder backend selected: {}", kind.name());
+                return Ok((kind, candidate));
+            }
+            Err(e) => failures.push(format!("{}: {e}", kind.name())),
+        }
+    }
+    Err(EncoderError::InitFailed(format!(
+        "no hardware video encoder available ({})",
+        failures.join("; ")
+    )))
+}
+
+fn build_backend(kind: BackendKind, config: &EncoderConfig) -> Box<dyn VideoEncoder> {
+    match kind {
+        BackendKind::Nvenc => Box::new(NvencEncoder::new(config.clone())),
+        BackendKind::Vaapi => Box::new(VaapiEncoder::new(config.clone())),
+        BackendKind::Mock => Box::new(MockVideoEncoder::new(config.clone())),
+    }
+}
+
+/// Picks a backend at init: the preference's hardware order, then the software mock.
+/// The mock last resort is kept so streaming still works on hosts without a GPU.
 pub struct AutoVideoEncoder {
-    _config: EncoderConfig,
+    preference: BackendPreference,
     inner: Box<dyn VideoEncoder>,
+    selected: BackendKind,
 }
 
 impl AutoVideoEncoder {
+    /// Uses [`BackendPreference::from_env`].
     pub fn new(config: EncoderConfig) -> Self {
-        let inner: Box<dyn VideoEncoder> = if NvencEncoder::is_available() {
-            Box::new(NvencEncoder::new(config.clone()))
-        } else {
-            Box::new(MockVideoEncoder::new(config.clone()))
-        };
+        Self::with_preference(config, BackendPreference::from_env())
+    }
+
+    pub fn with_preference(config: EncoderConfig, preference: BackendPreference) -> Self {
         Self {
-            _config: config,
-            inner,
+            preference,
+            inner: Box::new(MockVideoEncoder::new(config)),
+            selected: BackendKind::Mock,
         }
+    }
+
+    /// The backend that `init` settled on. Mock until `init` succeeds.
+    pub fn selected_backend(&self) -> BackendKind {
+        self.selected
     }
 }
 
 #[async_trait]
 impl VideoEncoder for AutoVideoEncoder {
     async fn init(&mut self, config: EncoderConfig) -> Result<(), EncoderError> {
-        match self.inner.init(config.clone()).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                tracing::warn!(
-                    "Primary video encoder failed to initialize: {e}. Gracefully demoting to MockVideoEncoder"
-                );
-                let mut fallback = MockVideoEncoder::new(config.clone());
-                fallback.init(config).await?;
-                self.inner = Box::new(fallback);
-                Ok(())
+        let mut chain: Vec<BackendKind> = hardware_order(self.preference).to_vec();
+        chain.push(BackendKind::Mock);
+        let mut failures = Vec::new();
+        for kind in chain {
+            let mut candidate = build_backend(kind, &config);
+            match candidate.init(config.clone()).await {
+                Ok(()) => {
+                    self.inner = candidate;
+                    self.selected = kind;
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!(
+                        "{} video encoder failed to initialize: {e}. Trying the next backend",
+                        kind.name()
+                    );
+                    failures.push(format!("{}: {e}", kind.name()));
+                }
             }
         }
+        Err(EncoderError::InitFailed(failures.join("; ")))
     }
 
     async fn encode(&mut self, frame: &RawFrame) -> Result<EncodedFrame, EncoderError> {
@@ -301,6 +482,81 @@ mod tests {
 
         let encoded = auto.encode(&raw).await.expect("Encode failed");
         assert!(!encoded.chunks.is_empty());
+    }
+
+    #[test]
+    fn test_backend_preference_parsing_and_order() {
+        assert_eq!(
+            "auto".parse::<BackendPreference>(),
+            Ok(BackendPreference::Auto)
+        );
+        assert_eq!(
+            "NVENC".parse::<BackendPreference>(),
+            Ok(BackendPreference::Nvenc)
+        );
+        assert_eq!(
+            "va-api".parse::<BackendPreference>(),
+            Ok(BackendPreference::Vaapi)
+        );
+        assert_eq!(
+            "mock".parse::<BackendPreference>(),
+            Ok(BackendPreference::Mock)
+        );
+        assert!("cuda".parse::<BackendPreference>().is_err());
+
+        // Auto is NVENC then VA-API; the mock is never a hardware candidate.
+        assert_eq!(
+            hardware_order(BackendPreference::Auto),
+            &[BackendKind::Nvenc, BackendKind::Vaapi]
+        );
+        assert_eq!(
+            hardware_order(BackendPreference::Vaapi),
+            &[BackendKind::Vaapi]
+        );
+        assert!(hardware_order(BackendPreference::Mock).is_empty());
+    }
+
+    #[test]
+    fn test_probe_backends_reports_reasons() {
+        let probes = probe_backends(VideoCodec::Hevc);
+        assert_eq!(probes.len(), 3);
+        for p in &probes {
+            assert!(!p.reason.is_empty(), "{:?} has no reason", p.kind);
+        }
+        let mock = probes.iter().find(|p| p.kind == BackendKind::Mock).unwrap();
+        assert!(mock.available);
+    }
+
+    #[tokio::test]
+    async fn test_create_encoder_explicit_mock_and_error_shape() {
+        let (kind, mut enc) = create_encoder(EncoderConfig::default(), BackendPreference::Mock)
+            .await
+            .expect("mock always initialises");
+        assert_eq!(kind, BackendKind::Mock);
+        enc.init(EncoderConfig::default()).await.unwrap();
+
+        // Without a usable VA-API driver the factory errors and does not substitute the mock.
+        // On a host that has one, the call succeeds; either outcome is valid.
+        match create_encoder(EncoderConfig::default(), BackendPreference::Vaapi).await {
+            Ok((kind, _)) => assert_eq!(kind, BackendKind::Vaapi),
+            Err(EncoderError::InitFailed(msg)) => {
+                assert!(
+                    msg.starts_with("no hardware video encoder available"),
+                    "{msg}"
+                );
+                assert!(msg.contains("vaapi:"), "{msg}");
+            }
+            Err(other) => panic!("unexpected error {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_auto_encoder_with_mock_preference_selects_mock() {
+        let mut auto =
+            AutoVideoEncoder::with_preference(EncoderConfig::default(), BackendPreference::Mock);
+        assert_eq!(auto.selected_backend(), BackendKind::Mock);
+        auto.init(EncoderConfig::default()).await.unwrap();
+        assert_eq!(auto.selected_backend(), BackendKind::Mock);
     }
 
     #[tokio::test]

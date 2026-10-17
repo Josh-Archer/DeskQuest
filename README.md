@@ -171,7 +171,7 @@ When `/dev/uinput` is unavailable or permissions are not yet configured, the hos
 The project is structured into 7 core phases. Status reflects what is merged on `main`; see [ROADMAP.md](ROADMAP.md) for details.
 
 - [x] **Phase 1:** Foundation & Architecture (Cargo workspace, zero-copy binary protocol, telemetry, CI)
-- [~] **Phase 2:** Linux Capture & Hardware Encoding Engine (PipeWire DMA-BUF capture, NVENC AV1/HEVC with intra-refresh and reference picture invalidation done; VA-API backend for AMD/Intel pending)
+- [~] **Phase 2:** Linux Capture & Hardware Encoding Engine (PipeWire DMA-BUF capture, NVENC AV1/HEVC with intra-refresh and reference picture invalidation done; VA-API HEVC backend for AMD/Intel implemented but not yet verified on hardware, see `crates/encoder/src/vaapi.rs`; select with `LINUX_QUEST_VIDEO_ENCODER=nvenc|vaapi|mock`)
 - [~] **Phase 3:** Low-Latency Network & USB Transport (paced UDP, Reed-Solomon/XOR FEC, ADB reverse tunnel done; QUIC control channel and mDNS/SSDP LAN discovery pending)
 - [x] **Phase 4:** Meta Quest OpenXR Client & Hardware Decoder (AMediaCodec, Vulkan, Composition Layers)
 - [~] **Phase 5:** Virtual Multi-Monitor Management on Linux (wlroots, Mutter and X11 backends with dynamic EDID done; VKMS/EVDI kernel dummy-driver fallback pending)
