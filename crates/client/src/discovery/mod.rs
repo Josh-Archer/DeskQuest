@@ -45,8 +45,15 @@ pub use multicast_lock::{MockMulticastLock, MulticastLock};
 pub use linux_quest_transport::MdnsDiscoveryBackend;
 
 /// How long one browse listens for answers. mDNS responders reply within about a second, so
-/// three seconds covers slow responders without making the list feel stuck.
-pub const DEFAULT_BROWSE_WINDOW: Duration = Duration::from_secs(3);
+/// two seconds covers them while keeping the multicast lock (and the Wi-Fi radio awake) short.
+/// With [`scheduler::DEFAULT_RESCAN_PERIOD`] of 15 s the lock is held about 13% of the time
+/// while disconnected, down from about 60% at 3 s every 5 s.
+pub const DEFAULT_BROWSE_WINDOW: Duration = Duration::from_secs(2);
+
+/// How long a host stays listed after it last answered. It must span several scans: the
+/// transport default (15 s) equals the default re-scan period, so hosts would drop out of the
+/// list between scans. Three periods tolerates a missed scan or a lost mDNS answer.
+pub const HOST_STALE_AFTER: Duration = Duration::from_secs(45);
 
 /// Browses for hosts and remembers the ones that answer.
 ///
@@ -67,7 +74,7 @@ impl<B: DiscoveryBackend, L: MulticastLock> ClientDiscovery<B, L> {
             lock,
             lock_held: false,
             window: DEFAULT_BROWSE_WINDOW,
-            directory: HostDirectory::default(),
+            directory: HostDirectory::new(HOST_STALE_AFTER),
         }
     }
 
@@ -176,20 +183,30 @@ pub fn mdns_discovery<L: MulticastLock>(
     Ok(ClientDiscovery::new(MdnsDiscoveryBackend::new()?, lock))
 }
 
-/// Points `config` at a discovered host: `host_addr` becomes its control address (port 48444).
+/// Points `config` at a discovered host: `host_addr` becomes its control address (port 48444),
+/// chosen by [`DiscoveredHost::ordered_addresses`] so a LAN address beats a Docker bridge.
+///
+/// The host's other addresses go to `extra_host_ips`, so the UDP source filter accepts video
+/// from any interface the host answered on, not only the one chosen for control.
 ///
 /// This does not change `transport_mode`. In `Udp` mode the receive path accepts video only from
-/// `host_addr`'s IP (`android::udp_source_filter`), so selecting a host there makes it the video
+/// those IPs (`android::udp_source_filter`), so selecting a host there makes it the video
 /// source. ADB mode is unchanged and does not use discovery.
 pub fn apply_selection(config: &mut ClientConfig, host: &DiscoveredHost) -> ClientResult<()> {
-    config.host_addr = host
+    let addr = host
         .control_addr()
         .ok_or_else(|| ClientError::Transport(format!("host {:?} has no address", host.name)))?;
+    config.host_addr = addr;
+    config.extra_host_ips = host
+        .ordered_addresses()
+        .into_iter()
+        .filter(|ip| *ip != addr.ip())
+        .collect();
     Ok(())
 }
 
-/// Parses a host typed by hand. Accepts `192.168.1.20`, `192.168.1.20:48444`, `[fe80::1]:48444`
-/// or a bare IPv6 address. Without a port, `default_port` is used.
+/// Parses a host typed by hand. Accepts `192.168.1.20`, `192.168.1.20:48444`, `[fe80::1]:48444`,
+/// `[fe80::1]` or a bare IPv6 address. Without a port, `default_port` is used.
 pub fn parse_manual_host(input: &str, default_port: u16) -> ClientResult<SocketAddr> {
     let text = input.trim();
     if text.is_empty() {
@@ -200,6 +217,11 @@ pub fn parse_manual_host(input: &str, default_port: u16) -> ClientResult<SocketA
     }
     if let Ok(ip) = text.parse::<IpAddr>() {
         return checked_port(SocketAddr::new(ip, default_port));
+    }
+    if let Some(inner) = text.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
+        if let Ok(ip) = inner.parse::<std::net::Ipv6Addr>() {
+            return checked_port(SocketAddr::new(IpAddr::V6(ip), default_port));
+        }
     }
     Err(ClientError::Config(format!(
         "invalid host address {text:?}; expected an IP address with an optional port"
@@ -302,6 +324,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hosts_stay_listed_across_the_default_rescan_period() {
+        let backend = MockDiscoveryBackend::new().with_peers([host("den", 10)]);
+        let mut discovery = ClientDiscovery::new(backend, MockMulticastLock::new());
+        let t0 = Instant::now();
+        discovery.scan_with_clock(|| t0).await.unwrap();
+        let next_scan = t0 + scheduler::DEFAULT_RESCAN_PERIOD + DEFAULT_BROWSE_WINDOW;
+        assert_eq!(discovery.hosts_at(next_scan).len(), 1);
+    }
+
+    #[tokio::test]
     async fn hosts_that_stop_answering_expire() {
         let backend = MockDiscoveryBackend::new().with_peers([host("den", 10)]);
         let mut discovery = ClientDiscovery::new(backend, MockMulticastLock::new());
@@ -344,6 +376,31 @@ mod tests {
     }
 
     #[test]
+    fn selection_prefers_lan_address_over_docker_and_keeps_all_for_filter() {
+        let mut config = ClientConfig::default();
+        let mut multi = host("den", 10);
+        multi.addresses = vec![
+            IpAddr::from([172, 17, 0, 1]),
+            IpAddr::from([192, 168, 1, 10]),
+        ];
+        apply_selection(&mut config, &multi).unwrap();
+        assert_eq!(
+            config.host_addr,
+            SocketAddr::from(([192, 168, 1, 10], DEFAULT_CONTROL_PORT))
+        );
+        assert_eq!(config.extra_host_ips, vec![IpAddr::from([172, 17, 0, 1])]);
+
+        config.transport_mode = crate::config::TransportMode::Udp;
+        let filter = crate::android::udp_source_filter(&config).unwrap();
+        let accepts = |ip: [u8; 4]| {
+            crate::android::accept_udp_source(Some(&filter), SocketAddr::from((ip, 50000)))
+        };
+        assert!(accepts([192, 168, 1, 10]));
+        assert!(accepts([172, 17, 0, 1]));
+        assert!(!accepts([192, 168, 1, 99]));
+    }
+
+    #[test]
     fn selection_rejects_host_without_address() {
         let mut config = ClientConfig::default();
         let mut no_addr = host("den", 10);
@@ -365,6 +422,12 @@ mod tests {
             parse_manual_host("[fe80::1]:48444", MANUAL_DEFAULT_PORT).unwrap(),
             "[fe80::1]:48444".parse::<SocketAddr>().unwrap()
         );
+        assert_eq!(
+            parse_manual_host("[fe80::1]", MANUAL_DEFAULT_PORT).unwrap(),
+            SocketAddr::new("fe80::1".parse().unwrap(), MANUAL_DEFAULT_PORT)
+        );
+        assert!(parse_manual_host("[192.168.1.1]", MANUAL_DEFAULT_PORT).is_err());
+        assert!(parse_manual_host("[fe80::1", MANUAL_DEFAULT_PORT).is_err());
         assert_eq!(
             parse_manual_host("fe80::1", MANUAL_DEFAULT_PORT)
                 .unwrap()

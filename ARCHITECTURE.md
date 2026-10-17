@@ -102,6 +102,9 @@ For wireless freedom:
 ### Ports
 - Wi-Fi/LAN (manual entry and mDNS discovery): the host's control listener, TCP `48444`. Discovery advertises this port, along with the UDP input port `48442`. Manual entry defaults to `48444`.
 - Wi-Fi video: UDP `48440` on the client. The client accepts datagrams only from the host IP it was given.
+  - In `Udp` mode the default `host_addr` is `127.0.0.1`, so **all LAN video is dropped until discovery or manual entry sets the host address**. The client logs a warning at startup in that state, and a rate-limited warning for the first dropped datagram from each source. `0.0.0.0` disables the filter.
+  - Discovery picks the host's LAN address (private ranges ahead of the Docker bridge `172.17/16`) as `host_addr` and keeps the host's other discovered addresses, so the filter accepts video from any of them. Addresses are compared in canonical form (IPv4-mapped IPv6 equals IPv4).
+- Discovery duty cycle: while disconnected the client browses for 2 s every 15 s, holding the Android multicast lock for about 13% of the time. Hosts stay listed for 45 s after they last answered.
 - USB/ADB: `adb reverse tcp:42069 tcp:42069`. This port is separate and is never a default for Wi-Fi entry.
 - The daemon has no video listener yet, so no video port is advertised.
 

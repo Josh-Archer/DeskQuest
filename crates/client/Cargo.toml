@@ -43,5 +43,6 @@ jni = "0.21"
 [dev-dependencies]
 # Paused tokio clock for the discovery scheduler tests.
 tokio = { workspace = true, features = ["test-util"] }
+async-trait.workspace = true
 linux-quest-capture = { path = "../capture" }
 linux-quest-encoder = { path = "../encoder" }

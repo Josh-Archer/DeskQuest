@@ -4,7 +4,8 @@
 //! reports the lock as unavailable.
 //!
 //! The `MulticastLock` object is kept as a JNI global reference so it survives across calls.
-//! It is released on `release` and again on drop, so a discovery that is dropped mid-browse
+//! It is released on `release` and again on drop (the reference is kept until the Java release
+//! succeeds, so a failed release can be retried), so a discovery that is dropped mid-browse
 //! does not leave Wi-Fi multicast reception switched on.
 
 use crate::discovery::multicast_lock::MulticastLock;
@@ -33,6 +34,86 @@ impl Default for AndroidMulticastLock {
     }
 }
 
+/// Local reference slots reserved for one JNI call sequence. A native thread has no Java frame
+/// that would free locals on return, so every sequence runs inside a local frame.
+#[cfg(target_os = "android")]
+const LOCAL_FRAME_CAPACITY: i32 = 16;
+
+/// Converts a JNI error into a [`ClientError`], first describing and clearing any pending Java
+/// exception. Calling further JNI functions with an exception pending is undefined behaviour,
+/// and an uncleared exception would also surface on the next call from this thread.
+#[cfg(target_os = "android")]
+fn jni_error(env: &mut jni::JNIEnv, what: &str, e: jni::errors::Error) -> ClientError {
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_describe();
+        let _ = env.exception_clear();
+    }
+    ClientError::Android(format!("{what}: {e}"))
+}
+
+#[cfg(target_os = "android")]
+impl AndroidMulticastLock {
+    /// Creates the Java `MulticastLock`, pins it with a global reference, then acquires it.
+    /// All local references die with the frame. The global reference is created before
+    /// `acquire()` so a failure to create it cannot leave the Java lock held without a handle.
+    fn create_and_acquire(env: &mut jni::JNIEnv) -> ClientResult<jni::objects::GlobalRef> {
+        let ctx = ndk_context::android_context();
+        let activity = unsafe { jni::objects::JObject::from_raw(ctx.context().cast()) };
+
+        env.with_local_frame(LOCAL_FRAME_CAPACITY, |env| -> ClientResult<_> {
+            // WifiManager wifi = (WifiManager) activity.getSystemService("wifi");
+            let service_name = env
+                .new_string("wifi")
+                .map_err(|e| jni_error(env, "JNI new_string failed", e))?;
+            let wifi = env
+                .call_method(
+                    &activity,
+                    "getSystemService",
+                    "(Ljava/lang/String;)Ljava/lang/Object;",
+                    &[(&service_name).into()],
+                )
+                .map_err(|e| jni_error(env, "getSystemService failed", e))?
+                .l()
+                .map_err(|e| jni_error(env, "Invalid WifiManager object", e))?;
+
+            if wifi.is_null() {
+                return Err(ClientError::Android("WifiManager service is null".into()));
+            }
+
+            // WifiManager.MulticastLock lock = wifi.createMulticastLock(TAG);
+            let tag = env
+                .new_string(MULTICAST_LOCK_TAG)
+                .map_err(|e| jni_error(env, "JNI new_string tag failed", e))?;
+            let lock = env
+                .call_method(
+                    &wifi,
+                    "createMulticastLock",
+                    "(Ljava/lang/String;)Landroid/net/wifi/WifiManager$MulticastLock;",
+                    &[(&tag).into()],
+                )
+                .map_err(|e| jni_error(env, "createMulticastLock failed", e))?
+                .l()
+                .map_err(|e| jni_error(env, "MulticastLock conversion failed", e))?;
+
+            if lock.is_null() {
+                return Err(ClientError::Android(
+                    "createMulticastLock returned null".into(),
+                ));
+            }
+
+            // Pin first, acquire second.
+            let global = env
+                .new_global_ref(&lock)
+                .map_err(|e| jni_error(env, "MulticastLock global ref failed", e))?;
+
+            // lock.acquire();  (requires android.permission.CHANGE_WIFI_MULTICAST_STATE)
+            env.call_method(&lock, "acquire", "()V", &[])
+                .map_err(|e| jni_error(env, "MulticastLock.acquire failed", e))?;
+            Ok(global)
+        })
+    }
+}
+
 #[cfg(target_os = "android")]
 impl MulticastLock for AndroidMulticastLock {
     fn acquire(&mut self) -> ClientResult<()> {
@@ -47,55 +128,14 @@ impl MulticastLock for AndroidMulticastLock {
             .attach_current_thread()
             .map_err(|e| ClientError::Android(format!("Failed to attach JNI thread: {e}")))?;
 
-        let activity = unsafe { jni::objects::JObject::from_raw(ctx.context().cast()) };
-
-        // WifiManager wifi = (WifiManager) activity.getSystemService("wifi");
-        let service_name = env
-            .new_string("wifi")
-            .map_err(|e| ClientError::Android(format!("JNI new_string failed: {e}")))?;
-        let wifi = env
-            .call_method(
-                &activity,
-                "getSystemService",
-                "(Ljava/lang/String;)Ljava/lang/Object;",
-                &[(&service_name).into()],
-            )
-            .map_err(|e| ClientError::Android(format!("getSystemService failed: {e}")))?
-            .l()
-            .map_err(|e| ClientError::Android(format!("Invalid WifiManager object: {e}")))?;
-
-        if wifi.is_null() {
-            return Err(ClientError::Android("WifiManager service is null".into()));
-        }
-
-        // WifiManager.MulticastLock lock = wifi.createMulticastLock(TAG);
-        let tag = env
-            .new_string(MULTICAST_LOCK_TAG)
-            .map_err(|e| ClientError::Android(format!("JNI new_string tag failed: {e}")))?;
-        let lock = env
-            .call_method(
-                &wifi,
-                "createMulticastLock",
-                "(Ljava/lang/String;)Landroid/net/wifi/WifiManager$MulticastLock;",
-                &[(&tag).into()],
-            )
-            .map_err(|e| ClientError::Android(format!("createMulticastLock failed: {e}")))?
-            .l()
-            .map_err(|e| ClientError::Android(format!("MulticastLock conversion failed: {e}")))?;
-
-        // lock.acquire();  (requires android.permission.CHANGE_WIFI_MULTICAST_STATE)
-        env.call_method(&lock, "acquire", "()V", &[])
-            .map_err(|e| ClientError::Android(format!("MulticastLock.acquire failed: {e}")))?;
-
-        let global = env
-            .new_global_ref(&lock)
-            .map_err(|e| ClientError::Android(format!("MulticastLock global ref failed: {e}")))?;
-        self.lock = Some(global);
+        self.lock = Some(Self::create_and_acquire(&mut env)?);
         Ok(())
     }
 
     fn release(&mut self) -> ClientResult<()> {
-        let Some(lock) = self.lock.take() else {
+        // Keep the stored reference until the Java release succeeds, so a failed call can be
+        // retried (by the next scan or by drop) instead of leaking a held lock.
+        let Some(lock) = self.lock.as_ref() else {
             return Ok(());
         };
 
@@ -107,8 +147,12 @@ impl MulticastLock for AndroidMulticastLock {
             .map_err(|e| ClientError::Android(format!("Failed to attach JNI thread: {e}")))?;
 
         // lock.release();
-        env.call_method(lock.as_obj(), "release", "()V", &[])
-            .map_err(|e| ClientError::Android(format!("MulticastLock.release failed: {e}")))?;
+        env.with_local_frame(LOCAL_FRAME_CAPACITY, |env| -> ClientResult<()> {
+            env.call_method(lock.as_obj(), "release", "()V", &[])
+                .map_err(|e| jni_error(env, "MulticastLock.release failed", e))?;
+            Ok(())
+        })?;
+        self.lock = None;
         Ok(())
     }
 

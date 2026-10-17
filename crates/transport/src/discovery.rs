@@ -9,8 +9,8 @@
 //! | instance name  | DNS-SD    | `living-room` |
 //! | control port   | SRV port  | `48444`       |
 //! | `proto`        | TXT       | `1`           |
-//! | `video`        | TXT       | `48445`, omitted when the host has no video listener |
-//! | `input`        | TXT       | `48446`       |
+//! | `video`        | TXT       | `48445` (example), omitted when the host has no video listener |
+//! | `input`        | TXT       | `48442`       |
 //! | `codecs`       | TXT       | `av1,hevc`    |
 //!
 //! The client browses for the same type, merges what it sees into a [`HostDirectory`] and
@@ -191,11 +191,49 @@ impl DiscoveredHost {
         self.video_port != VIDEO_PORT_UNAVAILABLE
     }
 
-    /// Address to open the control connection to: the first resolved address and the control port.
+    /// Resolved addresses, best first, for choosing which one to connect to.
+    ///
+    /// A multi-homed host (Docker, VPN, virtual bridges) resolves to several addresses, and the
+    /// sorted order alone can put `172.17.0.1` ahead of the LAN address. Ranking:
+    /// private LAN ranges (`192.168/16`, `10/8`, `172.16/12` except the Docker bridge
+    /// `172.17/16`), then other routable IPv4, then IPv6 (global or unique-local), then the
+    /// Docker bridge, then link-local and loopback. Order within a rank is preserved.
+    pub fn ordered_addresses(&self) -> Vec<IpAddr> {
+        let mut ordered = self.addresses.clone();
+        ordered.sort_by_key(|ip| address_rank(*ip));
+        ordered
+    }
+
+    /// Address to open the control connection to: the best-ranked resolved address (see
+    /// [`ordered_addresses`](Self::ordered_addresses)) and the control port.
     pub fn control_addr(&self) -> Option<SocketAddr> {
-        self.addresses
+        self.ordered_addresses()
             .first()
             .map(|ip| SocketAddr::new(*ip, self.control_port))
+    }
+}
+
+fn address_rank(ip: IpAddr) -> u8 {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => {
+            let [a, b, _, _] = v4.octets();
+            if v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() {
+                4
+            } else if a == 172 && b == 17 {
+                3
+            } else if v4.is_private() {
+                0
+            } else {
+                1
+            }
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                4
+            } else {
+                2
+            }
+        }
     }
 }
 
@@ -1140,6 +1178,52 @@ mod tests {
             1
         );
         assert!(directory.get("den", Instant::now()).is_some());
+    }
+
+    fn host_with(addresses: &[IpAddr]) -> DiscoveredHost {
+        DiscoveredHost::from_parts(
+            "h",
+            addresses.iter().copied(),
+            48444,
+            &advertisement().txt_properties(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn lan_address_beats_docker_bridge() {
+        // 172.17.0.1 sorts before 192.168.1.10, so the plain BTreeSet order would pick docker.
+        let docker = IpAddr::from([172, 17, 0, 1]);
+        let lan = IpAddr::from([192, 168, 1, 10]);
+        let host = host_with(&[docker, lan]);
+        assert_eq!(host.addresses[0], docker);
+        assert_eq!(host.ordered_addresses(), vec![lan, docker]);
+        assert_eq!(host.control_addr(), Some(SocketAddr::new(lan, 48444)));
+    }
+
+    #[test]
+    fn docker_bridge_is_used_when_it_is_the_only_candidate() {
+        let docker = IpAddr::from([172, 17, 0, 1]);
+        assert_eq!(
+            host_with(&[docker]).control_addr(),
+            Some(SocketAddr::new(docker, 48444))
+        );
+    }
+
+    #[test]
+    fn private_ranges_rank_above_others() {
+        let ten = IpAddr::from([10, 0, 0, 5]);
+        let corp = IpAddr::from([172, 20, 1, 1]);
+        let public = IpAddr::from([8, 8, 8, 8]);
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        let link_local = IpAddr::from([169, 254, 1, 1]);
+        let docker = IpAddr::from([172, 17, 0, 1]);
+        let host = host_with(&[link_local, v6, public, docker, corp, ten]);
+        // 10.0.0.5 < 172.20.1.1 numerically, so the stable sort keeps ten first.
+        assert_eq!(
+            host.ordered_addresses(),
+            vec![ten, corp, public, v6, docker, link_local]
+        );
     }
 
     #[test]

@@ -63,12 +63,22 @@ pub struct ClientConfig {
     /// Remote host address.
     ///
     /// - `AdbReverseTcp`: the local end of the ADB reverse tunnel, `127.0.0.1:42069` by default.
-    /// - `Udp`: the host's address on the LAN. Its IP is the only source video datagrams are
-    ///   accepted from. An unspecified IP (`0.0.0.0`) means no source filter.
+    /// - `Udp`: the host's address on the LAN. Its IP (plus `extra_host_ips`) is the only
+    ///   source video datagrams are accepted from. An unspecified IP (`0.0.0.0`) means no
+    ///   source filter.
     ///
-    /// Discovery (`discovery::apply_selection`) sets this to a found host's control address
-    /// (port `48444`).
+    /// **The default is `127.0.0.1`, so in `Udp` mode a client that has not been pointed at a
+    /// host drops every LAN video datagram** (the client logs a warning at startup). Set it by
+    /// discovery (`discovery::apply_selection`, which uses the host's control address, port
+    /// `48444`), by manual entry, or set `0.0.0.0` to disable the filter.
     pub host_addr: SocketAddr,
+
+    /// Further IPs of the same host that UDP video may arrive from. A multi-homed host can send
+    /// from a different interface than the one `host_addr` names, so
+    /// `discovery::apply_selection` stores the host's other discovered addresses here. Empty
+    /// unless set by discovery.
+    #[serde(default)]
+    pub extra_host_ips: Vec<IpAddr>,
 
     /// Transport mode (UDP or ADB Reverse TCP).
     pub transport_mode: TransportMode,
@@ -126,6 +136,7 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             host_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), ADB_REVERSE_PORT),
+            extra_host_ips: Vec::new(),
             transport_mode: TransportMode::AdbReverseTcp,
             codec: ClientVideoCodec::Av1,
             display_mode: DisplayMode::CurvedCylinder,

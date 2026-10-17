@@ -11,23 +11,80 @@ use std::net::{IpAddr, SocketAddr};
 use crate::config::{ClientConfig, TransportMode};
 use crate::runtime::QuestClientRuntime;
 
-/// Source IP that UDP video datagrams must come from, or `None` to accept any source.
+/// Source IPs that UDP video datagrams must come from, or `None` to accept any source.
 ///
 /// Only the UDP transport filters, and only by IP: the host sends from an ephemeral port, so
 /// its port is not known. The ADB/USB path connects to `host_addr` and never filters.
 /// An unspecified IP (`0.0.0.0`) in `host_addr` means "unset", so no filter is applied.
-pub fn udp_source_filter(config: &ClientConfig) -> Option<IpAddr> {
+/// The list is `host_addr` plus `extra_host_ips`, all in canonical form (IPv4-mapped IPv6 is
+/// folded to IPv4).
+pub fn udp_source_filter(config: &ClientConfig) -> Option<Vec<IpAddr>> {
     match config.transport_mode {
         TransportMode::Udp if !config.host_addr.ip().is_unspecified() => {
-            Some(config.host_addr.ip())
+            let mut ips = vec![config.host_addr.ip().to_canonical()];
+            for ip in &config.extra_host_ips {
+                let ip = ip.to_canonical();
+                if !ips.contains(&ip) {
+                    ips.push(ip);
+                }
+            }
+            Some(ips)
         }
         _ => None,
     }
 }
 
-/// Whether a datagram from `source` may be passed to the packet parser.
-pub fn accept_udp_source(filter: Option<IpAddr>, source: SocketAddr) -> bool {
-    filter.is_none_or(|ip| source.ip() == ip)
+/// Whether a datagram from `source` may be passed to the packet parser. Addresses are compared
+/// in canonical form, so a dual-stack socket's `::ffff:192.168.1.20` matches `192.168.1.20`.
+pub fn accept_udp_source(filter: Option<&[IpAddr]>, source: SocketAddr) -> bool {
+    filter.is_none_or(|ips| {
+        let source = source.ip().to_canonical();
+        ips.iter().any(|ip| ip.to_canonical() == source)
+    })
+}
+
+/// A warning to log at startup when the configuration will silently drop all LAN video, or
+/// `None`. Applies to `Udp` mode with a loopback `host_addr` (the default). An unspecified
+/// address means no filter and is fine.
+pub fn udp_config_warning(config: &ClientConfig) -> Option<String> {
+    (config.transport_mode == TransportMode::Udp && config.host_addr.ip().is_loopback()).then(
+        || {
+            format!(
+                "UDP mode with loopback host_addr {}: every LAN video datagram will be dropped \
+             until discovery or manual entry sets the host address (or set 0.0.0.0 to disable \
+             the source filter)",
+                config.host_addr
+            )
+        },
+    )
+}
+
+/// Longest gap between repeated drop warnings for one source.
+const DROP_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Most sources tracked at once, so spoofed sources cannot grow the table without bound.
+const DROP_WARN_MAX_SOURCES: usize = 64;
+
+/// Rate limiter for "dropped datagram from unexpected source" warnings: one warning the first
+/// time a source is seen, and at most one more per [`DROP_WARN_INTERVAL`] after that.
+#[derive(Debug, Default)]
+pub struct DropWarnLimiter {
+    last_warned: std::collections::HashMap<IpAddr, std::time::Instant>,
+}
+
+impl DropWarnLimiter {
+    /// `true` when a drop from `source` should be logged at warn now.
+    pub fn should_warn(&mut self, source: IpAddr, now: std::time::Instant) -> bool {
+        let source = source.to_canonical();
+        if let Some(last) = self.last_warned.get(&source) {
+            if now.saturating_duration_since(*last) < DROP_WARN_INTERVAL {
+                return false;
+            }
+        } else if self.last_warned.len() >= DROP_WARN_MAX_SOURCES {
+            self.last_warned.clear();
+        }
+        self.last_warned.insert(source, now);
+        true
+    }
 }
 
 /// Native entry point for Android NativeActivity on Meta Quest.
@@ -66,6 +123,9 @@ pub fn android_main(app: AndroidApp) {
     let host_addr = config.host_addr;
     let transport_mode = config.transport_mode;
     let udp_filter = udp_source_filter(&config);
+    if let Some(message) = udp_config_warning(&config) {
+        tracing::warn!("{message}");
+    }
 
     let receiver_handle = std::thread::spawn(move || {
         match transport_mode {
@@ -160,12 +220,20 @@ pub fn android_main(app: AndroidApp) {
                 };
                 let _ = socket.set_read_timeout(Some(Duration::from_millis(100)));
                 let mut buf = [0u8; 65536];
+                let mut drop_warn = DropWarnLimiter::default();
 
                 while bg_running.load(std::sync::atomic::Ordering::Relaxed) {
                     match socket.recv_from(&mut buf) {
                         Ok((len, source)) => {
-                            if !accept_udp_source(udp_filter, source) {
-                                tracing::trace!(%source, "Dropping UDP datagram from unexpected source");
+                            if !accept_udp_source(udp_filter.as_deref(), source) {
+                                if drop_warn.should_warn(source.ip(), std::time::Instant::now()) {
+                                    tracing::warn!(
+                                        %source,
+                                        allowed = ?udp_filter,
+                                        "Dropping UDP datagram from a source that is not the host \
+                                         (further drops from this source are not logged for 60s)"
+                                    );
+                                }
                                 continue;
                             }
                             match linux_quest_protocol::packet::Packet::from_bytes(&buf[..len]) {
@@ -269,7 +337,7 @@ mod tests {
         };
         assert_eq!(
             udp_source_filter(&udp),
-            Some(IpAddr::from([192, 168, 1, 20]))
+            Some(vec![IpAddr::from([192, 168, 1, 20])])
         );
 
         let adb = ClientConfig {
@@ -291,6 +359,78 @@ mod tests {
     }
 
     #[test]
+    fn udp_filter_accepts_any_extra_host_address() {
+        let config = ClientConfig {
+            transport_mode: TransportMode::Udp,
+            host_addr: SocketAddr::from(([192, 168, 1, 20], 48444)),
+            extra_host_ips: vec![IpAddr::from([10, 0, 0, 7]), IpAddr::from([192, 168, 1, 20])],
+            ..Default::default()
+        };
+        let filter = udp_source_filter(&config).unwrap();
+        assert_eq!(filter.len(), 2, "duplicates are folded");
+        let from = |ip: [u8; 4]| SocketAddr::from((ip, 40000));
+        assert!(accept_udp_source(Some(&filter), from([192, 168, 1, 20])));
+        assert!(accept_udp_source(Some(&filter), from([10, 0, 0, 7])));
+        assert!(!accept_udp_source(Some(&filter), from([172, 17, 0, 1])));
+    }
+
+    #[test]
+    fn udp_filter_compares_canonical_addresses() {
+        let v4 = IpAddr::from([192, 168, 1, 20]);
+        let mapped: IpAddr = "::ffff:192.168.1.20".parse().unwrap();
+        assert!(accept_udp_source(
+            Some(&[v4]),
+            SocketAddr::new(mapped, 40000)
+        ));
+        assert!(accept_udp_source(
+            Some(&[mapped]),
+            SocketAddr::new(v4, 40000)
+        ));
+
+        let config = ClientConfig {
+            transport_mode: TransportMode::Udp,
+            host_addr: SocketAddr::new(mapped, 48444),
+            ..Default::default()
+        };
+        assert_eq!(udp_source_filter(&config), Some(vec![v4]));
+    }
+
+    #[test]
+    fn warns_only_for_udp_with_loopback_host() {
+        let udp_default = ClientConfig {
+            transport_mode: TransportMode::Udp,
+            ..Default::default()
+        };
+        assert!(udp_config_warning(&udp_default).is_some());
+
+        let unspecified = ClientConfig {
+            host_addr: SocketAddr::from(([0, 0, 0, 0], 48444)),
+            ..udp_default.clone()
+        };
+        assert!(udp_config_warning(&unspecified).is_none());
+
+        let lan = ClientConfig {
+            host_addr: SocketAddr::from(([192, 168, 1, 20], 48444)),
+            ..udp_default
+        };
+        assert!(udp_config_warning(&lan).is_none());
+        assert!(udp_config_warning(&ClientConfig::default()).is_none());
+    }
+
+    #[test]
+    fn drop_warnings_are_rate_limited_per_source() {
+        let mut limiter = DropWarnLimiter::default();
+        let t0 = std::time::Instant::now();
+        let a = IpAddr::from([172, 17, 0, 1]);
+        let b = IpAddr::from([10, 1, 1, 1]);
+        assert!(limiter.should_warn(a, t0));
+        assert!(!limiter.should_warn(a, t0 + std::time::Duration::from_secs(1)));
+        assert!(limiter.should_warn(b, t0 + std::time::Duration::from_secs(1)));
+        assert!(!limiter.should_warn(a, t0 + std::time::Duration::from_secs(59)));
+        assert!(limiter.should_warn(a, t0 + std::time::Duration::from_secs(61)));
+    }
+
+    #[test]
     fn udp_loopback_datagrams_are_filtered_by_source() {
         let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         receiver
@@ -305,9 +445,9 @@ mod tests {
         let (_, source) = receiver.recv_from(&mut buf).unwrap();
         let loopback = IpAddr::from([127, 0, 0, 1]);
         assert!(accept_udp_source(None, source));
-        assert!(accept_udp_source(Some(loopback), source));
+        assert!(accept_udp_source(Some(&[loopback]), source));
         assert!(!accept_udp_source(
-            Some(IpAddr::from([10, 9, 9, 9])),
+            Some(&[IpAddr::from([10, 9, 9, 9])]),
             source
         ));
     }

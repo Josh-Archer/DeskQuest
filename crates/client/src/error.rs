@@ -86,3 +86,10 @@ impl From<linux_quest_protocol::error::ProtocolError> for ClientError {
         ClientError::Protocol(err.to_string())
     }
 }
+
+#[cfg(target_os = "android")]
+impl From<jni::errors::Error> for ClientError {
+    fn from(e: jni::errors::Error) -> Self {
+        ClientError::Android(format!("JNI error: {e}"))
+    }
+}

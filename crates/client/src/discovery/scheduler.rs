@@ -15,8 +15,11 @@ use linux_quest_transport::DiscoveryBackend;
 
 use super::{ClientDiscovery, MulticastLock};
 
-/// How often to re-scan while disconnected.
-pub const DEFAULT_RESCAN_PERIOD: Duration = Duration::from_secs(5);
+/// How often to re-scan while disconnected. Each scan holds the multicast lock for
+/// [`DEFAULT_BROWSE_WINDOW`](super::DEFAULT_BROWSE_WINDOW), so 2 s every 15 s is a duty cycle of
+/// about 13%, which matters for headset battery. Callers can pass a shorter period to
+/// [`DiscoveryScheduler::new`], for example while a host list is on screen.
+pub const DEFAULT_RESCAN_PERIOD: Duration = Duration::from_secs(15);
 
 /// Shortest period accepted. A zero period would make the tick interval panic, and very short
 /// periods would hold the multicast lock almost continuously.
@@ -53,8 +56,9 @@ impl<B: DiscoveryBackend, L: MulticastLock> DiscoveryScheduler<B, L> {
     ///
     /// A tick that arrives while connected does nothing. A scan that fails (for example, the
     /// backend lost multicast) is logged at debug level and the next tick tries again. A
-    /// browse that is running when `stop` completes is cancelled. Returns how many scans were
-    /// attempted.
+    /// browse that is running when `stop` completes is cancelled. The multicast lock is released
+    /// before this returns on every path, including a stop that cancels a scan mid-browse.
+    /// Returns how many scans were attempted.
     pub async fn run(
         &mut self,
         connected: &watch::Receiver<bool>,
@@ -64,11 +68,23 @@ impl<B: DiscoveryBackend, L: MulticastLock> DiscoveryScheduler<B, L> {
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         tokio::pin!(stop);
 
+        let attempts = self.run_loop(connected, &mut stop, &mut ticker).await;
+        // A scan cancelled by `stop` never reaches its own lock release.
+        self.discovery.release_lock();
+        attempts
+    }
+
+    async fn run_loop(
+        &mut self,
+        connected: &watch::Receiver<bool>,
+        stop: &mut std::pin::Pin<&mut impl Future<Output = ()>>,
+        ticker: &mut tokio::time::Interval,
+    ) -> usize {
         let mut attempts = 0;
         loop {
             tokio::select! {
                 biased;
-                _ = &mut stop => break,
+                _ = &mut *stop => break,
                 _ = ticker.tick() => {}
             }
             if *connected.borrow() {
@@ -77,7 +93,7 @@ impl<B: DiscoveryBackend, L: MulticastLock> DiscoveryScheduler<B, L> {
             attempts += 1;
             tokio::select! {
                 biased;
-                _ = &mut stop => break,
+                _ = &mut *stop => break,
                 result = self.discovery.scan() => {
                     if let Err(e) = result {
                         debug!(error = %e, "LAN discovery scan failed; retrying on next tick");
@@ -202,6 +218,65 @@ mod tests {
         sched.run(&rx, sleep(Duration::from_secs(7))).await;
 
         assert!(!lock.is_held());
+    }
+
+    /// Backend whose browse takes `delay`, so a stop can land while a scan is in flight.
+    struct SlowBackend {
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl DiscoveryBackend for SlowBackend {
+        fn name(&self) -> &'static str {
+            "slow"
+        }
+
+        async fn advertise(
+            &mut self,
+            _: &linux_quest_transport::HostAdvertisement,
+        ) -> Result<(), linux_quest_transport::DiscoveryError> {
+            Ok(())
+        }
+
+        async fn withdraw(&mut self) -> Result<(), linux_quest_transport::DiscoveryError> {
+            Ok(())
+        }
+
+        async fn browse(
+            &mut self,
+            _: Duration,
+        ) -> Result<Vec<DiscoveredHost>, linux_quest_transport::DiscoveryError> {
+            sleep(self.delay).await;
+            Ok(vec![host("den")])
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_during_in_flight_scan_releases_the_lock() {
+        let lock = MockMulticastLock::new();
+        let mut sched = DiscoveryScheduler::new(
+            ClientDiscovery::new(
+                SlowBackend {
+                    delay: Duration::from_secs(30),
+                },
+                lock.clone(),
+            ),
+            Duration::from_secs(5),
+        );
+        let (_tx, rx) = watch::channel(false);
+
+        // The scan starts at 0s and would finish at 30s. Stop fires at 2s, mid-browse.
+        let attempts = sched.run(&rx, sleep(Duration::from_secs(2))).await;
+
+        assert_eq!(attempts, 1);
+        assert_eq!(lock.acquire_count(), 1, "the scan did take the lock");
+        assert!(
+            !lock.is_held(),
+            "run() must release the lock before returning"
+        );
+        assert!(!sched.discovery().is_lock_held());
+        assert_eq!(lock.release_count(), 1);
+        assert!(sched.discovery().hosts().is_empty());
     }
 
     #[test]
