@@ -8,7 +8,10 @@ use linux_quest_protocol::{
 
 use std::sync::Arc;
 
-use crate::ipc::{build_dashboard_snapshot, send_daemon_request, DaemonRequest, DaemonResponse};
+use crate::ipc::{
+    build_dashboard_snapshot, daemon_uptime_secs, mark_daemon_start, send_daemon_request,
+    DaemonRequest, DaemonResponse,
+};
 use crate::link_status::SharedLinkTracker;
 use crate::tui::model::{DashboardSnapshot, DisplaySnapshot};
 use crate::{HostError, MultiDisplayHost};
@@ -186,6 +189,7 @@ pub struct LiveDaemonTelemetrySource {
 
 impl LiveDaemonTelemetrySource {
     pub fn new(host: Arc<MultiDisplayHost>, link: SharedLinkTracker) -> Self {
+        mark_daemon_start();
         Self { host, link }
     }
 }
@@ -195,7 +199,11 @@ impl TelemetrySource for LiveDaemonTelemetrySource {
     async fn fetch_snapshot(&mut self) -> Result<DashboardSnapshot, HostError> {
         let monitors = self.host.list_monitors().await;
         let status = self.link.lock().status(Instant::now());
-        Ok(build_dashboard_snapshot(monitors, status, 0))
+        Ok(build_dashboard_snapshot(
+            monitors,
+            status,
+            daemon_uptime_secs(),
+        ))
     }
 }
 

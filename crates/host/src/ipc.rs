@@ -69,6 +69,7 @@ pub async fn run_ipc_server(
     link: SharedLinkTracker,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    mark_daemon_start();
     let runtime_dir = daemon_runtime_dir();
     let socket_path = daemon_socket_path();
     let pid_path = daemon_pid_path();
@@ -157,10 +158,28 @@ pub async fn run_ipc_server(
     Ok(())
 }
 
+static DAEMON_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Records the daemon start time (first call wins). Called when the IPC server or the live
+/// telemetry source is created, so uptime counts from daemon startup.
+pub fn mark_daemon_start() {
+    DAEMON_START.get_or_init(std::time::Instant::now);
+}
+
+/// Seconds since [`mark_daemon_start`] was first called (0 if it never was).
+pub fn daemon_uptime_secs() -> u64 {
+    DAEMON_START.get().map_or(0, |t| t.elapsed().as_secs())
+}
+
 /// Builds the dashboard snapshot from the live virtual monitors and the derived link state.
 ///
-/// `streaming` and `client.mode` come only from `link`. Monitors existing does not mean a
-/// client is attached, so with no live peer the snapshot reports disconnected.
+/// `client.mode` comes only from `link`. `streaming` is true only when a client is connected
+/// AND at least one virtual display exists. The host has no video endpoint yet, so this means
+/// "link up with something to stream", not that frames are flowing.
+///
+/// The wire layout of [`DashboardSnapshot`] is fixed (tray and TUI depend on it). Metrics the
+/// host does not measure yet (bitrate, fps, latency breakdowns, RTT, packet counters, audio
+/// stats) are reported as zero / empty instead of made-up numbers.
 pub fn build_dashboard_snapshot(
     monitors: Vec<VirtualMonitor>,
     link: LinkStatus,
@@ -174,41 +193,19 @@ pub fn build_dashboard_snapshot(
             width: m.width,
             height: m.height,
             refresh_rate: m.refresh_rate,
-            fps: m.refresh_rate as f32,
-            bitrate_mbps: 75.0,
-            codec: "AV1".into(),
+            fps: 0.0,
+            bitrate_mbps: 0.0,
+            codec: String::new(),
             is_virtual: m.is_virtual,
         })
         .collect();
 
-    let streaming = link.connected;
+    let streaming = link.connected && displays.iter().any(|d| d.is_virtual);
     let conn_mode = link.connection_mode();
 
-    let mut video_latency = linux_quest_protocol::FrameLatencyBreakdown {
-        frame_id: 1,
-        capture_start_us: 1000,
-        capture_duration_us: 1150,
-        encode_duration_us: 2850,
-        host_queue_duration_us: 300,
-        transport_duration_us: 800,
-        client_decode_duration_us: 3100,
-        client_render_duration_us: 600,
-        total_motion_to_photon_us: 0,
-    };
-    video_latency.compute_total();
-
-    let mut audio_latency = linux_quest_protocol::AudioLatencyBreakdown {
-        frame_id: 1,
-        capture_start_us: 1000,
-        capture_duration_us: 300,
-        encode_duration_us: 400,
-        transport_duration_us: 800,
-        jitter_buffer_delay_us: 2500,
-        decode_duration_us: 200,
-        playout_buffer_duration_us: 500,
-        total_latency_us: 0,
-    };
-    audio_latency.compute_total();
+    // Not measured yet: all-zero breakdowns (totals stay zero).
+    let video_latency = linux_quest_protocol::FrameLatencyBreakdown::default();
+    let audio_latency = linux_quest_protocol::AudioLatencyBreakdown::default();
 
     DashboardSnapshot {
         uptime_secs,
@@ -218,25 +215,25 @@ pub fn build_dashboard_snapshot(
         audio_latency,
         client: linux_quest_protocol::ClientTransportTelemetry {
             mode: conn_mode,
-            rtt_us: 1100,
-            smoothed_rtt_us: 1050,
-            packet_loss_rate: 0.0001,
-            packets_sent: 1000,
-            packets_recv: 999,
-            packets_lost: 1,
-            fec_recoveries: 1,
-            bitrate_mbps: 85.0,
+            rtt_us: 0,
+            smoothed_rtt_us: 0,
+            packet_loss_rate: 0.0,
+            packets_sent: 0,
+            packets_recv: 0,
+            packets_lost: 0,
+            fec_recoveries: 0,
+            bitrate_mbps: 0.0,
         },
         audio: linux_quest_protocol::AudioStreamTelemetry {
-            active: streaming,
-            codec: "Opus".into(),
-            sample_rate: 48000,
-            channels: 2,
-            frame_size_ms: 2.5,
-            bitrate_kbps: 128,
-            jitter_us: 350,
-            buffer_delay_us: 2500,
-            buffer_health_pct: 100.0,
+            active: false,
+            codec: String::new(),
+            sample_rate: 0,
+            channels: 0,
+            frame_size_ms: 0.0,
+            bitrate_kbps: 0,
+            jitter_us: 0,
+            buffer_delay_us: 0,
+            buffer_health_pct: 0.0,
             plc_count: 0,
         },
     }
@@ -290,7 +287,9 @@ async fn handle_ipc_client(
             let monitors = host.list_monitors().await;
             let status = link.lock().status(std::time::Instant::now());
             DaemonResponse::DashboardSnapshot(Box::new(build_dashboard_snapshot(
-                monitors, status, 0,
+                monitors,
+                status,
+                daemon_uptime_secs(),
             )))
         }
     };
@@ -391,7 +390,33 @@ mod tests {
         tracker.control_accepted("192.168.1.20:50000".parse().unwrap(), now);
 
         let snap = build_dashboard_snapshot(vec![], tracker.status(now), 0);
-        assert!(snap.streaming);
+        // Connected, but no virtual display: nothing to stream.
+        assert!(!snap.streaming);
         assert_eq!(snap.client.mode, ClientConnectionMode::Wifi);
+
+        let snap = build_dashboard_snapshot(vec![virtual_monitor(1)], tracker.status(now), 0);
+        assert!(snap.streaming);
+    }
+
+    #[test]
+    fn snapshot_has_no_fabricated_metrics() {
+        let now = Instant::now();
+        let mut tracker = LinkTracker::new(DEFAULT_INPUT_LIVENESS);
+        tracker.control_accepted("192.168.1.20:50000".parse().unwrap(), now);
+
+        let snap = build_dashboard_snapshot(vec![virtual_monitor(1)], tracker.status(now), 7);
+        assert_eq!(snap.uptime_secs, 7);
+        assert_eq!(snap.client.rtt_us, 0);
+        assert_eq!(snap.client.bitrate_mbps, 0.0);
+        assert_eq!(snap.client.packets_sent, 0);
+        assert_eq!(snap.video_latency.total_motion_to_photon_us, 0);
+        assert_eq!(snap.displays[0].bitrate_mbps, 0.0);
+        assert!(!snap.audio.active);
+    }
+
+    #[test]
+    fn daemon_uptime_counts_from_mark() {
+        mark_daemon_start();
+        assert!(daemon_uptime_secs() < 5);
     }
 }

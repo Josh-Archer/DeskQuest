@@ -8,6 +8,15 @@
 //! [`LinkTracker`] records those events. [`LinkStatus`] is the derived view for one
 //! instant. Every time-dependent method takes `now` explicitly so the model is pure
 //! and liveness can be tested without sleeping.
+//!
+//! # Caveats
+//!
+//! - With several clients connected, only the newest open control connection is reported as the
+//!   peer (the link is single-client). Older connections stay tracked so that closing the newest
+//!   one falls back to the previous one.
+//! - Loopback means USB only by convention: the ADB reverse tunnel makes the headset appear as a
+//!   local peer. Any local process can also connect from loopback, so the transport label is
+//!   informational and must NOT be used as an authentication or authorization signal.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -86,6 +95,11 @@ impl LinkTracker {
     /// The control TCP listener accepted a connection from `peer`.
     pub fn control_accepted(&mut self, peer: SocketAddr, now: Instant) {
         self.control_peers.push(peer);
+        self.last_activity = Some(now);
+    }
+
+    /// Some connected client sent a control message (liveness refresh).
+    pub fn control_activity(&mut self, now: Instant) {
         self.last_activity = Some(now);
     }
 
@@ -210,6 +224,29 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_loopback_peer_is_usb_adb_only_with_reverse_tunnel() {
+        let now = Instant::now();
+        let mut t = LinkTracker::new(LIVENESS);
+        t.control_accepted(addr("[::1]:50000"), now);
+        assert!(!t.status(now).connected);
+
+        t.adb_event(&AdbBridgeEvent::ReversePortEstablished {
+            serial: "QUEST".into(),
+            port: 48444,
+        });
+        assert_eq!(t.status(now).transport, Some(LinkTransport::UsbAdb));
+    }
+
+    #[test]
+    fn newest_control_connection_wins() {
+        let now = Instant::now();
+        let mut t = LinkTracker::new(LIVENESS);
+        t.control_accepted(addr("192.168.1.20:50000"), now);
+        t.control_accepted(addr("192.168.1.21:50001"), now);
+        assert_eq!(t.status(now).peer, Some(addr("192.168.1.21:50001")));
+    }
+
+    #[test]
     fn loopback_peer_without_reverse_tunnel_is_not_connected() {
         let now = Instant::now();
         let mut t = LinkTracker::new(LIVENESS);
@@ -321,6 +358,17 @@ mod tests {
         t.control_accepted(addr("127.0.0.1:50000"), now);
 
         assert!(!t.status(now).connected);
+    }
+
+    #[test]
+    fn control_activity_refreshes_last_seen() {
+        let t0 = Instant::now();
+        let mut t = LinkTracker::new(LIVENESS);
+        t.control_accepted(addr("192.168.1.20:50000"), t0);
+        let later = t0 + Duration::from_secs(30);
+        t.control_activity(later);
+        assert_eq!(t.status(later).last_seen, Some(later));
+        assert!(t.status(later).connected);
     }
 
     #[test]

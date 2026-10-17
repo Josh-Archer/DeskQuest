@@ -6,7 +6,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::net::{TcpListener, TcpStream};
@@ -21,6 +21,24 @@ use linux_quest_transport::{ControlChannel, ControlMessage, TransportError};
 
 use crate::link_status::SharedLinkTracker;
 use crate::HostError;
+
+/// Idle time before the first TCP keepalive probe on an accepted control socket.
+pub const CONTROL_KEEPALIVE_IDLE: Duration = Duration::from_secs(5);
+/// Interval between TCP keepalive probes.
+pub const CONTROL_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
+/// Unanswered probes before the kernel resets the connection (about 9s of silence in total).
+pub const CONTROL_KEEPALIVE_RETRIES: u32 = 2;
+
+/// Enables short-interval TCP keepalive so a headset that vanishes without a FIN
+/// (Wi-Fi drop, power off) is detected within seconds instead of the kernel default of hours.
+pub fn enable_control_keepalive(stream: &TcpStream) -> std::io::Result<()> {
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(CONTROL_KEEPALIVE_IDLE)
+        .with_interval(CONTROL_KEEPALIVE_INTERVAL);
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    let ka = ka.with_retries(CONTROL_KEEPALIVE_RETRIES);
+    socket2::SockRef::from(stream).set_tcp_keepalive(&ka)
+}
 
 /// Host origin ID for clipboard synchronization.
 pub const HOST_CLIPBOARD_ORIGIN_ID: u64 = 1;
@@ -175,6 +193,9 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
                 match listener.accept().await {
                     Ok((stream, peer_addr)) => {
                         tracing::info!(peer = %peer_addr, "New control channel connection for clipboard sync");
+                        if let Err(e) = enable_control_keepalive(&stream) {
+                            tracing::warn!(error = ?e, "Failed to enable TCP keepalive on control socket");
+                        }
                         if let Some(link) = &self.link {
                             link.lock().control_accepted(peer_addr, Instant::now());
                         }
@@ -224,7 +245,11 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
         let link = self.link.clone();
         tokio::spawn(async move {
             while running.load(Ordering::Relaxed) {
-                match ctrl_reader.recv_message().await {
+                let received = ctrl_reader.recv_message().await;
+                if let (Ok(_), Some(link)) = (&received, &link) {
+                    link.lock().control_activity(Instant::now());
+                }
+                match received {
                     Ok(ControlMessage::Clipboard(clip_msg)) => {
                         let action = {
                             let mut engine = sync_engine.lock();
@@ -283,7 +308,30 @@ impl HostClipboardService<AutoClipboardBackend> {
 mod tests {
     use super::*;
     use linux_quest_input::MockClipboardBackend;
-    use std::time::Duration;
+
+    #[tokio::test]
+    async fn test_control_keepalive_is_enabled_on_accepted_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+
+        enable_control_keepalive(&stream).unwrap();
+        let sock = socket2::SockRef::from(&stream);
+        assert!(sock.keepalive().unwrap());
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            assert_eq!(sock.tcp_keepalive_time().unwrap(), CONTROL_KEEPALIVE_IDLE);
+            assert_eq!(
+                sock.tcp_keepalive_interval().unwrap(),
+                CONTROL_KEEPALIVE_INTERVAL
+            );
+            assert_eq!(
+                sock.tcp_keepalive_retries().unwrap(),
+                CONTROL_KEEPALIVE_RETRIES
+            );
+        }
+    }
 
     #[test]
     fn test_host_clipboard_service_local_change_emits_message() {
