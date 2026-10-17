@@ -153,15 +153,17 @@ When `/dev/uinput` is unavailable or permissions are not yet configured, the hos
 
 ## 🗺️ Roadmap & Milestones
 
-The project is structured into 7 core phases:
+The project is structured into 7 core phases. Status reflects what is merged on `main`; see [ROADMAP.md](ROADMAP.md) for details.
 
-- [ ] **Phase 1:** Foundation & Architecture (Monorepo scaffolding, binary protocol, telemetry)
-- [ ] **Phase 2:** Linux Capture & Hardware Encoding Engine (PipeWire DMA-BUF, NVENC/VA-API AV1/HEVC)
-- [ ] **Phase 3:** Low-Latency Network & USB Transport (QUIC/UDP, FEC, ADB reverse tunnel)
-- [ ] **Phase 4:** Meta Quest OpenXR Client & Hardware Decoder (AMediaCodec, Vulkan, Composition Layers)
-- [ ] **Phase 5:** Virtual Multi-Monitor Management on Linux (Wayland virtual outputs, DRM/KMS, dynamic EDID)
-- [ ] **Phase 6:** Spatial Workspace, Passthrough & Input Redirection (6DoF pose, passthrough layers, controller/hand 6DoF manipulation & layout persistence completed; host input injection in progress)
-- [ ] **Phase 7:** Audio Streaming & Production Polish (PipeWire Opus host capture, 2.5ms/5ms low-delay encoding, Quest client AAudio playback with A/V sync, packaging, CLI/TUI)
+- [x] **Phase 1:** Foundation & Architecture (Cargo workspace, zero-copy binary protocol, telemetry, CI)
+- [~] **Phase 2:** Linux Capture & Hardware Encoding Engine (PipeWire DMA-BUF capture, NVENC AV1/HEVC with intra-refresh and reference picture invalidation done; VA-API backend for AMD/Intel pending)
+- [~] **Phase 3:** Low-Latency Network & USB Transport (paced UDP, Reed-Solomon/XOR FEC, ADB reverse tunnel done; QUIC control channel and mDNS/SSDP LAN discovery pending)
+- [x] **Phase 4:** Meta Quest OpenXR Client & Hardware Decoder (AMediaCodec, Vulkan, Composition Layers)
+- [~] **Phase 5:** Virtual Multi-Monitor Management on Linux (wlroots, Mutter and X11 backends with dynamic EDID done; VKMS/EVDI kernel dummy-driver fallback pending)
+- [x] **Phase 6:** Spatial Workspace, Passthrough & Input Redirection (6DoF screens, passthrough, controller/hand manipulation, uinput injection, clipboard sync)
+- [~] **Phase 7:** Audio Streaming & Production Polish (Opus audio with A/V sync and Ratatui dashboard done; tray icon/systemd service and packaging pending)
+
+> **Note:** Much of the code is tested against mock backends (display, decoder, uinput, clipboard, audio sink). End-to-end validation on real Quest 3 and GPU hardware, and the latency/CPU targets above, are still to be confirmed.
 
 Detailed milestone descriptions, deliverables, and acceptance criteria are outlined in [ROADMAP.md](ROADMAP.md).
 
