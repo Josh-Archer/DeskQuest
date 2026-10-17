@@ -518,9 +518,9 @@ impl MdnsDiscoveryBackend {
 #[cfg(feature = "mdns")]
 impl Drop for MdnsDiscoveryBackend {
     fn drop(&mut self) {
-        if self.shut_down {
-            return;
-        }
+        // Always try, even after `shutdown()`: a cancelled `shutdown()` future may have set
+        // `shut_down` without ever sending the command, and shutting down a daemon that is
+        // already gone just returns an ignored error.
         // Best effort: the daemon also sends goodbyes for registered services when it exits.
         if let Some(fullname) = self.registered_fullname.take() {
             let _ = self.daemon.unregister(&fullname);

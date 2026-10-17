@@ -50,7 +50,8 @@ async fn dropping_or_shutting_down_a_backend_stops_its_daemon_thread() {
     let idle = MdnsDiscoveryBackend::new().expect("daemon should start");
     let mut advertising = MdnsDiscoveryBackend::new().expect("daemon should start");
     advertising.advertise(&advertisement()).await.unwrap();
-    assert_eq!(daemon_threads(), 2);
+    // The daemon thread names itself once it is running, so wait for it rather than racing.
+    assert_eq!(wait_for_daemon_threads(2).await, 2);
     drop(idle);
     drop(advertising);
     assert_eq!(
