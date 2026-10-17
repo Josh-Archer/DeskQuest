@@ -29,3 +29,32 @@ parking_lot.workspace = true
 
 [dev-dependencies]
 linux-quest-client = { path = "../client" }
+
+# Linux packaging metadata. Run from the workspace root:
+#   cargo build --release -p linux-quest-host
+#   cargo deb -p linux-quest-host --no-build
+#   cargo generate-rpm -p crates/host
+# cargo-deb resolves asset paths relative to this crate directory ("../../" below),
+# except "target/release/..." which it resolves against the workspace target directory.
+# cargo-generate-rpm resolves asset paths relative to the working directory (workspace root).
+[package.metadata.deb]
+section = "utils"
+priority = "optional"
+depends = "$auto"
+extended-description = """\
+Linux Quest host daemon: streams a Linux desktop or virtual display to a Meta Quest 3 \
+over the network or USB/ADB and injects Quest input through /dev/uinput. \
+The package installs a udev rule granting the 'input' group access to /dev/uinput; \
+add your user to that group and log in again."""
+assets = [
+    ["target/release/linux-quest-host", "usr/bin/", "755"],
+    ["../../packaging/udev/99-uinput.rules", "usr/lib/udev/rules.d/99-uinput.rules", "644"],
+]
+
+[package.metadata.generate-rpm]
+license = "MIT OR Apache-2.0"
+summary = "Linux Quest 3 VR streaming host and virtual display daemon"
+assets = [
+    { source = "target/release/linux-quest-host", dest = "/usr/bin/linux-quest-host", mode = "755" },
+    { source = "packaging/udev/99-uinput.rules", dest = "/usr/lib/udev/rules.d/99-uinput.rules", mode = "644" },
+]

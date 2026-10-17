@@ -1,0 +1,48 @@
+# Maintainer: Josh Archer
+#
+# AUR package for the linux-quest host daemon.
+# Update pkgver and sha256sums for each tagged release (run `updpkgsums` or
+# `makepkg -g`). sha256sums=('SKIP') is a placeholder until the tag exists.
+
+pkgname=linux-quest-host
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Linux Quest 3 VR streaming host and virtual display daemon'
+arch=('x86_64')
+url='https://github.com/Josh-Archer/linux-quest'
+license=('MIT' 'Apache')
+depends=('gcc-libs' 'glibc')
+makedepends=('cargo')
+optdepends=(
+  'wl-clipboard: clipboard sync on Wayland'
+  'xclip: clipboard sync on X11'
+  'pipewire: screen and audio capture'
+)
+options=('!lto')
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "linux-quest-${pkgver}"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
+}
+
+build() {
+  cd "linux-quest-${pkgver}"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release -p linux-quest-host
+}
+
+check() {
+  cd "linux-quest-${pkgver}"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen -p linux-quest-host
+}
+
+package() {
+  cd "linux-quest-${pkgver}"
+  install -Dm755 "target/release/linux-quest-host" "${pkgdir}/usr/bin/linux-quest-host"
+  install -Dm644 "packaging/udev/99-uinput.rules" "${pkgdir}/usr/lib/udev/rules.d/99-uinput.rules"
+}
