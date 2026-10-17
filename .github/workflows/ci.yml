@@ -64,5 +64,10 @@ jobs:
       - name: Run workspace unit and integration tests
         run: cargo test --workspace --verbose
 
+      - name: Lint and test host tray feature
+        run: |
+          cargo clippy -p linux-quest-host --all-targets --features tray -- -D warnings
+          cargo test -p linux-quest-host --features tray --lib tray
+
       - name: Verify workspace documentation builds cleanly
         run: cargo doc --workspace --no-deps
