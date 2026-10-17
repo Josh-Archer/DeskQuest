@@ -12,6 +12,8 @@ pub mod fec;
 pub mod input_channel;
 pub mod jitter_buffer;
 pub mod pacing;
+#[cfg(feature = "quic")]
+pub mod quic;
 pub mod tcp;
 pub mod udp;
 
@@ -26,7 +28,7 @@ pub use discovery::MdnsDiscoveryBackend;
 pub use discovery::{
     refresh, refresh_with_clock, DiscoveredHost, DiscoveryBackend, DiscoveryError,
     HostAdvertisement, HostDirectory, MockDiscoveryBackend, DEFAULT_STALE_AFTER,
-    DISCOVERY_PROTOCOL_VERSION, DISCOVERY_SERVICE_TYPE,
+    DISCOVERY_PROTOCOL_VERSION, DISCOVERY_SERVICE_TYPE, VIDEO_PORT_UNAVAILABLE,
 };
 pub use fec::{FecError, FecHeader, ReedSolomonFec, XorFec};
 pub use input_channel::{
@@ -35,6 +37,10 @@ pub use input_channel::{
 };
 pub use jitter_buffer::{AdaptiveJitterBuffer, JitterBufferConfig, JitterBufferStats};
 pub use pacing::PacketPacer;
+#[cfg(feature = "quic")]
+pub use quic::{
+    Fingerprint, HostIdentity, QuicControl, QuicControlServer, QuicControlSession, QuicError,
+};
 pub use tcp::TcpEndpoint;
 pub use udp::{PacedUdpEndpoint, DEFAULT_UDP_MTU};
 

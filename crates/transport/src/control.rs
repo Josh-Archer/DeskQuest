@@ -58,6 +58,22 @@ pub struct ControlChannel<R, W> {
     writer: W,
 }
 
+/// Maps an I/O error that means "the peer or the connection is gone" to `ConnectionClosed`.
+///
+/// QUIC streams report a lost connection as `NotConnected` (see quinn's `ReadError`/`WriteError`
+/// conversions), so it is treated the same as a reset or an EOF.
+fn map_io_error(e: std::io::Error) -> ControlError {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::UnexpectedEof
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::BrokenPipe
+        | ErrorKind::NotConnected => ControlError::ConnectionClosed,
+        _ => ControlError::Io(e),
+    }
+}
+
 impl<R, W> ControlChannel<R, W>
 where
     R: AsyncRead + Unpin,
@@ -67,14 +83,22 @@ where
         Self { reader, writer }
     }
 
+    /// Consumes the channel and returns its reader and writer, e.g. to split them across tasks.
+    pub fn into_parts(self) -> (R, W) {
+        (self.reader, self.writer)
+    }
+
     pub async fn send_message(&mut self, msg: &ControlMessage) -> Result<(), ControlError> {
         let serialized =
             bincode::serialize(msg).map_err(|e| ControlError::Serialization(e.to_string()))?;
 
         let len = (serialized.len() as u32).to_be_bytes();
-        self.writer.write_all(&len).await?;
-        self.writer.write_all(&serialized).await?;
-        self.writer.flush().await?;
+        self.writer.write_all(&len).await.map_err(map_io_error)?;
+        self.writer
+            .write_all(&serialized)
+            .await
+            .map_err(map_io_error)?;
+        self.writer.flush().await.map_err(map_io_error)?;
         Ok(())
     }
 
@@ -83,12 +107,7 @@ where
         self.reader
             .read_exact(&mut len_buf)
             .await
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset => {
-                    ControlError::ConnectionClosed
-                }
-                _ => ControlError::Io(e),
-            })?;
+            .map_err(map_io_error)?;
 
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > MAX_CONTROL_MESSAGE_SIZE {
@@ -100,12 +119,7 @@ where
         self.reader
             .read_exact(&mut msg_buf)
             .await
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset => {
-                    ControlError::ConnectionClosed
-                }
-                _ => ControlError::Io(e),
-            })?;
+            .map_err(map_io_error)?;
 
         let msg: ControlMessage = bincode::deserialize(&msg_buf)
             .map_err(|e| ControlError::Deserialization(e.to_string()))?;

@@ -6,6 +6,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::net::{TcpListener, TcpStream};
@@ -18,7 +19,26 @@ use linux_quest_input::{
 use linux_quest_protocol::{ClipboardMessage, ClipboardSyncEngine, SyncAction};
 use linux_quest_transport::{ControlChannel, ControlMessage, TransportError};
 
+use crate::link_status::SharedLinkTracker;
 use crate::HostError;
+
+/// Idle time before the first TCP keepalive probe on an accepted control socket.
+pub const CONTROL_KEEPALIVE_IDLE: Duration = Duration::from_secs(5);
+/// Interval between TCP keepalive probes.
+pub const CONTROL_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
+/// Unanswered probes before the kernel resets the connection (about 9s of silence in total).
+pub const CONTROL_KEEPALIVE_RETRIES: u32 = 2;
+
+/// Enables short-interval TCP keepalive so a headset that vanishes without a FIN
+/// (Wi-Fi drop, power off) is detected within seconds instead of the kernel default of hours.
+pub fn enable_control_keepalive(stream: &TcpStream) -> std::io::Result<()> {
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(CONTROL_KEEPALIVE_IDLE)
+        .with_interval(CONTROL_KEEPALIVE_INTERVAL);
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    let ka = ka.with_retries(CONTROL_KEEPALIVE_RETRIES);
+    socket2::SockRef::from(stream).set_tcp_keepalive(&ka)
+}
 
 /// Host origin ID for clipboard synchronization.
 pub const HOST_CLIPBOARD_ORIGIN_ID: u64 = 1;
@@ -33,6 +53,7 @@ pub struct HostClipboardService<B: ClipboardBackend + 'static = AutoClipboardBac
     incoming_rx: mpsc::UnboundedReceiver<ClipboardMessage>,
     listener: Option<TcpListener>,
     peer_writers: Arc<Mutex<Vec<mpsc::UnboundedSender<ControlMessage>>>>,
+    link: Option<SharedLinkTracker>,
 }
 
 impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
@@ -60,7 +81,14 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
             incoming_rx,
             listener: None,
             peer_writers: Arc::new(Mutex::new(Vec::new())),
+            link: None,
         }
+    }
+
+    /// Reports accepted and closed control connections to the shared link tracker.
+    pub fn with_link_tracker(mut self, link: SharedLinkTracker) -> Self {
+        self.link = Some(link);
+        self
     }
 
     /// Customizes the watcher polling and debouncing configuration.
@@ -165,7 +193,13 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
                 match listener.accept().await {
                     Ok((stream, peer_addr)) => {
                         tracing::info!(peer = %peer_addr, "New control channel connection for clipboard sync");
-                        self.spawn_peer_handler(stream);
+                        if let Err(e) = enable_control_keepalive(&stream) {
+                            tracing::warn!(error = ?e, "Failed to enable TCP keepalive on control socket");
+                        }
+                        if let Some(link) = &self.link {
+                            link.lock().control_accepted(peer_addr, Instant::now());
+                        }
+                        self.spawn_peer_handler(stream, peer_addr);
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => {
@@ -180,7 +214,7 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
         Ok(())
     }
 
-    fn spawn_peer_handler(&self, stream: TcpStream) {
+    fn spawn_peer_handler(&self, stream: TcpStream, peer_addr: SocketAddr) {
         let (reader, writer) = stream.into_split();
         let mut ctrl_reader = ControlChannel::new(reader, tokio::io::sink());
         let mut ctrl_writer = ControlChannel::new(tokio::io::empty(), writer);
@@ -207,10 +241,15 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
             }
         });
 
-        // Task receiving incoming messages from peer
+        // Task receiving incoming messages from peer; reports the close when it ends
+        let link = self.link.clone();
         tokio::spawn(async move {
             while running.load(Ordering::Relaxed) {
-                match ctrl_reader.recv_message().await {
+                let received = ctrl_reader.recv_message().await;
+                if let (Ok(_), Some(link)) = (&received, &link) {
+                    link.lock().control_activity(Instant::now());
+                }
+                match received {
                     Ok(ControlMessage::Clipboard(clip_msg)) => {
                         let action = {
                             let mut engine = sync_engine.lock();
@@ -226,6 +265,9 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
                     Ok(_) => {}
                     Err(_) => break,
                 }
+            }
+            if let Some(link) = link {
+                link.lock().control_closed(peer_addr);
             }
         });
     }
@@ -250,6 +292,11 @@ impl HostClipboardService<AutoClipboardBackend> {
         (service, incoming_tx, outgoing_rx)
     }
 
+    /// Address the control listener is bound to, or `None` if no listener was bound.
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.listener.as_ref().and_then(|l| l.local_addr().ok())
+    }
+
     /// Binds a TCP listener to `bind_addr` for accepting client control channel connections.
     pub async fn bind_auto(bind_addr: SocketAddr) -> Result<Self, HostError> {
         let listener = TcpListener::bind(bind_addr)
@@ -266,7 +313,30 @@ impl HostClipboardService<AutoClipboardBackend> {
 mod tests {
     use super::*;
     use linux_quest_input::MockClipboardBackend;
-    use std::time::Duration;
+
+    #[tokio::test]
+    async fn test_control_keepalive_is_enabled_on_accepted_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+
+        enable_control_keepalive(&stream).unwrap();
+        let sock = socket2::SockRef::from(&stream);
+        assert!(sock.keepalive().unwrap());
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            assert_eq!(sock.tcp_keepalive_time().unwrap(), CONTROL_KEEPALIVE_IDLE);
+            assert_eq!(
+                sock.tcp_keepalive_interval().unwrap(),
+                CONTROL_KEEPALIVE_INTERVAL
+            );
+            assert_eq!(
+                sock.tcp_keepalive_retries().unwrap(),
+                CONTROL_KEEPALIVE_RETRIES
+            );
+        }
+    }
 
     #[test]
     fn test_host_clipboard_service_local_change_emits_message() {

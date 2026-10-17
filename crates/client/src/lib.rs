@@ -7,6 +7,7 @@ pub mod audio;
 pub mod clipboard;
 pub mod config;
 pub mod decoder;
+pub mod discovery;
 pub mod error;
 pub mod graphics;
 pub mod hud;
@@ -31,6 +32,11 @@ pub use clipboard::{
 };
 pub use config::{ClientConfig, ClientVideoCodec, DisplayMode, TransportMode};
 pub use decoder::{create_decoder, DecodedFrame, DecoderStats, HardwareVideoDecoder};
+pub use discovery::scheduler::{DiscoveryScheduler, DEFAULT_RESCAN_PERIOD, MIN_RESCAN_PERIOD};
+pub use discovery::{
+    apply_selection, parse_manual_host, AndroidMulticastLock, ClientDiscovery, MockMulticastLock,
+    MulticastLock,
+};
 pub use error::{ClientError, ClientResult};
 pub use graphics::{ImageLayoutTransition, SwapchainTexture, VulkanContext};
 pub use hud::{DebugHud, HudSnapshot};

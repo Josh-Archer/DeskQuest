@@ -20,9 +20,14 @@ crc32fast.workspace = true
 libc = { workspace = true }
 # Real mDNS LAN discovery. Off by default so default builds and tests never touch multicast.
 mdns-sd = { workspace = true, optional = true }
+# QUIC control channel. Off by default so default builds do not pull in quinn/rustls/rcgen.
+quinn = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 
 [features]
 default = []
 mdns = ["dep:mdns-sd"]
+quic = ["dep:quinn", "dep:rcgen", "dep:sha2"]
 
 [dev-dependencies]

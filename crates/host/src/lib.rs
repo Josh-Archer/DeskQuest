@@ -10,12 +10,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 
+pub mod advertise;
 pub mod audio_pipeline;
 pub mod clipboard_service;
 pub mod codec_select;
 pub mod input_receiver;
 pub mod ipc;
+pub mod link_status;
 pub mod multi_display;
+pub mod tray;
 pub mod tui;
 
 pub use audio_pipeline::HostAudioPipeline;

@@ -116,7 +116,18 @@ systemctl --user daemon-reload
 systemctl --user enable --now linux-quest-host
 ```
 
-See [`packaging/README.md`](packaging/README.md) for installation, the `/dev/uinput` udev rule and operating notes. The tray icon is not included yet (tracked in #32).
+See [`packaging/README.md`](packaging/README.md) for installation, the `/dev/uinput` udev rule and operating notes.
+
+### Optional tray icon
+
+`linux-quest-host tray` shows connection state in the system tray, with Open dashboard, Restart service and Quit. It is a separate process, and it is off by default, so build it with the `tray` feature:
+
+```bash
+cargo install --path crates/host --bin linux-quest-host --features tray --root ~/.local
+linux-quest-host tray
+```
+
+It needs a StatusNotifierItem host (KDE Plasma, GNOME with the AppIndicator extension, or a bar with a tray module). It can start before or after the daemon, and the systemd unit above does not change. The ordering, a sample user unit and known limitations are in [`packaging/README.md`](packaging/README.md#optional-tray-icon).
 
 ---
 
@@ -174,7 +185,7 @@ The project is structured into 7 core phases. Status reflects what is merged on 
 - [~] **Phase 2:** Linux Capture & Hardware Encoding Engine (PipeWire DMA-BUF capture, NVENC AV1/HEVC with intra-refresh and reference picture invalidation done; VA-API backend for AMD/Intel implemented as an unverified scaffold (HEVC and H.264 encode, rolling intra refresh, RGB-to-NV12 via VPP; AV1 and crate-written HEVC parameter sets are off unless opted in with `LINUX_QUEST_VAAPI_AV1=1` / `LINUX_QUEST_VAAPI_PACKED_HEADERS=1`), never run on a GPU, see `crates/encoder/src/vaapi.rs`; select with `LINUX_QUEST_VIDEO_ENCODER=nvenc|vaapi|mock` or `linux-quest-host daemon --encoder auto|nvenc|vaapi|mock`)
 - [~] **Phase 3:** Low-Latency Network & USB Transport (paced UDP, Reed-Solomon/XOR FEC, ADB reverse tunnel done; QUIC control channel and mDNS/SSDP LAN discovery pending)
 - [x] **Phase 4:** Meta Quest OpenXR Client & Hardware Decoder (AMediaCodec, Vulkan, Composition Layers)
-- [~] **Phase 5:** Virtual Multi-Monitor Management on Linux (wlroots, Mutter and X11 backends with dynamic EDID done; VKMS/EVDI kernel dummy-driver fallback pending)
+- [~] **Phase 5:** Virtual Multi-Monitor Management on Linux (wlroots, Mutter and X11 backends with dynamic EDID done; EVDI kernel dummy-driver fallback implemented but never run against real EVDI, see #31)
 - [x] **Phase 6:** Spatial Workspace, Passthrough & Input Redirection (6DoF screens, passthrough, controller/hand manipulation, uinput injection, clipboard sync)
 - [~] **Phase 7:** Audio Streaming & Production Polish (Opus audio with A/V sync and Ratatui dashboard done; tray icon/systemd service and packaging pending)
 

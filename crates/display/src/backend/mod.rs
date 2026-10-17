@@ -1,3 +1,4 @@
+pub mod kernel_drm;
 pub mod mock;
 pub mod mutter;
 pub mod wlr;
