@@ -24,8 +24,9 @@ pub use control::{ControlChannel, ControlError, ControlMessage, DEFAULT_CONTROL_
 #[cfg(feature = "mdns")]
 pub use discovery::MdnsDiscoveryBackend;
 pub use discovery::{
-    refresh, DiscoveredHost, DiscoveryBackend, DiscoveryError, HostAdvertisement, HostDirectory,
-    MockDiscoveryBackend, DEFAULT_STALE_AFTER, DISCOVERY_SERVICE_TYPE,
+    refresh, refresh_with_clock, DiscoveredHost, DiscoveryBackend, DiscoveryError,
+    HostAdvertisement, HostDirectory, MockDiscoveryBackend, DEFAULT_STALE_AFTER,
+    DISCOVERY_PROTOCOL_VERSION, DISCOVERY_SERVICE_TYPE,
 };
 pub use fec::{FecError, FecHeader, ReedSolomonFec, XorFec};
 pub use input_channel::{

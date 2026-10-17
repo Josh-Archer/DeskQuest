@@ -16,8 +16,13 @@
 //! The client browses for the same type, merges what it sees into a [`HostDirectory`] and
 //! expires hosts that stop answering. The network-facing part lives behind [`DiscoveryBackend`]
 //! so tests run against [`MockDiscoveryBackend`]; the real mDNS backend is compiled only with
-//! the `mdns` cargo feature. When multicast is blocked, backends return
-//! [`DiscoveryError::MulticastUnavailable`] and the caller should fall back to manual entry.
+//! the `mdns` cargo feature.
+//!
+//! [`DiscoveryError::MulticastUnavailable`] means "discovery cannot work, fall back to manual
+//! entry". The mock produces it on demand. The real backend produces it only when the `mdns-sd`
+//! daemon thread is gone (see `MdnsDiscoveryBackend` for exactly what is and is not detected);
+//! a blocked or unjoinable multicast socket is *not* reliably reported, so a browse that finds
+//! nothing is not proof that no hosts exist.
 
 use async_trait::async_trait;
 use linux_quest_protocol::VideoCodec;
@@ -75,9 +80,12 @@ impl HostAdvertisement {
         if self.name.len() > MAX_INSTANCE_NAME_BYTES {
             return invalid("instance name exceeds 63 bytes");
         }
-        // Dots would need DNS-SD escaping, which the client does not parse back.
-        if self.name.contains('.') || self.name.chars().any(char::is_control) {
-            return invalid("instance name must not contain dots or control characters");
+        // Dots and backslashes are escaped by DNS-SD, and the client does not un-escape the
+        // instance name it browses back, so such a name would not round-trip.
+        if self.name.contains(['.', '\\']) || self.name.chars().any(char::is_control) {
+            return invalid(
+                "instance name must not contain dots, backslashes or control characters",
+            );
         }
         if self.control_port == 0 || self.video_port == 0 || self.input_port == 0 {
             return invalid("ports must be non-zero");
@@ -275,15 +283,30 @@ impl HostDirectory {
     }
 }
 
-/// One browse cycle: query the backend, record what answered at `now`, then expire stale hosts.
+/// One browse cycle: query the backend, record what answered, then expire stale hosts.
 /// Returns how many hosts answered this cycle.
+///
+/// Entries are stamped with the time the browse *finished* (`Instant::now()` read after
+/// `backend.browse` returns), not when it started, so a long browse window does not make
+/// fresh hosts look older than they are. Use [`refresh_with_clock`] to inject a clock in tests.
 pub async fn refresh<B: DiscoveryBackend + ?Sized>(
     backend: &mut B,
     directory: &mut HostDirectory,
     window: Duration,
-    now: Instant,
+) -> Result<usize, DiscoveryError> {
+    refresh_with_clock(backend, directory, window, Instant::now).await
+}
+
+/// Like [`refresh`], but `clock` supplies the observation time. It is called exactly once,
+/// after the browse has completed, and not at all if the browse failed.
+pub async fn refresh_with_clock<B: DiscoveryBackend + ?Sized>(
+    backend: &mut B,
+    directory: &mut HostDirectory,
+    window: Duration,
+    clock: impl FnOnce() -> Instant,
 ) -> Result<usize, DiscoveryError> {
     let found = backend.browse(window).await?;
+    let now = clock();
     let count = found.len();
     directory.observe(found, now);
     directory.prune(now);
@@ -379,25 +402,130 @@ impl DiscoveryBackend for MockDiscoveryBackend {
 }
 
 /// Real mDNS / DNS-SD backend built on `mdns-sd`. Requires the `mdns` cargo feature.
+///
+/// # Lifecycle
+///
+/// `mdns_sd::ServiceDaemon` owns a thread and sockets but has no `Drop`. This type shuts the
+/// daemon down on drop (which also makes the daemon send mDNS goodbye packets for a still
+/// registered service). Prefer calling [`MdnsDiscoveryBackend::shutdown`] when you can await
+/// it: it waits (bounded) for the goodbye and for the daemon thread to acknowledge.
+///
+/// # Error reporting
+///
+/// `mdns-sd` opens its multicast sockets lazily on the daemon thread and only logs
+/// (at debug level) when binding or joining the multicast group fails. It does **not** report
+/// that through `ServiceDaemon::monitor` either. So:
+///
+/// * Detected, as [`DiscoveryError::MulticastUnavailable`]: the daemon thread cannot be
+///   started in [`new`](Self::new), or has exited (`Error::DaemonShutdown`), for example after
+///   [`shutdown`](Self::shutdown).
+/// * Detected, as [`DiscoveryError::Backend`]: `DaemonEvent::Error` events from the daemon's
+///   monitor channel (currently only rejected service registrations), reported by the next
+///   `advertise`/`browse` call, or immediately while a `browse` is waiting; and errors
+///   returned synchronously by the `mdns-sd` API.
+/// * **Not** detected: blocked multicast, failure to bind port 5353 or to join the group, or no
+///   usable network interface. `advertise` then succeeds without anything being sent and
+///   `browse` returns an empty list.
 #[cfg(feature = "mdns")]
 pub struct MdnsDiscoveryBackend {
     daemon: mdns_sd::ServiceDaemon,
+    monitor: mdns_sd::Receiver<mdns_sd::DaemonEvent>,
     hostname: String,
     registered_fullname: Option<String>,
+    shut_down: bool,
+}
+
+/// Stops the browse on drop, including when the `browse` future is cancelled mid-await.
+#[cfg(feature = "mdns")]
+struct BrowseGuard<'a> {
+    daemon: &'a mdns_sd::ServiceDaemon,
 }
 
 #[cfg(feature = "mdns")]
+impl Drop for BrowseGuard<'_> {
+    fn drop(&mut self) {
+        // Ignore the error: the daemon may already be shut down.
+        let _ = self.daemon.stop_browse(DISCOVERY_SERVICE_TYPE);
+    }
+}
+
+/// How long [`MdnsDiscoveryBackend::shutdown`] waits for each daemon acknowledgement.
+#[cfg(feature = "mdns")]
+const SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[cfg(feature = "mdns")]
 impl MdnsDiscoveryBackend {
-    /// Starts the mDNS daemon. Fails with `MulticastUnavailable` if the socket cannot be bound
-    /// or joined to the multicast group.
+    /// Starts the mDNS daemon thread.
+    ///
+    /// Fails with `MulticastUnavailable` only if the daemon thread or its control socket cannot
+    /// be created. The multicast sockets themselves are opened later by the daemon and their
+    /// failure is not reported; see the type-level docs.
     pub fn new() -> Result<Self, DiscoveryError> {
         let daemon = mdns_sd::ServiceDaemon::new()
             .map_err(|e| DiscoveryError::MulticastUnavailable(e.to_string()))?;
+        let monitor = match daemon.monitor() {
+            Ok(monitor) => monitor,
+            Err(e) => {
+                let _ = daemon.shutdown();
+                return Err(map_error(e));
+            }
+        };
         Ok(Self {
             daemon,
+            monitor,
             hostname: local_mdns_hostname(),
             registered_fullname: None,
+            shut_down: false,
         })
+    }
+
+    /// Withdraws any advertisement and stops the daemon thread, waiting (bounded) for the
+    /// goodbye packets and the daemon's acknowledgement. Idempotent. Afterwards `advertise`
+    /// and `browse` fail with `MulticastUnavailable`.
+    pub async fn shutdown(&mut self) -> Result<(), DiscoveryError> {
+        if self.shut_down {
+            return Ok(());
+        }
+        self.shut_down = true;
+
+        if let Some(fullname) = self.registered_fullname.take() {
+            if let Ok(ack) = self.daemon.unregister(&fullname) {
+                let _ = tokio::time::timeout(SHUTDOWN_ACK_TIMEOUT, ack.recv_async()).await;
+            }
+        }
+        match self.daemon.shutdown() {
+            Ok(ack) => {
+                let _ = tokio::time::timeout(SHUTDOWN_ACK_TIMEOUT, ack.recv_async()).await;
+                Ok(())
+            }
+            // Already gone is the state we wanted.
+            Err(mdns_sd::Error::DaemonShutdown) => Ok(()),
+            Err(e) => Err(map_error(e)),
+        }
+    }
+
+    /// Surfaces the first queued `DaemonEvent::Error`, discarding other events.
+    fn check_monitor(&self) -> Result<(), DiscoveryError> {
+        while let Ok(event) = self.monitor.try_recv() {
+            if let mdns_sd::DaemonEvent::Error(e) = event {
+                return Err(map_error(e));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "mdns")]
+impl Drop for MdnsDiscoveryBackend {
+    fn drop(&mut self) {
+        if self.shut_down {
+            return;
+        }
+        // Best effort: the daemon also sends goodbyes for registered services when it exits.
+        if let Some(fullname) = self.registered_fullname.take() {
+            let _ = self.daemon.unregister(&fullname);
+        }
+        let _ = self.daemon.shutdown();
     }
 }
 
@@ -411,9 +539,16 @@ fn local_mdns_hostname() -> String {
     format!("{raw}.local.")
 }
 
+/// `DaemonShutdown` means the daemon thread is gone, so no discovery can happen: report it as
+/// `MulticastUnavailable` so callers fall back to manual entry. Everything else is `Backend`.
 #[cfg(feature = "mdns")]
-fn backend_error(e: mdns_sd::Error) -> DiscoveryError {
-    DiscoveryError::Backend(e.to_string())
+fn map_error(e: mdns_sd::Error) -> DiscoveryError {
+    match e {
+        mdns_sd::Error::DaemonShutdown => {
+            DiscoveryError::MulticastUnavailable("mDNS daemon is not running".to_string())
+        }
+        other => DiscoveryError::Backend(other.to_string()),
+    }
 }
 
 #[cfg(feature = "mdns")]
@@ -425,6 +560,7 @@ impl DiscoveryBackend for MdnsDiscoveryBackend {
 
     async fn advertise(&mut self, advertisement: &HostAdvertisement) -> Result<(), DiscoveryError> {
         advertisement.validate()?;
+        self.check_monitor()?;
         self.withdraw().await?;
 
         let info = mdns_sd::ServiceInfo::new(
@@ -435,61 +571,94 @@ impl DiscoveryBackend for MdnsDiscoveryBackend {
             advertisement.control_port,
             advertisement.txt_properties(),
         )
-        .map_err(backend_error)?
+        .map_err(map_error)?
         .enable_addr_auto();
 
         let fullname = info.get_fullname().to_string();
-        self.daemon.register(info).map_err(backend_error)?;
+        self.daemon.register(info).map_err(map_error)?;
         self.registered_fullname = Some(fullname);
         Ok(())
     }
 
     async fn withdraw(&mut self) -> Result<(), DiscoveryError> {
         if let Some(fullname) = self.registered_fullname.take() {
-            self.daemon.unregister(&fullname).map_err(backend_error)?;
+            self.daemon.unregister(&fullname).map_err(map_error)?;
         }
         Ok(())
     }
 
     async fn browse(&mut self, window: Duration) -> Result<Vec<DiscoveredHost>, DiscoveryError> {
+        self.check_monitor()?;
         let receiver = self
             .daemon
             .browse(DISCOVERY_SERVICE_TYPE)
-            .map_err(backend_error)?;
+            .map_err(map_error)?;
+        // Dropped on every exit path, including cancellation of this future.
+        let _guard = BrowseGuard {
+            daemon: &self.daemon,
+        };
 
         let suffix = format!(".{DISCOVERY_SERVICE_TYPE}");
-        let mut found = Vec::new();
+        // Keyed by instance name: a service can resolve more than once (new addresses, TXT
+        // updates), and the latest resolution wins. Removal evicts.
+        let mut found: BTreeMap<String, DiscoveredHost> = BTreeMap::new();
         let deadline = tokio::time::Instant::now() + window;
-        while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, receiver.recv_async()).await {
-            let mdns_sd::ServiceEvent::ServiceResolved(resolved) = event else {
-                continue;
+        loop {
+            let event = tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                daemon_event = self.monitor.recv_async() => {
+                    match daemon_event {
+                        Ok(mdns_sd::DaemonEvent::Error(e)) => return Err(map_error(e)),
+                        Ok(_) => continue,
+                        // Monitor closed: the daemon thread is gone.
+                        Err(_) => return Err(map_error(mdns_sd::Error::DaemonShutdown)),
+                    }
+                }
+                event = receiver.recv_async() => match event {
+                    Ok(event) => event,
+                    Err(_) => break,
+                },
             };
-            let Some(name) = resolved.get_fullname().strip_suffix(&suffix) else {
-                tracing::warn!(
-                    fullname = resolved.get_fullname(),
-                    "ignoring unexpected service type"
-                );
-                continue;
-            };
-            let addresses = resolved
-                .get_addresses()
-                .iter()
-                .map(|a| a.to_ip_addr())
-                .collect::<Vec<_>>();
-            let txt: HashMap<String, String> = resolved
-                .get_properties()
-                .iter()
-                .map(|p| (p.key().to_string(), p.val_str().to_string()))
-                .collect();
-            match DiscoveredHost::from_parts(name, addresses, resolved.get_port(), &txt) {
-                Ok(host) => found.push(host),
-                Err(e) => tracing::warn!(instance = name, error = %e, "skipping discovered host"),
+            match event {
+                mdns_sd::ServiceEvent::ServiceResolved(resolved) => {
+                    let Some(name) = resolved.get_fullname().strip_suffix(&suffix) else {
+                        tracing::warn!(
+                            fullname = resolved.get_fullname(),
+                            "ignoring unexpected service type"
+                        );
+                        continue;
+                    };
+                    let addresses = resolved
+                        .get_addresses()
+                        .iter()
+                        .map(|a| a.to_ip_addr())
+                        .collect::<Vec<_>>();
+                    let txt: HashMap<String, String> = resolved
+                        .get_properties()
+                        .iter()
+                        .map(|p| (p.key().to_string(), p.val_str().to_string()))
+                        .collect();
+                    match DiscoveredHost::from_parts(name, addresses, resolved.get_port(), &txt) {
+                        Ok(host) => {
+                            found.insert(host.name.clone(), host);
+                        }
+                        Err(e) => {
+                            // The newest record for this name is unusable, so drop any older one.
+                            found.remove(name);
+                            tracing::warn!(instance = name, error = %e, "skipping discovered host");
+                        }
+                    }
+                }
+                mdns_sd::ServiceEvent::ServiceRemoved(_, fullname) => {
+                    if let Some(name) = fullname.strip_suffix(&suffix) {
+                        found.remove(name);
+                    }
+                }
+                _ => {}
             }
         }
 
-        // Ignore the error if the browse was already torn down.
-        let _ = self.daemon.stop_browse(DISCOVERY_SERVICE_TYPE);
-        Ok(found)
+        Ok(found.into_values().collect())
     }
 }
 
@@ -704,7 +873,13 @@ mod tests {
         let mut directory = HostDirectory::default();
         let now = Instant::now();
 
-        let result = refresh(&mut backend, &mut directory, Duration::from_millis(10), now).await;
+        let result = refresh_with_clock(
+            &mut backend,
+            &mut directory,
+            Duration::from_millis(10),
+            || now,
+        )
+        .await;
         assert!(matches!(
             result,
             Err(DiscoveryError::MulticastUnavailable(_))
@@ -756,23 +931,152 @@ mod tests {
         let mut directory = HostDirectory::new(Duration::from_secs(15));
         let t0 = Instant::now();
 
-        let seen = refresh(&mut backend, &mut directory, Duration::from_millis(10), t0)
-            .await
-            .unwrap();
+        let seen = refresh_with_clock(
+            &mut backend,
+            &mut directory,
+            Duration::from_millis(10),
+            || t0,
+        )
+        .await
+        .unwrap();
         assert_eq!(seen, 2);
         assert_eq!(directory.hosts(t0).len(), 2);
 
         // "den" powers off. A later browse only sees "studio", past the TTL for "den".
         backend.set_peers([host("studio", 11)]);
         let t1 = t0 + Duration::from_secs(20);
-        let seen = refresh(&mut backend, &mut directory, Duration::from_millis(10), t1)
-            .await
-            .unwrap();
+        let seen = refresh_with_clock(
+            &mut backend,
+            &mut directory,
+            Duration::from_millis(10),
+            || t1,
+        )
+        .await
+        .unwrap();
         assert_eq!(seen, 1);
 
         let names: Vec<_> = directory.hosts(t1).iter().map(|h| h.name.clone()).collect();
         assert_eq!(names, ["studio"]);
         assert!(directory.get("den", t1).is_none());
+    }
+
+    #[test]
+    fn advertisement_validation_rejects_backslash_and_control_characters() {
+        for name in ["back\\slash", "tab\tname", "new\nline"] {
+            let mut ad = advertisement();
+            ad.name = name.to_string();
+            assert!(
+                matches!(ad.validate(), Err(DiscoveryError::InvalidAdvertisement(_))),
+                "{name:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn reobserved_host_replaces_stale_data() {
+        let t0 = Instant::now();
+        let mut directory = HostDirectory::new(Duration::from_secs(15));
+        directory.observe([host("den", 10)], t0);
+
+        let mut moved = host("den", 99);
+        moved.control_port = 50000;
+        moved.codecs = vec![VideoCodec::H264];
+        let t1 = t0 + Duration::from_secs(5);
+        directory.observe([moved.clone()], t1);
+
+        assert_eq!(directory.hosts(t1).len(), 1);
+        assert_eq!(directory.get("den", t1), Some(&moved));
+        assert_eq!(
+            directory.get("den", t1).unwrap().control_addr(),
+            Some("192.168.1.99:50000".parse().unwrap())
+        );
+        // Age was reset by the re-observation, not inherited from t0.
+        let t2 = t0 + Duration::from_secs(16);
+        assert!(directory.get("den", t2).is_some());
+    }
+
+    #[test]
+    fn prune_returns_zero_when_nothing_is_stale() {
+        let t0 = Instant::now();
+        let mut directory = HostDirectory::new(Duration::from_secs(15));
+        assert_eq!(directory.prune(t0), 0, "empty directory");
+
+        directory.observe([host("den", 10), host("studio", 11)], t0);
+        assert_eq!(directory.prune(t0 + Duration::from_secs(14)), 0);
+        assert_eq!(directory.hosts(t0).len(), 2);
+    }
+
+    #[test]
+    fn zero_ttl_makes_every_host_immediately_stale() {
+        let t0 = Instant::now();
+        let mut directory = HostDirectory::new(Duration::ZERO);
+        directory.observe([host("den", 10)], t0);
+
+        assert!(directory.hosts(t0).is_empty());
+        assert!(directory.get("den", t0).is_none());
+        assert_eq!(directory.prune(t0), 1);
+        assert_eq!(directory.prune(t0), 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_stamps_entries_after_the_browse_completes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// Backend whose browse "takes" a recorded step before returning.
+        struct Recording<'a>(&'a AtomicBool);
+
+        #[async_trait]
+        impl DiscoveryBackend for Recording<'_> {
+            fn name(&self) -> &'static str {
+                "recording"
+            }
+            async fn advertise(&mut self, _: &HostAdvertisement) -> Result<(), DiscoveryError> {
+                Ok(())
+            }
+            async fn withdraw(&mut self) -> Result<(), DiscoveryError> {
+                Ok(())
+            }
+            async fn browse(&mut self, _: Duration) -> Result<Vec<DiscoveredHost>, DiscoveryError> {
+                self.0.store(true, Ordering::SeqCst);
+                Ok(vec![host("den", 10)])
+            }
+        }
+
+        let browsed = AtomicBool::new(false);
+        let mut backend = Recording(&browsed);
+        let mut directory = HostDirectory::default();
+        let mut browsed_before_clock = false;
+        refresh_with_clock(&mut backend, &mut directory, Duration::ZERO, || {
+            browsed_before_clock = browsed.load(Ordering::SeqCst);
+            Instant::now()
+        })
+        .await
+        .unwrap();
+        assert!(browsed_before_clock, "clock must be read after the browse");
+
+        // A failed browse never reads the clock.
+        let mut failing = MockDiscoveryBackend::new().with_multicast_available(false);
+        let mut called = false;
+        let result = refresh_with_clock(&mut failing, &mut directory, Duration::ZERO, || {
+            called = true;
+            Instant::now()
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(!called);
+    }
+
+    #[tokio::test]
+    async fn refresh_uses_the_real_clock() {
+        let mut backend = MockDiscoveryBackend::new().with_peers([host("den", 10)]);
+        let mut directory = HostDirectory::default();
+        assert_eq!(
+            refresh(&mut backend, &mut directory, Duration::ZERO)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(directory.get("den", Instant::now()).is_some());
     }
 
     #[test]

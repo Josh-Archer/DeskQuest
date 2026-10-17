@@ -32,5 +32,7 @@ crc32fast = "1.4"
 parking_lot = "0.12"
 libloading = "0.8"
 libc = "0.2"
+# Real mDNS LAN discovery (optional in linux-quest-transport, behind its `mdns` feature).
+mdns-sd = { version = "0.21", default-features = false, features = ["async"] }
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 crossterm = "0.28"
