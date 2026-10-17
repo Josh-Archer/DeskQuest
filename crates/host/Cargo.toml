@@ -1,5 +1,6 @@
 [package]
 name = "linux-quest-host"
+description = "Linux Quest 3 VR streaming host and virtual display daemon"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -41,20 +42,35 @@ linux-quest-client = { path = "../client" }
 section = "utils"
 priority = "optional"
 depends = "$auto"
+# Debian-format copyright file (installed as /usr/share/doc/linux-quest-host/copyright).
+license-file = ["../../packaging/debian/copyright", "0"]
+# postinst reloads udev so the uinput rule applies without a reboot (best effort).
+maintainer-scripts = "../../packaging/debian/"
 extended-description = """\
 Linux Quest host daemon: streams a Linux desktop or virtual display to a Meta Quest 3 \
 over the network or USB/ADB and injects Quest input through /dev/uinput. \
 The package installs a udev rule granting the 'input' group access to /dev/uinput; \
-add your user to that group and log in again."""
+add your user to that group and log in again. It loads the uinput module at boot and \
+ships a systemd user unit: systemctl --user enable --now linux-quest-host."""
 assets = [
     ["target/release/linux-quest-host", "usr/bin/", "755"],
     ["../../packaging/udev/99-uinput.rules", "usr/lib/udev/rules.d/99-uinput.rules", "644"],
+    ["../../packaging/modules-load/linux-quest.conf", "usr/lib/modules-load.d/linux-quest.conf", "644"],
+    ["../../packaging/systemd/linux-quest-host.service", "usr/lib/systemd/user/linux-quest-host.service", "644"],
+    ["../../LICENSE-MIT", "usr/share/doc/linux-quest-host/LICENSE-MIT", "644"],
+    ["../../LICENSE-APACHE", "usr/share/doc/linux-quest-host/LICENSE-APACHE", "644"],
 ]
 
 [package.metadata.generate-rpm]
 license = "MIT OR Apache-2.0"
 summary = "Linux Quest 3 VR streaming host and virtual display daemon"
+# Reload udev so the uinput rule applies without a reboot (best effort).
+post_install_script = "udevadm control --reload || true\nudevadm trigger || true"
 assets = [
     { source = "target/release/linux-quest-host", dest = "/usr/bin/linux-quest-host", mode = "755" },
     { source = "packaging/udev/99-uinput.rules", dest = "/usr/lib/udev/rules.d/99-uinput.rules", mode = "644" },
+    { source = "packaging/modules-load/linux-quest.conf", dest = "/usr/lib/modules-load.d/linux-quest.conf", mode = "644" },
+    { source = "packaging/systemd/linux-quest-host.service", dest = "/usr/lib/systemd/user/linux-quest-host.service", mode = "644" },
+    { source = "LICENSE-MIT", dest = "/usr/share/licenses/linux-quest-host/LICENSE-MIT", mode = "644" },
+    { source = "LICENSE-APACHE", dest = "/usr/share/licenses/linux-quest-host/LICENSE-APACHE", mode = "644" },
 ]

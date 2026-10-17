@@ -10,13 +10,14 @@ pkgrel=1
 pkgdesc='Linux Quest 3 VR streaming host and virtual display daemon'
 arch=('x86_64')
 url='https://github.com/Josh-Archer/linux-quest'
-license=('MIT' 'Apache')
+license=('MIT' 'Apache-2.0')
 depends=('gcc-libs' 'glibc')
 makedepends=('cargo')
 optdepends=(
   'wl-clipboard: clipboard sync on Wayland'
   'xclip: clipboard sync on X11'
   'pipewire: screen and audio capture'
+  'nvidia-utils: NVIDIA GPU encoding'
 )
 options=('!lto')
 source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
@@ -38,11 +39,17 @@ build() {
 check() {
   cd "linux-quest-${pkgver}"
   export RUSTUP_TOOLCHAIN=stable
-  cargo test --frozen -p linux-quest-host
+  # Unit tests only: the integration tests depend on host state (display, uinput,
+  # network) and are not reliable in a clean chroot.
+  cargo test --frozen -p linux-quest-host --lib
 }
 
 package() {
   cd "linux-quest-${pkgver}"
   install -Dm755 "target/release/linux-quest-host" "${pkgdir}/usr/bin/linux-quest-host"
   install -Dm644 "packaging/udev/99-uinput.rules" "${pkgdir}/usr/lib/udev/rules.d/99-uinput.rules"
+  install -Dm644 "packaging/modules-load/linux-quest.conf" "${pkgdir}/usr/lib/modules-load.d/linux-quest.conf"
+  install -Dm644 "packaging/systemd/linux-quest-host.service" "${pkgdir}/usr/lib/systemd/user/linux-quest-host.service"
+  install -Dm644 "LICENSE-MIT" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-MIT"
+  install -Dm644 "LICENSE-APACHE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-APACHE"
 }

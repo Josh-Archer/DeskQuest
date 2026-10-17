@@ -1,0 +1,15 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: linux-quest
+Source: https://github.com/Josh-Archer/linux-quest
+
+Files: *
+Copyright: 2026 linux-quest contributors
+License: MIT or Apache-2.0
+
+License: MIT
+ Full text: /usr/share/doc/linux-quest-host/LICENSE-MIT
+
+License: Apache-2.0
+ The complete text of the Apache License, Version 2.0 is in
+ /usr/share/common-licenses/Apache-2.0 and in
+ /usr/share/doc/linux-quest-host/LICENSE-APACHE.
