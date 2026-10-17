@@ -33,20 +33,68 @@
 //! has run on AMD or Intel hardware. The one runtime exercise is probing a
 //! container with no render node, which must fail with a reason rather than panic.
 //!
+//! # Off by default
+//!
+//! This backend has never run on a GPU, so the parts that are most likely to be
+//! wrong are opt-in:
+//!
+//! * AV1 is off. With [`VAAPI_AV1_ENV`] (`LINUX_QUEST_VAAPI_AV1`) unset,
+//!   [`select_encode`] and [`probe`] report AV1 as unsupported before touching the
+//!   driver, so [`crate::probe_backends`], `AutoVideoEncoder` and the host's codec
+//!   planning never choose it.
+//! * Crate-written HEVC VPS/SPS/PPS packed headers are off. With
+//!   [`VAAPI_PACKED_HEADERS_ENV`] (`LINUX_QUEST_VAAPI_PACKED_HEADERS`) unset, the
+//!   driver generates the parameter sets.
+//!
+//! [`VaapiEncoder::new`] reads both variables; [`VaapiEncoder::with_layer`] (used by
+//! tests) never does and has both off.
+//!
 //! # Codecs
 //!
 //! * HEVC Main, EncSliceLP (falls back to EncSlice). Sequence, picture and slice
-//!   buffers per `va_enc_hevc.h`. When the driver accepts packed headers, the VPS,
-//!   SPS and PPS are supplied by this crate (see [`headers`]) and the SPS carries a
-//!   VUI colour description. Otherwise the driver generates the headers and the
-//!   colour is not signalled, which is logged.
+//!   buffers per `va_enc_hevc.h`. Width and height must be multiples of 8 (the
+//!   minimum coding block size); `init` refuses other sizes. With the packed-header
+//!   opt-in and a driver that accepts them, the VPS, SPS and PPS are supplied by this
+//!   crate (see [`headers`]) and the SPS carries a VUI colour description; the SPS
+//!   writer can also emit a conformance window for sizes that are not multiples of 8,
+//!   but the surfaces are not padded, so that path is not reachable from `init`.
 //! * H.264 High (then Main), EncSliceLP (falls back to EncSlice). Sequence, picture
-//!   and slice buffers per `va_enc_h264.h`. Headers are driver-generated, so the
-//!   colour is not signalled.
-//! * AV1 Profile 0, EncSliceLP only. Sequence, picture and tile-group buffers per
-//!   `va_enc_av1.h`. Headers are driver-generated, so the colour is not signalled.
-//!   Unverified: the frame-header bit offsets are left at zero, so a driver that
-//!   needs them to patch headers will fail on hardware.
+//!   and slice buffers per `va_enc_h264.h`. Headers are driver-generated. The
+//!   sequence buffer declares `log2_max_frame_num` and the POC lsb as 8 bits, and sets
+//!   frame cropping when the height or width is not a multiple of 16 (1080 lines are
+//!   coded as 1088 and cropped by 8). `frame_num` is 0 at an IDR and advances only
+//!   after a picture was encoded; references carry `frame_idx` = their `frame_num`,
+//!   `VA_PICTURE_H264_SHORT_TERM_REFERENCE` and their POC; unused slots are
+//!   `VA_PICTURE_H264_INVALID`.
+//! * AV1 Profile 0, EncSliceLP only, opt-in (see above). Sequence, picture and
+//!   tile-group buffers per `va_enc_av1.h`. Fixed here: `order_hint` is masked to the
+//!   7 bits the sequence declares, one tile (`tile_cols` = `tile_rows` = 1) is
+//!   declared, and `max_qp` is the AV1 range (255, not 51). **Still unverified and
+//!   likely wrong**: the packed frame-header bit offsets
+//!   (`bit_offset_qindex`, `bit_offset_loopfilter_params`, `bit_offset_cdef_params`,
+//!   `byte_offset_frame_hdr_obu_size`, `size_in_bits_frame_hdr_obu`) are left at zero,
+//!   so a driver that patches headers from them (Intel's iHD does) will produce a bad
+//!   or rejected stream; the per-frame `ref_frame_ctrl_l0`, `primary_ref_frame` and
+//!   refresh flags, the tile group, and the sequence-level tool flags are also
+//!   unchecked against a decoder.
+//!
+//! # Colour contract
+//!
+//! Frames are converted to NV12 as BT.709 limited range (see [`crate::ColourConfig`]).
+//! Only HEVC with the packed-header opt-in can signal that in the bitstream. H.264
+//! and AV1 (driver-generated headers) and HEVC without the opt-in carry no colour
+//! description, so the decoder must assume BT.709 limited. The Quest MediaCodec
+//! decoder in `crates/client/src/decoder/mediacodec.rs` sets no colour keys on its
+//! `MediaFormat`, so it relies on the stream or on its own default; whether it
+//! assumes BT.709 limited is not verified. A wrong guess shows up as a slight
+//! brightness and saturation error, not as a failure.
+//!
+//! # Rate control
+//!
+//! CBR with a one second window (`window_size` is in milliseconds) and an HRD buffer
+//! of about one second of bits (initially three-quarters full). `max_qp` is 51 for
+//! H.264 and HEVC and 255 for AV1. Whether a driver honours these values for
+//! low-latency streaming is unverified.
 //!
 //! # Intra refresh
 //!
@@ -55,8 +103,11 @@
 //! inter frame carries a `VAEncMiscParameterRIR` that makes one band of macroblock
 //! columns intra, moving across the picture so that a full refresh takes
 //! `intra_refresh_period` frames. Those frames are flagged `is_intra_refresh`.
-//! Otherwise `intra_refresh_period` produces a full non-IDR I-frame every N frames.
-//! Unverified: the macroblock units of the RIR location and the QP delta.
+//! Because nothing confirms that a driver honours the RIR buffer, a full non-IDR
+//! I-frame is still coded every `intra_refresh_period` x [`ROLLING_SAFETY_NET_FACTOR`]
+//! frames. Without rolling refresh, `intra_refresh_period` produces a full I-frame
+//! every N frames. Unverified: the macroblock units of the RIR location and the QP
+//! delta.
 //!
 //! # RGB input
 //!
@@ -64,15 +115,22 @@
 //! NV12 encode input by a `VAEntrypointVideoProc` pipeline. If the driver does not
 //! offer that entrypoint, or the pipeline fails, the frame falls back to the CPU
 //! copy in `RawFrame::data` when one exists. Without a CPU copy it is an error that
-//! names the VPP path. CPU conversion uses the [`crate::ColourConfig`] matrix.
+//! names the VPP path. CPU conversion uses the [`crate::ColourConfig`] matrix. The
+//! CPU path uploads with `vaCreateImage` and `vaPutImage` (so the driver handles any
+//! surface tiling), after checking the image's pitches and size against the frame.
 //!
 //! # Reference picture invalidation
 //!
-//! VA-API has no "invalidate this reference" call. The backend keeps a small DPB
-//! of reconstructed surfaces tagged with their PTS. `invalidate_reference_picture`
-//! marks matching entries unusable, and the next frame references the newest
-//! still-valid entry. If none remain, the next frame is a non-IDR I-frame, which
-//! is a recovery point.
+//! VA-API has no "invalidate this reference" call. The backend keeps a small DPB of
+//! reconstructed surfaces tagged with their PTS. Every inter picture is predicted from
+//! the newest valid entry, so each entry descends from the one before it:
+//! `invalidate_reference_picture(pts)` marks that entry **and every entry encoded after
+//! it** unusable (and, if `pts` is older than everything held, all of them). The DPB
+//! models what the decoder holds: after a picture only its one reference and itself
+//! remain for HEVC, and only itself for H.264 and AV1. So losing the newest picture
+//! falls back to the one before it for HEVC; losing anything older, or any picture on
+//! H.264 or AV1, leaves no clean reference and the next frame is a non-IDR I-frame
+//! (a recovery point). PTS values are assumed to increase in encode order.
 
 pub mod abi;
 pub mod headers;
@@ -89,7 +147,7 @@ use libloading::Library;
 use linux_quest_capture::{DmaBufPlane, PixelFormat, RawFrame};
 use linux_quest_protocol::{VideoChunk, VideoChunkMeta, VideoCodec};
 use thiserror::Error;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{ColourConfig, EncodedFrame, EncoderConfig, EncoderError, VideoEncoder};
 use abi::{
@@ -139,6 +197,9 @@ pub mod consts {
     pub const VA_ENC_PACKED_HEADER_TYPE_PICTURE: u32 = 2;
     pub const VA_ENC_PACKED_HEADER_TYPE_SLICE: u32 = 3;
 
+    /// `VA_LSB_FIRST`: `VAImageFormat.byte_order` for little-endian pixel data.
+    pub const VA_LSB_FIRST: u32 = 1;
+
     pub const VA_ENC_INTRA_REFRESH_NONE: u32 = 0x0000_0000;
     pub const VA_ENC_INTRA_REFRESH_ROLLING_COLUMN: u32 = 0x0000_0001;
     pub const VA_ENC_INTRA_REFRESH_ROLLING_ROW: u32 = 0x0000_0002;
@@ -179,6 +240,8 @@ pub mod consts {
     pub const VA_ENC_MISC_HRD: u32 = 5;
     pub const VA_ENC_MISC_RIR: u32 = 7;
 
+    pub const VA_PICTURE_H264_INVALID: u32 = 0x0000_0001;
+    pub const VA_PICTURE_H264_SHORT_TERM_REFERENCE: u32 = 0x0000_0008;
     pub const VA_PICTURE_HEVC_INVALID: u32 = 0x0000_0001;
     pub const VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE: u32 = 0x0000_0010;
     /// Spec coding types used in `pic_fields.coding_type` (not header macros).
@@ -420,7 +483,21 @@ type DestroyIdFn = unsafe extern "C" fn(*mut c_void, u32) -> c_int;
 type BeginPictureFn = unsafe extern "C" fn(*mut c_void, u32, u32) -> c_int;
 type RenderPictureFn = unsafe extern "C" fn(*mut c_void, u32, *mut u32, c_int) -> c_int;
 type MapBufferFn = unsafe extern "C" fn(*mut c_void, u32, *mut *mut c_void) -> c_int;
-type DeriveImageFn = unsafe extern "C" fn(*mut c_void, u32, *mut VaImage) -> c_int;
+type CreateImageFn =
+    unsafe extern "C" fn(*mut c_void, *mut VaImageFormat, c_int, c_int, *mut VaImage) -> c_int;
+type PutImageFn = unsafe extern "C" fn(
+    *mut c_void,
+    u32,
+    u32,
+    c_int,
+    c_int,
+    u32,
+    u32,
+    c_int,
+    c_int,
+    u32,
+    u32,
+) -> c_int;
 
 struct VaFns {
     get_display_drm: GetDisplayDrmFn,
@@ -446,7 +523,8 @@ struct VaFns {
     sync_surface: DestroyIdFn,
     map_buffer: MapBufferFn,
     unmap_buffer: DestroyIdFn,
-    derive_image: DeriveImageFn,
+    create_image: CreateImageFn,
+    put_image: PutImageFn,
     destroy_image: DestroyIdFn,
 }
 
@@ -506,7 +584,8 @@ impl VaLibs {
                 sync_surface: sym(&va, b"vaSyncSurface\0")?,
                 map_buffer: sym(&va, b"vaMapBuffer\0")?,
                 unmap_buffer: sym(&va, b"vaUnmapBuffer\0")?,
-                derive_image: sym(&va, b"vaDeriveImage\0")?,
+                create_image: sym(&va, b"vaCreateImage\0")?,
+                put_image: sym(&va, b"vaPutImage\0")?,
                 destroy_image: sym(&va, b"vaDestroyImage\0")?,
             }
         };
@@ -1103,29 +1182,56 @@ impl VaLayer for LibVa {
         if nv12.len() < w * h * 3 / 2 {
             return Err(VaError::Invalid("NV12 buffer too small for upload".into()));
         }
+        // vaCreateImage + vaPutImage, not vaDeriveImage: a derived image exposes the
+        // surface's own memory, which is tiled on many drivers, so a row-by-row copy
+        // would write garbage. vaPutImage lets the driver do the (de)tiling.
+        let mut format = VaImageFormat {
+            fourcc: VA_FOURCC_NV12,
+            byte_order: VA_LSB_FIRST,
+            bits_per_pixel: 12,
+            depth: 0,
+            red_mask: 0,
+            green_mask: 0,
+            blue_mask: 0,
+            alpha_mask: 0,
+            reserved: [0; 4],
+        };
         let mut image: VaImage = unsafe { std::mem::zeroed() };
-        // SAFETY: image is a writable VAImage-sized local.
-        check("vaDeriveImage", unsafe {
-            (fns.derive_image)(dpy, surface, &mut image)
+        // SAFETY: format and image are writable locals of the libva struct sizes.
+        check("vaCreateImage", unsafe {
+            (fns.create_image)(
+                dpy,
+                &mut format,
+                width as c_int,
+                height as c_int,
+                &mut image,
+            )
         })?;
         let result = (|| -> Result<(), VaError> {
             if image.format.fourcc != VA_FOURCC_NV12 || image.num_planes < 2 {
                 return Err(VaError::Unsupported(
-                    "vaDeriveImage did not return a two-plane NV12 image".into(),
+                    "vaCreateImage did not return a two-plane NV12 image".into(),
                 ));
             }
-            if (image.width as usize) < w || (image.height as usize) < h {
-                return Err(VaError::Invalid("derived image smaller than frame".into()));
-            }
+            check_nv12_image_bounds(
+                w,
+                h,
+                image.pitches[0] as usize,
+                image.pitches[1] as usize,
+                image.offsets[0] as usize,
+                image.offsets[1] as usize,
+                image.data_size as usize,
+            )?;
             let mut base: *mut c_void = std::ptr::null_mut();
-            // SAFETY: image.buf is a live buffer owned by the derived image.
+            // SAFETY: image.buf is a live buffer owned by the created image.
             check("vaMapBuffer(image)", unsafe {
                 (fns.map_buffer)(dpy, image.buf, &mut base)
             })?;
             let base = base as *mut u8;
             let (y_pitch, uv_pitch) = (image.pitches[0] as usize, image.pitches[1] as usize);
-            // SAFETY: each row write is bounded by the pitch and plane height, which
-            // libva reports for this image; the source rows are bounded by `nv12`.
+            // SAFETY: `check_nv12_image_bounds` proved that every row written below
+            // ends inside `image.data_size` bytes of the mapped buffer; the source
+            // rows are bounded by the length check on `nv12` above.
             unsafe {
                 for row in 0..h {
                     let dst = base.add(image.offsets[0] as usize + row * y_pitch);
@@ -1140,13 +1246,69 @@ impl VaLayer for LibVa {
             // SAFETY: unmapping the buffer mapped above.
             check("vaUnmapBuffer(image)", unsafe {
                 (fns.unmap_buffer)(dpy, image.buf)
+            })?;
+            // SAFETY: surface and image are live on this display.
+            check("vaPutImage", unsafe {
+                (fns.put_image)(
+                    dpy,
+                    surface,
+                    image.image_id,
+                    0,
+                    0,
+                    width,
+                    height,
+                    0,
+                    0,
+                    width,
+                    height,
+                )
             })
         })();
-        // SAFETY: the derived image was created on this display.
+        // SAFETY: the image was created on this display.
         unsafe {
             (fns.destroy_image)(dpy, image.image_id);
         }
         result
+    }
+}
+
+/// Checks that an NV12 `VAImage` with these pitches, offsets and `data_size` can hold
+/// a `w` x `h` frame copied row by row: every row of both planes must start at or
+/// after its plane offset and end inside the mapped buffer.
+fn check_nv12_image_bounds(
+    w: usize,
+    h: usize,
+    y_pitch: usize,
+    uv_pitch: usize,
+    y_offset: usize,
+    uv_offset: usize,
+    data_size: usize,
+) -> Result<(), VaError> {
+    let too_small = |what: &str| {
+        Err(VaError::Invalid(format!(
+            "VA image {what} does not fit {w}x{h} NV12 \
+             (pitches {y_pitch}/{uv_pitch}, offsets {y_offset}/{uv_offset}, size {data_size})"
+        )))
+    };
+    if h == 0 || w == 0 {
+        return Ok(());
+    }
+    if y_pitch < w || uv_pitch < w {
+        return too_small("pitch");
+    }
+    let y_end = (h - 1)
+        .checked_mul(y_pitch)
+        .and_then(|v| v.checked_add(y_offset))
+        .and_then(|v| v.checked_add(w));
+    let uv_rows = h / 2;
+    let uv_end = uv_rows
+        .saturating_sub(1)
+        .checked_mul(uv_pitch)
+        .and_then(|v| v.checked_add(uv_offset))
+        .and_then(|v| v.checked_add(w));
+    match (y_end, uv_end) {
+        (Some(y), Some(uv)) if y <= data_size && uv <= data_size => Ok(()),
+        _ => too_small("data size"),
     }
 }
 
@@ -1167,6 +1329,42 @@ impl Drop for LibVa {
 // ---------------------------------------------------------------------------
 // Capability probing and profile/entrypoint selection (pure, over VaLayer).
 // ---------------------------------------------------------------------------
+
+/// Environment variable that opts in to the AV1 path (`1`, `true`, `yes` or `on`).
+/// Off by default: the AV1 buffers are known to be incomplete (see the module docs).
+pub const VAAPI_AV1_ENV: &str = "LINUX_QUEST_VAAPI_AV1";
+/// Environment variable that opts in to crate-written HEVC VPS/SPS/PPS packed headers
+/// (`1`, `true`, `yes` or `on`). Off by default: until they are verified on hardware
+/// the driver generates the parameter sets.
+pub const VAAPI_PACKED_HEADERS_ENV: &str = "LINUX_QUEST_VAAPI_PACKED_HEADERS";
+
+/// Switches for the parts of this backend that are not trusted yet. Everything is off
+/// by default; [`VaapiOptions::from_env`] reads the opt-in environment variables.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VaapiOptions {
+    /// Offer AV1. When false the backend reports no AV1 capability at all, so
+    /// auto-selection and the host's codec planning never choose it.
+    pub av1: bool,
+    /// Supply HEVC VPS/SPS/PPS as packed headers (with the VUI colour description)
+    /// when the driver accepts them. When false the driver writes the parameter sets.
+    pub packed_headers: bool,
+}
+
+fn env_flag(name: &str) -> bool {
+    matches!(
+        std::env::var(name).as_deref().map(str::trim),
+        Ok("1" | "true" | "TRUE" | "yes" | "on")
+    )
+}
+
+impl VaapiOptions {
+    pub fn from_env() -> Self {
+        Self {
+            av1: env_flag(VAAPI_AV1_ENV),
+            packed_headers: env_flag(VAAPI_PACKED_HEADERS_ENV),
+        }
+    }
+}
 
 /// Result of selecting an encode profile and entrypoint for a codec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1219,10 +1417,18 @@ fn preferred_entrypoints(codec: VideoCodec) -> &'static [c_int] {
 
 /// Selects the profile and entrypoint for `codec` and checks that the driver
 /// can do what this backend needs: 4:2:0 render targets and CBR rate control.
+///
+/// AV1 is refused unless `options.av1` is set, before the driver is even asked.
 pub fn select_encode(
     layer: &mut dyn VaLayer,
     codec: VideoCodec,
+    options: &VaapiOptions,
 ) -> Result<EncodeSelection, VaError> {
+    if codec == VideoCodec::Av1 && !options.av1 {
+        return Err(VaError::Unsupported(format!(
+            "AV1 is disabled for VA-API (experimental, incomplete buffers); set {VAAPI_AV1_ENV}=1 to opt in"
+        )));
+    }
     let profiles = layer.query_profiles()?;
     let profile = candidate_profiles(codec)
         .iter()
@@ -1290,16 +1496,27 @@ pub fn select_encode(
 }
 
 /// Probes a layer for `codec` and reports the vendor and the selected mode.
-pub fn probe_with(layer: &mut dyn VaLayer, codec: VideoCodec) -> Result<ProbeReport, VaError> {
+pub fn probe_with(
+    layer: &mut dyn VaLayer,
+    codec: VideoCodec,
+    options: &VaapiOptions,
+) -> Result<ProbeReport, VaError> {
+    // Refuse a disabled codec before touching the driver.
+    if codec == VideoCodec::Av1 && !options.av1 {
+        return Err(VaError::Unsupported(format!(
+            "AV1 is disabled for VA-API (experimental, incomplete buffers); set {VAAPI_AV1_ENV}=1 to opt in"
+        )));
+    }
     let vendor = layer.open()?;
-    let selection = select_encode(layer, codec)?;
+    let selection = select_encode(layer, codec, options)?;
     Ok(ProbeReport { vendor, selection })
 }
 
-/// Probes the real libva installation for `codec`.
+/// Probes the real libva installation for `codec`, with the options from the
+/// environment. AV1 reports unsupported unless [`VAAPI_AV1_ENV`] is set.
 pub fn probe(codec: VideoCodec) -> Result<ProbeReport, VaError> {
     let mut layer = LibVa::new();
-    probe_with(&mut layer, codec)
+    probe_with(&mut layer, codec, &VaapiOptions::from_env())
 }
 
 // ---------------------------------------------------------------------------
@@ -1480,10 +1697,16 @@ impl Rgb2Yuv {
 // Reference bookkeeping.
 // ---------------------------------------------------------------------------
 
+/// Largest width or height accepted (the HEVC and AV1 parameter buffers hold 16-bit sizes).
+const MAX_DIMENSION: u32 = 16384;
+
 /// Reference picture slots kept by the encoder.
 pub const DPB_CAPACITY: usize = 4;
 /// Reconstruction pool size. One more than the DPB, so a free target always exists.
 pub const RECON_POOL_SIZE: usize = DPB_CAPACITY + 1;
+/// With rolling intra refresh the periodic full I-frame is kept as a safety net, at
+/// this multiple of `intra_refresh_period`.
+pub const ROLLING_SAFETY_NET_FACTOR: u64 = 4;
 /// Number of references each inter frame uses. Low latency means one.
 pub const LOW_LATENCY_REFS: usize = 1;
 
@@ -1492,9 +1715,17 @@ pub struct DpbEntry {
     pub surface: u32,
     pub pts_us: u64,
     pub poc: i32,
+    /// H.264 `frame_num` of the picture (also its `VAPictureH264::frame_idx`).
+    pub frame_num: u32,
+    /// False once this picture, or a picture it was predicted from, was reported lost.
     pub valid: bool,
 }
 
+/// Reference pictures the encoder believes the decoder still holds.
+///
+/// Every inter picture is predicted from the newest valid entry, so each entry
+/// descends from the entries before it. Losing one picture therefore loses every
+/// picture encoded after it, which is how [`Dpb::invalidate`] taints.
 #[derive(Debug, Default)]
 pub struct Dpb {
     entries: VecDeque<DpbEntry>,
@@ -1508,14 +1739,29 @@ impl Dpb {
         }
     }
 
-    /// Marks entries with this PTS unusable. Returns true if any matched.
+    /// Pushes `entry` after encoding it, keeping only the entries in `retain` plus
+    /// the new one. This models the decoder's reference set: a picture's reference
+    /// picture set (HEVC) or sliding window (H.264) lists only what the picture
+    /// referenced, so anything else is gone from the decoder after this picture.
+    pub fn push_retaining(&mut self, entry: DpbEntry, retain: &[u32]) {
+        self.entries.retain(|e| retain.contains(&e.surface));
+        self.push(entry);
+    }
+
+    /// Reports `pts_us` as lost. That entry and every entry encoded after it are
+    /// marked unusable, because each of them was predicted from its predecessor.
+    /// An entry already evicted still counts: if `pts_us` is older than every entry,
+    /// all of them descend from it. Returns true if any entry was marked.
+    ///
+    /// Assumes PTS values increase in encode order.
     pub fn invalidate(&mut self, pts_us: u64) -> bool {
-        let mut hit = false;
-        for e in self.entries.iter_mut().filter(|e| e.pts_us == pts_us) {
+        let Some(first) = self.entries.iter().position(|e| e.pts_us >= pts_us) else {
+            return false;
+        };
+        for e in self.entries.iter_mut().skip(first) {
             e.valid = false;
-            hit = true;
         }
-        hit
+        true
     }
 
     /// Newest-first valid entries, at most `n`.
@@ -1527,6 +1773,11 @@ impl Dpb {
             .take(n)
             .copied()
             .collect()
+    }
+
+    /// The most recently encoded entry, valid or not.
+    pub fn newest(&self) -> Option<&DpbEntry> {
+        self.entries.back()
     }
 
     pub fn holds(&self, surface: u32) -> bool {
@@ -1579,6 +1830,12 @@ struct Session {
     dpb: Dpb,
     frame_counter: u64,
     idr_base: u64,
+    /// Pictures successfully encoded since (and not including) the last IDR was
+    /// started. Zero at an IDR, so H.264 `frame_num` is 0 there; it advances only
+    /// after a picture was encoded, so a failed encode leaves no gap.
+    coded_since_idr: u32,
+    /// IDRs started so far; low 16 bits are `idr_pic_id` (consecutive IDRs differ).
+    idr_count: u32,
     sequence_started: bool,
     cpu_fallback_logged: bool,
     /// Config and context for the RGB-to-NV12 VPP pass, created on first use.
@@ -1590,24 +1847,30 @@ struct Session {
 }
 
 impl Session {
+    /// Destroys in dependency order: the coded buffer, then contexts (the VPP context
+    /// renders into the input surfaces, so it goes before them), then configs, then
+    /// the surfaces.
     fn destroy(&mut self, layer: &mut dyn VaLayer) {
-        let mut surfaces = std::mem::take(&mut self.recon);
-        surfaces.append(&mut self.input);
-        if !surfaces.is_empty() {
-            layer.destroy_surfaces(&surfaces);
-        }
-        if let Some((cfg, ctx)) = self.vpp.take() {
-            layer.destroy_context(ctx);
-            layer.destroy_config(cfg);
-        }
         if let Some(c) = self.coded.take() {
             layer.destroy_buffer(c);
+        }
+        let vpp = self.vpp.take();
+        if let Some((_, ctx)) = vpp {
+            layer.destroy_context(ctx);
         }
         if let Some(ctx) = self.context.take() {
             layer.destroy_context(ctx);
         }
+        if let Some((cfg, _)) = vpp {
+            layer.destroy_config(cfg);
+        }
         if let Some(cfg) = self.config_id.take() {
             layer.destroy_config(cfg);
+        }
+        let mut surfaces = std::mem::take(&mut self.recon);
+        surfaces.append(&mut self.input);
+        if !surfaces.is_empty() {
+            layer.destroy_surfaces(&surfaces);
         }
         self.dpb.clear();
     }
@@ -1650,17 +1913,30 @@ pub struct VaapiEncoder {
     force_keyframe: bool,
     last_rpi_frame: Option<u64>,
     vendor: Option<String>,
+    options: VaapiOptions,
 }
 
 impl VaapiEncoder {
-    /// Encoder over the real libva, loaded lazily on `init`.
+    /// Encoder over the real libva, loaded lazily on `init`. Opt-in features are read
+    /// from the environment ([`VAAPI_AV1_ENV`], [`VAAPI_PACKED_HEADERS_ENV`]).
     pub fn new(config: EncoderConfig) -> Self {
-        Self::with_layer(config, Box::new(LibVa::new()))
+        Self::with_layer_options(config, Box::new(LibVa::new()), VaapiOptions::from_env())
     }
 
-    /// Encoder over an arbitrary layer (used by tests with [`MockVaLayer`]).
+    /// Encoder over an arbitrary layer (used by tests with [`MockVaLayer`]), with
+    /// every opt-in feature off.
     pub fn with_layer(config: EncoderConfig, layer: Box<dyn VaLayer>) -> Self {
+        Self::with_layer_options(config, layer, VaapiOptions::default())
+    }
+
+    /// Encoder over an arbitrary layer with explicit options.
+    pub fn with_layer_options(
+        config: EncoderConfig,
+        layer: Box<dyn VaLayer>,
+        options: VaapiOptions,
+    ) -> Self {
         Self {
+            options,
             layer,
             config,
             session: None,
@@ -1906,6 +2182,16 @@ fn next_input_surface(s: &mut Session) -> Result<u32, EncoderError> {
     Ok(surface)
 }
 
+/// Picture order count of the `n`th picture after an IDR (`n` = 0 at the IDR). H.264
+/// steps by two per frame, the usual convention for frame-coded video; the other
+/// codecs step by one.
+fn picture_poc(codec: VideoCodec, n: u32) -> i32 {
+    match codec {
+        VideoCodec::H264 => (n as i32).wrapping_mul(2),
+        VideoCodec::Hevc | VideoCodec::Av1 => n as i32,
+    }
+}
+
 /// Builds the (buffer type, bytes) list for one picture. Parameter sets come first on
 /// an IDR, then the per-picture buffers, then the rolling intra refresh buffer.
 fn frame_buffers(
@@ -1917,7 +2203,7 @@ fn frame_buffers(
     rir: Option<RirPlan>,
 ) -> Vec<(c_int, Vec<u8>)> {
     let cfg = &s.config;
-    let poc = (s.frame_counter - s.idr_base) as i32;
+    let poc = picture_poc(cfg.codec, s.coded_since_idr);
     let idr = kind == PictureKind::Idr;
     let mut out: Vec<(c_int, Vec<u8>)> = Vec::new();
     if idr {
@@ -1929,9 +2215,15 @@ fn frame_buffers(
             out.push((VA_BUF_ENC_PACKED_HEADER_DATA, p.bytes.clone()));
         }
     }
-    let rc = rate_control_misc(cfg.bitrate_kbps, cfg.fps);
+    // H.264 and HEVC QP tops out at 51; AV1 quantizer indices go to 255.
+    let max_qp = if cfg.codec == VideoCodec::Av1 {
+        abi::AV1_MAX_QINDEX as u32
+    } else {
+        abi::AVC_HEVC_MAX_QP
+    };
+    let rc = rate_control_misc(cfg.bitrate_kbps, max_qp);
     let fr = frame_rate_misc(cfg.fps);
-    let hrd = hrd_misc(cfg.bitrate_kbps, cfg.fps);
+    let hrd = hrd_misc(cfg.bitrate_kbps);
     // use_128x128_superblock is set in the AV1 sequence, so superblocks are 128 luma samples.
     let sb = 128u32;
     match cfg.codec {
@@ -2009,6 +2301,8 @@ fn frame_buffers(
         }
         VideoCodec::H264 => {
             if idr {
+                // 1080-line pictures are coded as 1088 and cropped back.
+                let (crop_right, crop_bottom) = H264SeqParams::crop_for(cfg.width, cfg.height);
                 out.push((
                     VA_BUF_ENC_SEQ,
                     H264SeqParams {
@@ -2020,6 +2314,8 @@ fn frame_buffers(
                         max_num_ref_frames: 1,
                         width_mbs: cfg.width.div_ceil(16) as u16,
                         height_mbs: cfg.height.div_ceil(16) as u16,
+                        crop_right,
+                        crop_bottom,
                     }
                     .to_bytes(),
                 ));
@@ -2031,18 +2327,18 @@ fn frame_buffers(
                     rir_misc(plan.column, plan.location, plan.insert_size),
                 ));
             }
-            let frame_num = (s.frame_counter % 256) as u16;
+            // frame_num is 0 at an IDR and counts successfully coded pictures after it
+            // (every picture is a reference), wrapping at 2^log2_max_frame_num.
+            let frame_num = s.coded_since_idr % (1 << abi::H264_LOG2_MAX_FRAME_NUM);
             let mut ref_list = Vec::new();
             for e in refs.iter().take(1) {
-                ref_list.push(abi::h264_picture_bytes(e.surface, e.poc as u32 & 0xff));
+                // frame_idx of a reference is its frame_num.
+                ref_list.push(abi::h264_reference_picture(e.surface, e.frame_num, e.poc));
             }
-            let curr = abi::h264_picture_bytes(recon, poc as u32 & 0xff);
-            let mut reference_frames = [[0u8; abi::h264_picture::SIZE]; 16];
-            for (slot, bytes) in reference_frames.iter_mut().zip(ref_list.iter()) {
-                *slot = *bytes;
-            }
-            for slot in reference_frames.iter_mut().skip(ref_list.len()) {
-                *slot = abi::h264_picture_bytes(VA_INVALID_ID, 0);
+            let curr = abi::h264_reference_picture(recon, frame_num, poc);
+            let mut reference_frames = [abi::h264_invalid_picture(); 16];
+            for (slot, r) in reference_frames.iter_mut().zip(ref_list.iter()) {
+                *slot = *r;
             }
             out.push((
                 VA_BUF_ENC_PIC,
@@ -2050,7 +2346,7 @@ fn frame_buffers(
                     curr_pic: curr,
                     reference_frames,
                     coded_buf: coded,
-                    frame_num,
+                    frame_num: frame_num as u16,
                     idr,
                     reference_pic: true,
                     num_ref_idx_l0_active_minus1: ref_list.len().max(1).saturating_sub(1) as u8,
@@ -2062,8 +2358,9 @@ fn frame_buffers(
                 H264SliceParams {
                     num_macroblocks: cfg.width.div_ceil(16) * cfg.height.div_ceil(16),
                     slice_type: if kind.is_intra() { 2 } else { 0 },
-                    idr_pic_id: 0,
-                    pic_order_cnt_lsb: (poc as u32 & 0xff) as u16,
+                    idr_pic_id: (s.idr_count & 0xffff) as u16,
+                    pic_order_cnt_lsb: (poc as u32 & ((1 << abi::H264_LOG2_MAX_POC_LSB) - 1))
+                        as u16,
                     num_ref_idx_l0_active_minus1: ref_list.len().max(1).saturating_sub(1) as u8,
                     ref_pic_list0: ref_list,
                 }
@@ -2112,7 +2409,7 @@ fn frame_buffers(
                         abi::AV1_INTER_FRAME
                     },
                     refresh_frame_flags: if key { 0xff } else { 0x01 },
-                    order_hint: (poc as u32 & 0xff) as u8,
+                    order_hint: (poc as u32 & abi::AV1_ORDER_HINT_MASK) as u8,
                     primary_ref_frame: if key { 7 } else { 0 },
                     base_qindex: 100,
                     width_in_sbs: cfg.width.div_ceil(sb) as u16,
@@ -2192,11 +2489,21 @@ fn encode_on_session(
     s.frame_counter += 1;
     let frame_index = s.frame_counter;
     let period = s.config.intra_refresh_period as u64;
+    // Without a working rolling refresh a full I-frame every `period` frames bounds
+    // how long a loss can persist. With rolling refresh the same I-frame is kept as a
+    // slower safety net, because nothing has confirmed that the driver honours the RIR
+    // buffer.
+    let periodic = if s.rolling_refresh.is_some() {
+        period.saturating_mul(ROLLING_SAFETY_NET_FACTOR)
+    } else {
+        period
+    };
     let kind = if force_idr || !s.sequence_started {
         PictureKind::Idr
     } else if s.dpb.valid_refs(LOW_LATENCY_REFS).is_empty() {
+        // Every reference was reported lost or descends from a lost picture.
         PictureKind::Recovery
-    } else if s.rolling_refresh.is_none() && period > 0 && frame_index.is_multiple_of(period) {
+    } else if periodic > 0 && frame_index.is_multiple_of(periodic) {
         PictureKind::IntraRefresh
     } else {
         PictureKind::Inter
@@ -2204,6 +2511,8 @@ fn encode_on_session(
     if kind == PictureKind::Idr {
         s.dpb.clear();
         s.idr_base = frame_index;
+        s.coded_since_idr = 0;
+        s.idr_count = s.idr_count.wrapping_add(1);
     }
     let refs = if kind == PictureKind::Inter {
         s.dpb.valid_refs(LOW_LATENCY_REFS)
@@ -2235,13 +2544,22 @@ fn encode_on_session(
     if kind == PictureKind::Idr {
         s.sequence_started = true;
     }
-    let poc = (frame_index - s.idr_base) as i32;
-    s.dpb.push(DpbEntry {
+    let entry = DpbEntry {
         surface: recon,
         pts_us: frame.pts_us,
-        poc,
+        poc: picture_poc(s.config.codec, s.coded_since_idr),
+        frame_num: s.coded_since_idr % (1 << abi::H264_LOG2_MAX_FRAME_NUM),
         valid: true,
-    });
+    };
+    // HEVC's reference picture set lists the one reference this picture used, so the
+    // decoder keeps that picture and this one. H.264 (sliding window over one
+    // reference frame) and AV1 (slot 0 refreshed) keep only the newest picture.
+    let retained: Vec<u32> = match (s.config.codec, refs.first()) {
+        (VideoCodec::Hevc, Some(r)) => vec![r.surface],
+        _ => Vec::new(),
+    };
+    s.dpb.push_retaining(entry, &retained);
+    s.coded_since_idr += 1;
     Ok((kind, frame_index, payload))
 }
 
@@ -2290,8 +2608,32 @@ impl VideoEncoder for VaapiEncoder {
                 config.width, config.height
             )));
         }
+        if config.width > MAX_DIMENSION || config.height > MAX_DIMENSION {
+            return Err(EncoderError::InitFailed(format!(
+                "VA-API sizes are limited to {MAX_DIMENSION} per side, got {}x{}",
+                config.width, config.height
+            )));
+        }
+        // The parameter buffers carry the coded size, and HEVC codes whole minimum
+        // coding blocks. The crate-written SPS can crop with a conformance window
+        // (`headers::hevc_coded_size`), but the surfaces and input upload are not
+        // padded to the coded size, so an unaligned size is refused instead of
+        // encoding a picture whose size disagrees with the surfaces.
+        if config.codec == VideoCodec::Hevc
+            && (!config.width.is_multiple_of(headers::HEVC_MIN_CB_SIZE)
+                || !config.height.is_multiple_of(headers::HEVC_MIN_CB_SIZE))
+        {
+            return Err(EncoderError::InitFailed(format!(
+                "VA-API HEVC needs width and height that are multiples of {} (the minimum \
+                 coding block size), got {}x{}",
+                headers::HEVC_MIN_CB_SIZE,
+                config.width,
+                config.height
+            )));
+        }
         let vendor = self.layer.open().map_err(to_init)?;
-        let selection = select_encode(self.layer.as_mut(), config.codec).map_err(to_init)?;
+        let selection =
+            select_encode(self.layer.as_mut(), config.codec, &self.options).map_err(to_init)?;
 
         // Rolling intra refresh needs the driver to offer it and a non-zero period.
         let rolling_refresh = if selection.intra_refresh != 0 && config.intra_refresh_period > 0 {
@@ -2300,13 +2642,21 @@ impl VideoEncoder for VaapiEncoder {
             None
         };
 
-        // HEVC colour signalling needs the packed VPS/SPS/PPS, so it is only requested
-        // when the driver takes both packed sequence and picture headers.
+        // HEVC colour signalling needs the packed VPS/SPS/PPS. They are opt-in
+        // (`VaapiOptions::packed_headers`) because they have not been decoded from a
+        // real encoder yet, and they are only requested when the driver takes both
+        // packed sequence and picture headers.
         let both = VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE;
         let mut packed = Vec::new();
         let mut packed_request = VA_ENC_PACKED_HEADER_NONE;
         if config.codec == VideoCodec::Hevc && config.colour.signal {
-            if selection.packed_headers & both == both {
+            if !self.options.packed_headers {
+                info!(
+                    "VA-API HEVC: the driver writes the parameter sets and the colour \
+                     description is not signalled (crate-written packed headers are opt-in: \
+                     set {VAAPI_PACKED_HEADERS_ENV}=1)"
+                );
+            } else if selection.packed_headers & both == both {
                 packed = headers::hevc_parameter_sets(&config)
                     .into_iter()
                     .map(|(header_type, bytes)| PackedHeader { header_type, bytes })
@@ -2429,6 +2779,9 @@ pub enum VaCall {
     ReadCoded { buffer: u32 },
     DestroySurfaces { count: usize },
     DestroyBuffer { buffer: u32 },
+    CreateConfig { attribs: Vec<(c_int, u32)> },
+    DestroyContext { context: u32 },
+    DestroyConfig { config: u32 },
 }
 
 /// Scripted driver state behind [`MockVaLayer`]. Tests read `calls` and `params`.
@@ -2448,6 +2801,8 @@ pub struct MockVaState {
     /// Every parameter buffer ever created: id -> (kind, bytes).
     pub params: BTreeMap<u32, (c_int, Vec<u8>)>,
     pub rendered: Vec<Vec<u32>>,
+    /// Number of upcoming `end_picture` calls that fail.
+    pub fail_end_picture: u32,
     next_id: u32,
 }
 
@@ -2588,12 +2943,19 @@ impl VaLayer for MockVaLayer {
         &mut self,
         _profile: c_int,
         _entrypoint: c_int,
-        _attribs: &[AttribValue],
+        attribs: &[AttribValue],
     ) -> Result<u32, VaError> {
-        Ok(self.with(|s| s.id()))
+        Ok(self.with(|s| {
+            s.calls.push(VaCall::CreateConfig {
+                attribs: attribs.iter().map(|a| (a.attrib_type, a.value)).collect(),
+            });
+            s.id()
+        }))
     }
 
-    fn destroy_config(&mut self, _config: u32) {}
+    fn destroy_config(&mut self, config: u32) {
+        self.with(|s| s.calls.push(VaCall::DestroyConfig { config }));
+    }
 
     fn create_surfaces(&mut self, _w: u32, _h: u32, count: u32) -> Result<Vec<u32>, VaError> {
         Ok(self.with(|s| (0..count).map(|_| s.id()).collect()))
@@ -2641,7 +3003,9 @@ impl VaLayer for MockVaLayer {
         Ok(self.with(|s| s.id()))
     }
 
-    fn destroy_context(&mut self, _context: u32) {}
+    fn destroy_context(&mut self, context: u32) {
+        self.with(|s| s.calls.push(VaCall::DestroyContext { context }));
+    }
 
     fn create_param_buffer(
         &mut self,
@@ -2680,8 +3044,14 @@ impl VaLayer for MockVaLayer {
     }
 
     fn end_picture(&mut self, _context: u32) -> Result<(), VaError> {
-        self.with(|s| s.calls.push(VaCall::End));
-        Ok(())
+        self.with(|s| {
+            s.calls.push(VaCall::End);
+            if s.fail_end_picture > 0 {
+                s.fail_end_picture -= 1;
+                return Err(VaError::Invalid("mock end_picture failure".into()));
+            }
+            Ok(())
+        })
     }
 
     fn sync_surface(&mut self, surface: u32) -> Result<(), VaError> {

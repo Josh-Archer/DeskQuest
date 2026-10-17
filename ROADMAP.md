@@ -66,7 +66,7 @@ This roadmap outlines the development trajectory of `linux-quest` from initial a
 ---
 
 ## Phase 2: Linux Capture & Hardware Encoding Engine
-> Status: PipeWire/DMA-BUF capture and NVENC (incl. intra-refresh, RPI) done. VA-API backend (HEVC, H.264, AV1, rolling intra refresh, VPP colour conversion) implemented but unverified on AMD/Intel hardware; the stream codec is not yet negotiated per client, and the daemon does not run a video session yet ([#28](https://github.com/Josh-Archer/linux-quest/issues/28)).
+> Status: PipeWire/DMA-BUF capture and NVENC (incl. intra-refresh, RPI) done. VA-API backend (HEVC, H.264, rolling intra refresh, VPP colour conversion; AV1 opt-in) implemented as a scaffold, unverified on AMD/Intel hardware; the stream codec is not yet negotiated per client, and the daemon does not run a video session yet ([#28](https://github.com/Josh-Archer/linux-quest/issues/28)).
 
 *Objective: Build a zero-copy capture pipeline on Linux capable of 4K @ 90Hz/120Hz with minimal CPU overhead.*
 

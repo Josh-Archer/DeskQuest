@@ -34,7 +34,8 @@ pub enum EncoderError {
 ///
 /// Values are ITU-T H.273 code points. The default is BT.709 with limited (video)
 /// range, which is what HD content and most decoders expect. The HEVC VA-API path
-/// signals this in the VUI when the driver accepts packed parameter sets; see the
+/// signals this in the VUI only when crate-written packed parameter sets are opted
+/// in to and the driver accepts them; otherwise nothing is signalled. See the
 /// `vaapi` module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ColourConfig {

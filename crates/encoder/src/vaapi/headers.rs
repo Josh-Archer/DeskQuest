@@ -149,9 +149,28 @@ pub fn vps_rbsp() -> Vec<u8> {
     w.trailing()
 }
 
+/// Minimum luma coding block size of the SPS this module writes (8x8). HEVC requires
+/// the coded picture size to be a multiple of it.
+pub const HEVC_MIN_CB_SIZE: u32 = 8;
+
+/// Coded picture size for a `width` x `height` display size: each side rounded up to
+/// [`HEVC_MIN_CB_SIZE`]. The SPS carries a conformance window that crops back to the
+/// display size.
+pub fn hevc_coded_size(width: u32, height: u32) -> (u32, u32) {
+    (
+        width.next_multiple_of(HEVC_MIN_CB_SIZE),
+        height.next_multiple_of(HEVC_MIN_CB_SIZE),
+    )
+}
+
 /// Sequence parameter set for `config`, with a VUI colour description when
-/// `config.colour.signal` is set.
+/// `config.colour.signal` is set. When the display size is not a multiple of the
+/// minimum coding block size, the SPS codes the rounded-up size and a conformance
+/// window crops it back (offsets are in chroma units: 2 luma samples for 4:2:0).
 pub fn sps_rbsp(config: &EncoderConfig) -> Vec<u8> {
+    let (coded_w, coded_h) = hevc_coded_size(config.width, config.height);
+    let crop_right = (coded_w - config.width) / 2;
+    let crop_bottom = (coded_h - config.height) / 2;
     let mut w = BitWriter::new();
     w.u(4, 0) // sps_video_parameter_set_id
         .u(3, 0) // sps_max_sub_layers_minus1
@@ -159,10 +178,18 @@ pub fn sps_rbsp(config: &EncoderConfig) -> Vec<u8> {
     profile_tier_level(&mut w);
     w.ue(0) // sps_seq_parameter_set_id
         .ue(1) // chroma_format_idc: 4:2:0
-        .ue(config.width) // pic_width_in_luma_samples
-        .ue(config.height) // pic_height_in_luma_samples
-        .flag(false) // conformance_window_flag
-        .ue(0) // bit_depth_luma_minus8
+        .ue(coded_w) // pic_width_in_luma_samples
+        .ue(coded_h); // pic_height_in_luma_samples
+    if crop_right != 0 || crop_bottom != 0 {
+        w.flag(true) // conformance_window_flag
+            .ue(0) // conf_win_left_offset
+            .ue(crop_right) // conf_win_right_offset
+            .ue(0) // conf_win_top_offset
+            .ue(crop_bottom); // conf_win_bottom_offset
+    } else {
+        w.flag(false); // conformance_window_flag
+    }
+    w.ue(0) // bit_depth_luma_minus8
         .ue(0) // bit_depth_chroma_minus8
         .ue(4) // log2_max_pic_order_cnt_lsb_minus4 (8-bit POC lsb)
         .flag(true) // sps_sub_layer_ordering_info_present_flag
@@ -324,6 +351,134 @@ mod tests {
             .flat_map(|(_, b)| b)
             .collect();
         std::fs::write(path, bytes).expect("write parameter sets");
+    }
+
+    /// MSB-first bit reader over an RBSP, written independently of `BitWriter`.
+    struct BitReader<'a> {
+        data: &'a [u8],
+        pos: usize,
+    }
+
+    impl<'a> BitReader<'a> {
+        fn bit(&mut self) -> u32 {
+            let b = (self.data[self.pos / 8] >> (7 - self.pos % 8)) & 1;
+            self.pos += 1;
+            b as u32
+        }
+        fn bits(&mut self, n: u32) -> u32 {
+            (0..n).fold(0, |acc, _| (acc << 1) | self.bit())
+        }
+        fn ue(&mut self) -> u32 {
+            let mut zeros = 0;
+            while self.bit() == 0 {
+                zeros += 1;
+            }
+            (1 << zeros) - 1 + self.bits(zeros)
+        }
+    }
+
+    /// (coded width, coded height, conformance window as left/right/top/bottom) read
+    /// back from an SPS RBSP.
+    fn parse_sps_size(rbsp: &[u8]) -> (u32, u32, Option<[u32; 4]>) {
+        let mut r = BitReader { data: rbsp, pos: 0 };
+        r.bits(4 + 3 + 1); // vps id, max sub layers, temporal id nesting
+        r.bits(2 + 1 + 5); // profile space, tier, profile idc
+        r.bits(32); // compatibility flags
+        r.bits(4); // progressive, interlaced, non-packed, frame-only
+        r.bits(32);
+        r.bits(12); // 43 constraint bits + 1 reserved
+        r.bits(8); // level idc
+        assert_eq!(r.ue(), 0, "sps id");
+        assert_eq!(r.ue(), 1, "4:2:0");
+        let (w, h) = (r.ue(), r.ue());
+        let window = (r.bit() == 1).then(|| [r.ue(), r.ue(), r.ue(), r.ue()]);
+        (w, h, window)
+    }
+
+    fn cfg_size(width: u32, height: u32) -> EncoderConfig {
+        EncoderConfig {
+            width,
+            height,
+            ..EncoderConfig::default()
+        }
+    }
+
+    #[test]
+    fn sps_round_trips_sizes_that_are_multiples_of_the_min_cb() {
+        for (w, h) in [(1920, 1080), (1280, 720), (3840, 2160)] {
+            let (cw, ch, window) = parse_sps_size(&sps_rbsp(&cfg_size(w, h)));
+            assert_eq!((cw, ch, window), (w, h, None), "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn sps_conformance_window_crops_1366x768_back_to_the_display_size() {
+        let (cw, ch, window) = parse_sps_size(&sps_rbsp(&cfg_size(1366, 768)));
+        assert_eq!(
+            (cw, ch),
+            (1368, 768),
+            "coded width rounds up to a multiple of 8"
+        );
+        // 2 columns cropped = 1 chroma unit on the right; no rows cropped.
+        assert_eq!(window, Some([0, 1, 0, 0]));
+        assert_eq!(cw - 2 * window.unwrap()[1], 1366);
+    }
+
+    /// Value of a syntax element in ffmpeg's `trace_headers` output, which prints
+    /// `name  <bits> = <value>` per element.
+    fn trace_value(log: &str, name: &str) -> Option<i64> {
+        log.lines().find_map(|l| {
+            let (left, value) = l.rsplit_once(" = ")?;
+            (left.split_whitespace().nth(4) == Some(name))
+                .then(|| value.trim().parse().ok())
+                .flatten()
+        })
+    }
+
+    /// Cross-check with ffmpeg's `trace_headers` bitstream filter, which parses the
+    /// SPS with its own code. Skipped when ffmpeg is not installed.
+    #[test]
+    fn ffmpeg_trace_headers_agrees_on_the_coded_size_and_window() {
+        use std::process::Command;
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            eprintln!("ffmpeg not installed; skipping the independent SPS parse");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("lq-sps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // (display size, coded size, conformance window right/bottom offsets)
+        let cases = [
+            ((1366u32, 768u32), (1368i64, 768i64), (1i64, 0i64)),
+            ((1920, 1080), (1920, 1080), (0, 0)),
+            ((1280, 722), (1280, 728), (0, 3)),
+        ];
+        for ((w, h), (cw, ch), (right, bottom)) in cases {
+            let stream: Vec<u8> = hevc_parameter_sets(&cfg_size(w, h))
+                .into_iter()
+                .flat_map(|(_, b)| b)
+                .collect();
+            let path = dir.join(format!("{w}x{h}.h265"));
+            std::fs::write(&path, stream).unwrap();
+            let out = Command::new("ffmpeg")
+                .args(["-v", "trace", "-f", "hevc", "-i"])
+                .arg(&path)
+                .args(["-c", "copy", "-bsf:v", "trace_headers", "-f", "null", "-"])
+                .output()
+                .expect("run ffmpeg");
+            let log = String::from_utf8_lossy(&out.stderr).to_string();
+            let get = |name: &str| trace_value(&log, name);
+            assert_eq!(get("pic_width_in_luma_samples"), Some(cw), "{w}x{h}\n{log}");
+            assert_eq!(get("pic_height_in_luma_samples"), Some(ch), "{w}x{h}");
+            let flag = i64::from(right != 0 || bottom != 0);
+            assert_eq!(get("conformance_window_flag"), Some(flag), "{w}x{h}");
+            if flag == 1 {
+                assert_eq!(get("conf_win_left_offset"), Some(0));
+                assert_eq!(get("conf_win_right_offset"), Some(right), "{w}x{h}");
+                assert_eq!(get("conf_win_top_offset"), Some(0));
+                assert_eq!(get("conf_win_bottom_offset"), Some(bottom), "{w}x{h}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

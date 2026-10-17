@@ -12,6 +12,20 @@ use linux_quest_capture::DmaBufPlane;
 
 type Shared = Arc<Mutex<MockVaState>>;
 
+/// Default options: every opt-in feature off.
+const OFF: VaapiOptions = VaapiOptions {
+    av1: false,
+    packed_headers: false,
+};
+const AV1_ON: VaapiOptions = VaapiOptions {
+    av1: true,
+    packed_headers: false,
+};
+const PACKED_ON: VaapiOptions = VaapiOptions {
+    av1: false,
+    packed_headers: true,
+};
+
 fn cfg(codec: VideoCodec, refresh: u32) -> EncoderConfig {
     EncoderConfig {
         codec,
@@ -128,7 +142,7 @@ fn count_calls(st: &MockVaState, pred: impl Fn(&VaCall) -> bool) -> usize {
 #[test]
 fn hevc_prefers_lp_and_requires_cbr() {
     let (_s, mut layer) = mock(MockVaState::hevc_lp());
-    let report = probe_with(layer.as_mut(), VideoCodec::Hevc).expect("probe");
+    let report = probe_with(layer.as_mut(), VideoCodec::Hevc, &OFF).expect("probe");
     assert_eq!(report.vendor, "mock-vendor");
     assert_eq!(report.selection.profile, VA_PROFILE_HEVC_MAIN);
     assert_eq!(report.selection.entrypoint, VA_ENTRYPOINT_ENC_SLICE_LP);
@@ -140,7 +154,7 @@ fn hevc_prefers_lp_and_requires_cbr() {
 fn hevc_uses_full_slice_when_lp_missing() {
     let st = MockVaState::with_codec(VA_PROFILE_HEVC_MAIN, &[VA_ENTRYPOINT_ENC_SLICE]);
     let (_s, mut layer) = mock(st);
-    let sel = select_encode(layer.as_mut(), VideoCodec::Hevc).expect("select");
+    let sel = select_encode(layer.as_mut(), VideoCodec::Hevc, &OFF).expect("select");
     assert_eq!(sel.entrypoint, VA_ENTRYPOINT_ENC_SLICE);
 }
 
@@ -156,7 +170,7 @@ fn hevc_rejects_driver_without_cbr() {
         0x1, // CQP only
     );
     let (_s, mut layer) = mock(st);
-    let err = select_encode(layer.as_mut(), VideoCodec::Hevc).unwrap_err();
+    let err = select_encode(layer.as_mut(), VideoCodec::Hevc, &OFF).unwrap_err();
     assert!(err.to_string().contains("constant-bitrate"), "{err}");
 }
 
@@ -166,7 +180,7 @@ fn hevc_rejects_missing_profile() {
     st.profiles.clear();
     let (_s, mut layer) = mock(st);
     assert!(matches!(
-        select_encode(layer.as_mut(), VideoCodec::Hevc),
+        select_encode(layer.as_mut(), VideoCodec::Hevc, &OFF),
         Err(VaError::Unsupported(_))
     ));
 }
@@ -175,13 +189,13 @@ fn hevc_rejects_missing_profile() {
 fn av1_is_lp_only() {
     let st = MockVaState::with_codec(VA_PROFILE_AV1_PROFILE0, &[VA_ENTRYPOINT_ENC_SLICE_LP]);
     let (_s, mut layer) = mock(st);
-    let sel = select_encode(layer.as_mut(), VideoCodec::Av1).expect("AV1 LP selects");
+    let sel = select_encode(layer.as_mut(), VideoCodec::Av1, &AV1_ON).expect("AV1 LP selects");
     assert_eq!(sel.profile, VA_PROFILE_AV1_PROFILE0);
     assert_eq!(sel.entrypoint, VA_ENTRYPOINT_ENC_SLICE_LP);
 
     let st = MockVaState::with_codec(VA_PROFILE_AV1_PROFILE0, &[VA_ENTRYPOINT_ENC_SLICE]);
     let (_s, mut layer) = mock(st);
-    let err = select_encode(layer.as_mut(), VideoCodec::Av1).unwrap_err();
+    let err = select_encode(layer.as_mut(), VideoCodec::Av1, &AV1_ON).unwrap_err();
     assert!(
         err.to_string().contains("no usable encode entrypoint"),
         "{err}"
@@ -193,7 +207,7 @@ fn h264_prefers_high_profile_then_main() {
     let st = MockVaState::with_codec(VA_PROFILE_H264_HIGH, &[VA_ENTRYPOINT_ENC_SLICE_LP]);
     let (_s, mut layer) = mock(st);
     assert_eq!(
-        select_encode(layer.as_mut(), VideoCodec::H264)
+        select_encode(layer.as_mut(), VideoCodec::H264, &OFF)
             .unwrap()
             .profile,
         VA_PROFILE_H264_HIGH
@@ -201,7 +215,7 @@ fn h264_prefers_high_profile_then_main() {
 
     let st = MockVaState::with_codec(VA_PROFILE_H264_MAIN, &[VA_ENTRYPOINT_ENC_SLICE]);
     let (_s, mut layer) = mock(st);
-    let sel = select_encode(layer.as_mut(), VideoCodec::H264).expect("main profile");
+    let sel = select_encode(layer.as_mut(), VideoCodec::H264, &OFF).expect("main profile");
     assert_eq!(sel.profile, VA_PROFILE_H264_MAIN);
     assert_eq!(sel.entrypoint, VA_ENTRYPOINT_ENC_SLICE);
 }
@@ -212,7 +226,7 @@ fn selection_reports_intra_refresh_and_vpp() {
         .with_intra_refresh(VA_ENC_INTRA_REFRESH_ROLLING_COLUMN)
         .with_vpp();
     let (_s, mut layer) = mock(st);
-    let sel = select_encode(layer.as_mut(), VideoCodec::Hevc).unwrap();
+    let sel = select_encode(layer.as_mut(), VideoCodec::Hevc, &OFF).unwrap();
     assert_eq!(sel.intra_refresh, VA_ENC_INTRA_REFRESH_ROLLING_COLUMN);
     assert!(sel.vpp);
 }
@@ -308,7 +322,7 @@ async fn hevc_packed_parameter_sets_precede_the_idr_when_driver_accepts_them() {
     let st = MockVaState::hevc_lp()
         .with_packed_headers(VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE);
     let (shared, layer) = mock(st);
-    let mut enc = VaapiEncoder::with_layer(cfg(VideoCodec::Hevc, 0), layer);
+    let mut enc = VaapiEncoder::with_layer_options(cfg(VideoCodec::Hevc, 0), layer, PACKED_ON);
     enc.init(cfg(VideoCodec::Hevc, 0)).await.unwrap();
     enc.encode(&bgra(1280, 720, 1, [0; 4])).await.unwrap();
     let st = shared.lock().unwrap();
@@ -360,7 +374,7 @@ async fn hevc_without_packed_headers_colour_is_not_signalled_but_still_encodes()
 async fn av1_and_h264_buffers_have_the_verified_sizes() {
     let st = MockVaState::with_codec(VA_PROFILE_AV1_PROFILE0, &[VA_ENTRYPOINT_ENC_SLICE_LP]);
     let (shared, layer) = mock(st);
-    let mut enc = VaapiEncoder::with_layer(cfg(VideoCodec::Av1, 0), layer);
+    let mut enc = VaapiEncoder::with_layer_options(cfg(VideoCodec::Av1, 0), layer, AV1_ON);
     enc.init(cfg(VideoCodec::Av1, 0)).await.unwrap();
     enc.encode(&bgra(1280, 720, 1, [0; 4])).await.unwrap();
     {
@@ -734,55 +748,690 @@ async fn encode_before_init_is_an_error_not_a_panic() {
     assert!(enc.encode(&bgra(1280, 720, 1, [0; 4])).await.is_err());
 }
 
-#[tokio::test]
-async fn invalidated_newest_reference_falls_back_to_older_valid_one() {
-    let (shared, layer) = mock(MockVaState::hevc_lp());
-    let mut enc = VaapiEncoder::with_layer(cfg(VideoCodec::Hevc, 0), layer);
-    enc.init(cfg(VideoCodec::Hevc, 0)).await.unwrap();
-    enc.encode(&bgra(1280, 720, 10, [0; 4])).await.unwrap(); // IDR, pts 10
-    enc.encode(&bgra(1280, 720, 20, [0; 4])).await.unwrap(); // P, pts 20
-    enc.invalidate_reference_picture(20);
-    // The next frame references the newest valid picture, which is the IDR.
-    let next = enc.encode(&bgra(1280, 720, 30, [0; 4])).await.unwrap();
-    assert!(!next.is_keyframe);
-    assert_eq!(enc.last_rpi_frame(), Some(20));
+/// Config with an explicit picture size.
+fn cfg_sz(codec: VideoCodec, refresh: u32, width: u32, height: u32) -> EncoderConfig {
+    EncoderConfig {
+        width,
+        height,
+        ..cfg(codec, refresh)
+    }
+}
+
+/// What the encoder submitted for one HEVC picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HevcPicture {
+    /// The reconstruction surface of this picture.
+    recon: u32,
+    /// First reference list entry (`VA_INVALID_ID` for intra pictures).
+    ref0: u32,
+    /// Whether the encoder flagged the frame as a keyframe (IDR or recovery).
+    keyframe: bool,
+    picture_type: u32,
+}
+
+async fn encode_hevc(
+    enc: &mut VaapiEncoder,
+    shared: &Shared,
+    width: u32,
+    height: u32,
+    pts: u64,
+) -> HevcPicture {
+    let f = enc
+        .encode(&bgra(width, height, pts, [0; 4]))
+        .await
+        .expect("encode");
     let st = shared.lock().unwrap();
     let pic = last_param(&st, VA_BUF_ENC_PIC);
-    let refs = u32_at(&pic, hevc_pic::REFERENCE_FRAMES + hevc_picture::PICTURE_ID);
-    assert_ne!(refs, VA_INVALID_ID);
+    HevcPicture {
+        recon: u32_at(&pic, hevc_pic::DECODED_CURR_PIC + hevc_picture::PICTURE_ID),
+        ref0: u32_at(&pic, hevc_pic::REFERENCE_FRAMES + hevc_picture::PICTURE_ID),
+        keyframe: f.is_keyframe,
+        picture_type: f.picture_type,
+    }
+}
+
+/// An initialised small HEVC encoder that has coded an IDR at pts 10 and P pictures
+/// at 20, 30 and 40 (each predicted from the one before).
+async fn hevc_chain() -> (VaapiEncoder, Shared, Vec<HevcPicture>) {
+    let (shared, layer) = mock(MockVaState::hevc_lp());
+    let c = cfg_sz(VideoCodec::Hevc, 0, 256, 128);
+    let mut enc = VaapiEncoder::with_layer(c.clone(), layer);
+    enc.init(c).await.unwrap();
+    let mut pics = Vec::new();
+    for pts in [10, 20, 30, 40] {
+        pics.push(encode_hevc(&mut enc, &shared, 256, 128, pts).await);
+    }
+    assert!(pics[0].keyframe);
+    for i in 1..4 {
+        assert!(!pics[i].keyframe);
+        assert_eq!(
+            pics[i].ref0,
+            pics[i - 1].recon,
+            "P{i} chains off the previous picture"
+        );
+    }
+    (enc, shared, pics)
 }
 
 #[tokio::test]
-async fn invalidating_every_reference_codes_a_recovery_i_frame() {
-    let (_shared, layer) = mock(MockVaState::hevc_lp());
-    let mut enc = VaapiEncoder::with_layer(cfg(VideoCodec::Hevc, 0), layer);
-    enc.init(cfg(VideoCodec::Hevc, 0)).await.unwrap();
-    enc.encode(&bgra(1280, 720, 10, [0; 4])).await.unwrap();
-    enc.invalidate_reference_picture(10);
-    let rec = enc.encode(&bgra(1280, 720, 20, [0; 4])).await.unwrap();
-    assert!(rec.is_keyframe, "non-IDR I-frame is a recovery point");
+async fn invalidating_the_newest_picture_falls_back_to_the_one_before_it() {
+    let (mut enc, shared, pics) = hevc_chain().await;
+    enc.invalidate_reference_picture(40);
+    assert_eq!(enc.last_rpi_frame(), Some(40));
+    let next = encode_hevc(&mut enc, &shared, 256, 128, 50).await;
+    assert!(!next.keyframe, "a clean reference survives");
+    assert_eq!(
+        next.ref0, pics[2].recon,
+        "predicted from the picture before the lost one"
+    );
+    // The chain continues from the new picture, not the lost one.
+    let after = encode_hevc(&mut enc, &shared, 256, 128, 60).await;
+    assert_eq!(after.ref0, next.recon);
+}
+
+#[tokio::test]
+async fn invalidating_a_middle_picture_taints_everything_after_it() {
+    let (mut enc, shared, pics) = hevc_chain().await;
+    // 30 was lost: 40 was predicted from it, and 20 is gone from the decoder's
+    // reference set, so no clean reference remains.
+    enc.invalidate_reference_picture(30);
+    let rec = encode_hevc(&mut enc, &shared, 256, 128, 50).await;
+    assert!(rec.keyframe, "recovery I-frame");
     assert_eq!(rec.picture_type, 2);
+    assert_eq!(rec.ref0, VA_INVALID_ID);
+    assert!(![pics[2].recon, pics[3].recon].contains(&rec.recon));
+    // After the recovery frame, prediction resumes from it.
+    let p = encode_hevc(&mut enc, &shared, 256, 128, 60).await;
+    assert!(!p.keyframe);
+    assert_eq!(p.ref0, rec.recon);
+}
+
+#[tokio::test]
+async fn invalidating_an_older_picture_taints_the_whole_chain() {
+    let (mut enc, shared, _pics) = hevc_chain().await;
+    enc.invalidate_reference_picture(20);
+    let rec = encode_hevc(&mut enc, &shared, 256, 128, 50).await;
+    assert!(rec.keyframe && rec.picture_type == 2);
+}
+
+#[tokio::test]
+async fn invalidating_a_picture_older_than_the_dpb_taints_the_whole_chain() {
+    let (mut enc, shared, _pics) = hevc_chain().await;
+    // pts 5 is not held any more, but everything we hold descends from it.
+    enc.invalidate_reference_picture(5);
+    let rec = encode_hevc(&mut enc, &shared, 256, 128, 50).await;
+    assert!(rec.keyframe && rec.picture_type == 2);
+}
+
+#[tokio::test]
+async fn invalidating_every_picture_codes_a_recovery_i_frame() {
+    let (mut enc, shared, _pics) = hevc_chain().await;
+    for pts in [10, 20, 30, 40] {
+        enc.invalidate_reference_picture(pts);
+    }
+    let rec = encode_hevc(&mut enc, &shared, 256, 128, 50).await;
+    assert!(rec.keyframe && rec.picture_type == 2, "{rec:?}");
+    assert_eq!(rec.ref0, VA_INVALID_ID);
+}
+
+#[tokio::test]
+async fn invalidating_a_future_pts_changes_nothing() {
+    let (mut enc, shared, pics) = hevc_chain().await;
+    enc.invalidate_reference_picture(9_999);
+    let next = encode_hevc(&mut enc, &shared, 256, 128, 50).await;
+    assert!(!next.keyframe);
+    assert_eq!(next.ref0, pics[3].recon);
+}
+
+#[tokio::test]
+async fn a_second_loss_after_a_fallback_taints_the_fallback_picture_too() {
+    let (mut enc, shared, pics) = hevc_chain().await;
+    enc.invalidate_reference_picture(40);
+    let fallback = encode_hevc(&mut enc, &shared, 256, 128, 50).await;
+    assert_eq!(fallback.ref0, pics[2].recon);
+    // The fallback picture (50) is lost as well. Its own reference (30) is still
+    // clean and still held by the decoder.
+    enc.invalidate_reference_picture(50);
+    let again = encode_hevc(&mut enc, &shared, 256, 128, 60).await;
+    assert!(!again.keyframe);
+    assert_eq!(again.ref0, pics[2].recon);
+    // Losing 30 itself leaves nothing.
+    enc.invalidate_reference_picture(30);
+    let rec = encode_hevc(&mut enc, &shared, 256, 128, 70).await;
+    assert!(rec.keyframe && rec.picture_type == 2);
 }
 
 #[test]
-fn dpb_caps_entries_and_invalidates_by_pts() {
+fn dpb_caps_entries_and_taints_from_the_lost_picture_onward() {
+    let entry = |i: u32| DpbEntry {
+        surface: i,
+        pts_us: i as u64 * 10,
+        poc: i as i32,
+        frame_num: i,
+        valid: true,
+    };
     let mut dpb = Dpb::default();
-    for i in 0..6u32 {
-        dpb.push(DpbEntry {
-            surface: i,
-            pts_us: i as u64,
-            poc: i as i32,
-            valid: true,
-        });
+    for i in 0..6 {
+        dpb.push(entry(i));
     }
     assert_eq!(dpb.len(), DPB_CAPACITY);
     assert!(!dpb.holds(0), "oldest entries are evicted");
-    assert!(dpb.invalidate(5));
+    // Entries 2..=5 are held. Losing 40 (entry 4) taints 4 and 5 but not 2 and 3.
+    assert!(dpb.invalidate(40));
     assert_eq!(
         dpb.valid_refs(1)[0].surface,
-        4,
-        "newest valid entry is picked"
+        3,
+        "newest clean entry is picked"
     );
+    assert_eq!(dpb.valid_refs(8).len(), 2);
+    // Nothing at or after a future pts.
+    assert!(!dpb.invalidate(10_000));
+    // A pts older than every entry taints them all.
+    assert!(dpb.invalidate(1));
+    assert!(dpb.valid_refs(1).is_empty());
+}
+
+#[test]
+fn dpb_push_retaining_keeps_only_the_used_reference() {
+    let entry = |i: u32| DpbEntry {
+        surface: i,
+        pts_us: i as u64,
+        poc: i as i32,
+        frame_num: i,
+        valid: true,
+    };
+    let mut dpb = Dpb::default();
+    dpb.push(entry(1));
+    dpb.push(entry(2));
+    dpb.push_retaining(entry(3), &[2]);
+    assert!(!dpb.holds(1) && dpb.holds(2) && dpb.holds(3));
+    dpb.push_retaining(entry(4), &[]);
+    assert_eq!(dpb.len(), 1);
+    assert_eq!(dpb.newest().map(|e| e.surface), Some(4));
+}
+
+#[tokio::test]
+async fn h264_keeps_only_the_newest_picture_so_a_loss_means_recovery() {
+    let st = MockVaState::with_codec(VA_PROFILE_H264_HIGH, &[VA_ENTRYPOINT_ENC_SLICE_LP]);
+    let (_shared, layer) = mock(st);
+    let c = cfg_sz(VideoCodec::H264, 0, 256, 128);
+    let mut enc = VaapiEncoder::with_layer(c.clone(), layer);
+    enc.init(c).await.unwrap();
+    for pts in [10, 20, 30] {
+        enc.encode(&bgra(256, 128, pts, [0; 4])).await.unwrap();
+    }
+    // The sliding window holds one reference frame, so there is no older fallback.
+    enc.invalidate_reference_picture(30);
+    let rec = enc.encode(&bgra(256, 128, 40, [0; 4])).await.unwrap();
+    assert!(rec.is_keyframe && rec.picture_type == 2);
+}
+
+// ---------------------------------------------------------------------------
+// H.264 reference signalling.
+// ---------------------------------------------------------------------------
+
+/// Fields of the last H.264 picture and slice buffers.
+struct H264Pic {
+    frame_num: u16,
+    idr: bool,
+    cur_idx: u32,
+    cur_flags: u32,
+    cur_poc: (i32, i32),
+    ref0: (u32, u32, u32, i32),
+    ref1_flags: u32,
+    ref1_id: u32,
+    idr_pic_id: u16,
+    poc_lsb: u16,
+    list0: (u32, u32),
+    list0_1_flags: u32,
+}
+
+fn read_h264(st: &MockVaState) -> H264Pic {
+    let pic = last_param(st, VA_BUF_ENC_PIC);
+    let slice = last_param(st, VA_BUF_ENC_SLICE);
+    let i32_at = |b: &[u8], off: usize| i32::from_le_bytes(b[off..off + 4].try_into().unwrap());
+    let u16_at = |b: &[u8], off: usize| u16::from_le_bytes(b[off..off + 2].try_into().unwrap());
+    let rf = h264_pic::REFERENCE_FRAMES;
+    let sz = abi::h264_picture::SIZE;
+    H264Pic {
+        frame_num: u16_at(&pic, h264_pic::FRAME_NUM),
+        idr: u32_at(&pic, h264_pic::PIC_FIELDS) & 1 == 1,
+        cur_idx: u32_at(&pic, h264_pic::CURR_PIC + abi::h264_picture::FRAME_IDX),
+        cur_flags: u32_at(&pic, h264_pic::CURR_PIC + abi::h264_picture::FLAGS),
+        cur_poc: (
+            i32_at(
+                &pic,
+                h264_pic::CURR_PIC + abi::h264_picture::TOP_FIELD_ORDER_CNT,
+            ),
+            i32_at(
+                &pic,
+                h264_pic::CURR_PIC + abi::h264_picture::BOTTOM_FIELD_ORDER_CNT,
+            ),
+        ),
+        ref0: (
+            u32_at(&pic, rf + abi::h264_picture::PICTURE_ID),
+            u32_at(&pic, rf + abi::h264_picture::FRAME_IDX),
+            u32_at(&pic, rf + abi::h264_picture::FLAGS),
+            i32_at(&pic, rf + abi::h264_picture::TOP_FIELD_ORDER_CNT),
+        ),
+        ref1_flags: u32_at(&pic, rf + sz + abi::h264_picture::FLAGS),
+        ref1_id: u32_at(&pic, rf + sz + abi::h264_picture::PICTURE_ID),
+        idr_pic_id: u16_at(&slice, h264_slice::IDR_PIC_ID),
+        poc_lsb: u16_at(&slice, h264_slice::PIC_ORDER_CNT_LSB),
+        list0: (
+            u32_at(
+                &slice,
+                h264_slice::REF_PIC_LIST0 + abi::h264_picture::PICTURE_ID,
+            ),
+            u32_at(
+                &slice,
+                h264_slice::REF_PIC_LIST0 + abi::h264_picture::FRAME_IDX,
+            ),
+        ),
+        list0_1_flags: u32_at(
+            &slice,
+            h264_slice::REF_PIC_LIST0 + sz + abi::h264_picture::FLAGS,
+        ),
+    }
+}
+
+async fn h264_encoder(w: u32, h: u32) -> (VaapiEncoder, Shared) {
+    let st = MockVaState::with_codec(VA_PROFILE_H264_HIGH, &[VA_ENTRYPOINT_ENC_SLICE_LP]);
+    let (shared, layer) = mock(st);
+    let c = cfg_sz(VideoCodec::H264, 0, w, h);
+    let mut enc = VaapiEncoder::with_layer(c.clone(), layer);
+    enc.init(c).await.unwrap();
+    (enc, shared)
+}
+
+#[tokio::test]
+async fn h264_frame_num_is_zero_at_the_idr_and_references_carry_flags_and_poc() {
+    let (mut enc, shared) = h264_encoder(256, 128).await;
+    enc.encode(&bgra(256, 128, 1, [0; 4])).await.unwrap();
+    let idr = {
+        let st = shared.lock().unwrap();
+        read_h264(&st)
+    };
+    assert!(idr.idr);
+    assert_eq!(idr.frame_num, 0, "frame_num is 0 at an IDR");
+    assert_eq!(idr.cur_idx, 0);
+    assert_eq!(idr.cur_flags, VA_PICTURE_H264_SHORT_TERM_REFERENCE);
+    assert_eq!(idr.cur_poc, (0, 0));
+    assert_eq!(idr.ref0.0, VA_INVALID_ID, "no reference at an IDR");
+    assert_eq!(idr.ref0.2, VA_PICTURE_H264_INVALID);
+    assert!(idr.idr_pic_id > 0);
+
+    enc.encode(&bgra(256, 128, 2, [0; 4])).await.unwrap();
+    let p1 = {
+        let st = shared.lock().unwrap();
+        read_h264(&st)
+    };
+    assert!(!p1.idr);
+    assert_eq!(p1.frame_num, 1);
+    assert_eq!(p1.cur_poc, (2, 2));
+    assert_eq!(p1.poc_lsb, 2);
+    assert_eq!(p1.ref0.1, 0, "frame_idx of a reference is its frame_num");
+    assert_eq!(p1.ref0.2, VA_PICTURE_H264_SHORT_TERM_REFERENCE);
+    assert_eq!(p1.ref0.3, 0, "reference POC");
+    assert_ne!(p1.ref0.0, VA_INVALID_ID);
+    assert_eq!(p1.ref1_id, VA_INVALID_ID);
+    assert_eq!(
+        p1.ref1_flags, VA_PICTURE_H264_INVALID,
+        "unused slot is marked invalid"
+    );
+    assert_eq!(p1.list0, (p1.ref0.0, 0));
+    assert_eq!(p1.list0_1_flags, VA_PICTURE_H264_INVALID);
+
+    enc.encode(&bgra(256, 128, 3, [0; 4])).await.unwrap();
+    let p2 = {
+        let st = shared.lock().unwrap();
+        read_h264(&st)
+    };
+    assert_eq!(p2.frame_num, 2);
+    assert_eq!(p2.ref0.1, 1, "references the previous picture's frame_num");
+    assert_eq!(p2.ref0.3, 2);
+}
+
+#[tokio::test]
+async fn h264_frame_num_does_not_advance_on_a_failed_encode() {
+    let (mut enc, shared) = h264_encoder(256, 128).await;
+    enc.encode(&bgra(256, 128, 1, [0; 4])).await.unwrap();
+    enc.encode(&bgra(256, 128, 2, [0; 4])).await.unwrap();
+    shared.lock().unwrap().fail_end_picture = 1;
+    assert!(enc.encode(&bgra(256, 128, 3, [0; 4])).await.is_err());
+    enc.encode(&bgra(256, 128, 4, [0; 4])).await.unwrap();
+    let p = {
+        let st = shared.lock().unwrap();
+        read_h264(&st)
+    };
+    assert_eq!(p.frame_num, 2, "no gap after the failure");
+    assert_eq!(p.ref0.1, 1, "still predicted from the last coded picture");
+    assert_eq!(p.cur_poc.0, 4);
+}
+
+#[tokio::test]
+async fn h264_a_new_idr_resets_frame_num_and_changes_idr_pic_id() {
+    let (mut enc, shared) = h264_encoder(256, 128).await;
+    enc.encode(&bgra(256, 128, 1, [0; 4])).await.unwrap();
+    let first_id = {
+        let st = shared.lock().unwrap();
+        read_h264(&st).idr_pic_id
+    };
+    enc.encode(&bgra(256, 128, 2, [0; 4])).await.unwrap();
+    enc.request_keyframe();
+    enc.encode(&bgra(256, 128, 3, [0; 4])).await.unwrap();
+    let again = {
+        let st = shared.lock().unwrap();
+        read_h264(&st)
+    };
+    assert!(again.idr);
+    assert_eq!(again.frame_num, 0);
+    assert_eq!(again.cur_poc, (0, 0));
+    assert_ne!(
+        again.idr_pic_id, first_id,
+        "consecutive IDRs differ in idr_pic_id"
+    );
+}
+
+#[tokio::test]
+async fn h264_frame_num_wraps_at_the_declared_maximum() {
+    let (mut enc, shared) = h264_encoder(64, 64).await;
+    for i in 0..258u64 {
+        enc.encode(&bgra(64, 64, i + 1, [0; 4])).await.unwrap();
+        if i == 255 || i == 256 || i == 257 {
+            let st = shared.lock().unwrap();
+            let p = read_h264(&st);
+            let expect = (i % 256) as u16;
+            assert_eq!(p.frame_num, expect, "picture {i}");
+            if i == 256 {
+                assert_eq!(p.ref0.1, 255, "reference frame_num before the wrap");
+            }
+            // POC lsb wraps at 256 (poc steps by two).
+            assert_eq!(p.poc_lsb as i32, (i as i32 * 2) % 256);
+        }
+    }
+}
+
+#[tokio::test]
+async fn h264_sequence_crops_1080_to_1088_rows_and_1366_columns() {
+    for (w, h, right, bottom) in [
+        (1920u32, 1080u32, 0u32, 4u32),
+        (1366, 768, 5, 0),
+        (1280, 720, 0, 0),
+    ] {
+        let (mut enc, shared) = h264_encoder(w, h).await;
+        enc.encode(&bgra(w, h, 1, [0; 4])).await.unwrap();
+        let st = shared.lock().unwrap();
+        let seq = last_param(&st, VA_BUF_ENC_SEQ);
+        let flag = seq[h264_seq::FRAME_CROPPING_FLAG];
+        assert_eq!(flag == 1, right != 0 || bottom != 0, "{w}x{h}");
+        assert_eq!(
+            u32_at(&seq, h264_seq::FRAME_CROP_RIGHT_OFFSET),
+            right,
+            "{w}x{h}"
+        );
+        assert_eq!(
+            u32_at(&seq, h264_seq::FRAME_CROP_BOTTOM_OFFSET),
+            bottom,
+            "{w}x{h}"
+        );
+        assert_eq!(u32_at(&seq, h264_seq::FRAME_CROP_LEFT_OFFSET), 0);
+        assert_eq!(u32_at(&seq, h264_seq::FRAME_CROP_TOP_OFFSET), 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Opt-in features and init validation.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn av1_is_not_offered_unless_opted_in() {
+    let st = MockVaState::with_codec(VA_PROFILE_AV1_PROFILE0, &[VA_ENTRYPOINT_ENC_SLICE_LP]);
+    let (shared, mut layer) = mock(st);
+    let err = select_encode(layer.as_mut(), VideoCodec::Av1, &OFF).unwrap_err();
+    assert!(err.to_string().contains(VAAPI_AV1_ENV), "{err}");
+    let err = probe_with(layer.as_mut(), VideoCodec::Av1, &OFF).unwrap_err();
+    assert!(matches!(err, VaError::Unsupported(_)), "{err}");
+    assert!(
+        shared.lock().unwrap().calls.is_empty(),
+        "a disabled codec is refused before the driver is used"
+    );
+    assert!(probe_with(layer.as_mut(), VideoCodec::Av1, &AV1_ON).is_ok());
+}
+
+#[tokio::test]
+async fn av1_init_fails_by_default_and_names_the_opt_in() {
+    let st = MockVaState::with_codec(VA_PROFILE_AV1_PROFILE0, &[VA_ENTRYPOINT_ENC_SLICE_LP]);
+    let (_s, layer) = mock(st);
+    let mut enc = VaapiEncoder::with_layer(cfg(VideoCodec::Av1, 0), layer);
+    let err = enc.init(cfg(VideoCodec::Av1, 0)).await.unwrap_err();
+    assert!(err.to_string().contains(VAAPI_AV1_ENV), "{err}");
+}
+
+#[test]
+fn options_read_the_opt_in_environment_variables() {
+    // Only the parser is exercised here; the process environment is not modified.
+    assert!(!VaapiOptions::default().av1 && !VaapiOptions::default().packed_headers);
+    assert!(!env_flag("LINUX_QUEST_VAAPI_TEST_FLAG_THAT_IS_NEVER_SET"));
+}
+
+#[tokio::test]
+async fn av1_order_hint_fits_the_sequence_bits_and_one_tile_is_declared() {
+    let st = MockVaState::with_codec(VA_PROFILE_AV1_PROFILE0, &[VA_ENTRYPOINT_ENC_SLICE_LP]);
+    let (shared, layer) = mock(st);
+    let c = cfg_sz(VideoCodec::Av1, 0, 128, 128);
+    let mut enc = VaapiEncoder::with_layer_options(c.clone(), layer, AV1_ON);
+    enc.init(c).await.unwrap();
+    let mut max_hint = 0u8;
+    for i in 0..300u64 {
+        enc.encode(&bgra(128, 128, i + 1, [0; 4])).await.unwrap();
+        let st = shared.lock().unwrap();
+        let pic = last_param(&st, VA_BUF_ENC_PIC);
+        max_hint = max_hint.max(pic[av1_pic::ORDER_HINT]);
+        assert_eq!(pic[av1_pic::TILE_COLS], 1);
+        assert_eq!(pic[av1_pic::TILE_ROWS], 1);
+    }
+    assert_eq!(
+        max_hint, 127,
+        "order_hint wraps at the 7 bits order_hint_bits_minus_1 declares"
+    );
+    let st = shared.lock().unwrap();
+    let seq = st
+        .params
+        .values()
+        .find(|(k, _)| *k == VA_BUF_ENC_SEQ)
+        .unwrap()
+        .1
+        .clone();
+    assert_eq!(seq[av1_seq::ORDER_HINT_BITS_MINUS_1], 6);
+}
+
+fn rate_control_max_qp(st: &MockVaState) -> u32 {
+    let ids = st.rendered.last().unwrap();
+    let rc = ids
+        .iter()
+        .map(|id| &st.params[id])
+        .find(|(k, b)| *k == VA_BUF_ENC_MISC && u32_at(b, 0) == VA_ENC_MISC_RATE_CONTROL)
+        .expect("rate control buffer");
+    u32_at(&rc.1, abi::misc::DATA + abi::misc::rate_control::MAX_QP)
+}
+
+#[tokio::test]
+async fn max_qp_matches_the_codec_range() {
+    let (shared, layer) = mock(MockVaState::hevc_lp());
+    let mut enc = VaapiEncoder::with_layer(cfg_sz(VideoCodec::Hevc, 0, 128, 128), layer);
+    enc.init(cfg_sz(VideoCodec::Hevc, 0, 128, 128))
+        .await
+        .unwrap();
+    enc.encode(&bgra(128, 128, 1, [0; 4])).await.unwrap();
+    assert_eq!(rate_control_max_qp(&shared.lock().unwrap()), 51);
+
+    let st = MockVaState::with_codec(VA_PROFILE_AV1_PROFILE0, &[VA_ENTRYPOINT_ENC_SLICE_LP]);
+    let (shared, layer) = mock(st);
+    let c = cfg_sz(VideoCodec::Av1, 0, 128, 128);
+    let mut enc = VaapiEncoder::with_layer_options(c.clone(), layer, AV1_ON);
+    enc.init(c).await.unwrap();
+    enc.encode(&bgra(128, 128, 1, [0; 4])).await.unwrap();
+    assert_eq!(rate_control_max_qp(&shared.lock().unwrap()), 255);
+}
+
+fn config_packed_request(st: &MockVaState) -> u32 {
+    st.calls
+        .iter()
+        .find_map(|c| match c {
+            VaCall::CreateConfig { attribs } => attribs
+                .iter()
+                .find(|(t, _)| *t == VA_CONFIG_ATTRIB_ENC_PACKED_HEADERS)
+                .map(|(_, v)| *v),
+            _ => None,
+        })
+        .expect("a config with a packed-header attribute was created")
+}
+
+#[tokio::test]
+async fn packed_headers_are_off_by_default_even_when_the_driver_accepts_them() {
+    let st = MockVaState::hevc_lp()
+        .with_packed_headers(VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE);
+    let (shared, layer) = mock(st);
+    let mut enc = VaapiEncoder::with_layer(cfg(VideoCodec::Hevc, 0), layer);
+    assert!(cfg(VideoCodec::Hevc, 0).colour.signal);
+    enc.init(cfg(VideoCodec::Hevc, 0)).await.unwrap();
+    enc.encode(&bgra(1280, 720, 1, [0; 4])).await.unwrap();
+    let st = shared.lock().unwrap();
+    assert!(!render_kinds(&st).contains(&VA_BUF_ENC_PACKED_HEADER_DATA));
+    assert_eq!(config_packed_request(&st), VA_ENC_PACKED_HEADER_NONE);
+}
+
+#[tokio::test]
+async fn packed_headers_opt_in_requests_them_from_the_driver() {
+    let st = MockVaState::hevc_lp()
+        .with_packed_headers(VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE);
+    let (shared, layer) = mock(st);
+    let mut enc = VaapiEncoder::with_layer_options(cfg(VideoCodec::Hevc, 0), layer, PACKED_ON);
+    enc.init(cfg(VideoCodec::Hevc, 0)).await.unwrap();
+    let st = shared.lock().unwrap();
+    assert_eq!(
+        config_packed_request(&st),
+        VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE
+    );
+}
+
+#[tokio::test]
+async fn hevc_rejects_sizes_that_are_not_a_multiple_of_the_min_cb() {
+    for (w, h) in [(1366u32, 768u32), (1920, 1082), (1284, 724)] {
+        let (_s, layer) = mock(MockVaState::hevc_lp());
+        let mut enc = VaapiEncoder::with_layer(cfg_sz(VideoCodec::Hevc, 0, w, h), layer);
+        let err = enc
+            .init(cfg_sz(VideoCodec::Hevc, 0, w, h))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("multiples of 8"), "{w}x{h}: {err}");
+    }
+    for (w, h) in [(1920u32, 1080u32), (1280, 720), (2560, 1440)] {
+        let (_s, layer) = mock(MockVaState::hevc_lp());
+        let mut enc = VaapiEncoder::with_layer(cfg_sz(VideoCodec::Hevc, 0, w, h), layer);
+        enc.init(cfg_sz(VideoCodec::Hevc, 0, w, h))
+            .await
+            .unwrap_or_else(|e| panic!("{w}x{h}: {e}"));
+    }
+}
+
+#[tokio::test]
+async fn h264_accepts_sizes_that_are_not_a_multiple_of_8() {
+    let st = MockVaState::with_codec(VA_PROFILE_H264_HIGH, &[VA_ENTRYPOINT_ENC_SLICE_LP]);
+    let (_s, layer) = mock(st);
+    let c = cfg_sz(VideoCodec::H264, 0, 1366, 768);
+    let mut enc = VaapiEncoder::with_layer(c.clone(), layer);
+    enc.init(c).await.unwrap();
+}
+
+#[tokio::test]
+async fn rolling_refresh_keeps_a_slower_periodic_i_frame_as_a_safety_net() {
+    let st = MockVaState::hevc_lp().with_intra_refresh(VA_ENC_INTRA_REFRESH_ROLLING_COLUMN);
+    let (_shared, layer) = mock(st);
+    let c = cfg_sz(VideoCodec::Hevc, 5, 128, 128);
+    let mut enc = VaapiEncoder::with_layer(c.clone(), layer);
+    enc.init(c).await.unwrap();
+    let mut full_intra = Vec::new();
+    for i in 1..=45u64 {
+        let f = enc.encode(&bgra(128, 128, i, [0; 4])).await.unwrap();
+        if f.picture_type == 6 {
+            full_intra.push(i);
+        }
+    }
+    let every = 5 * ROLLING_SAFETY_NET_FACTOR;
+    assert_eq!(full_intra, vec![every, 2 * every]);
+}
+
+// ---------------------------------------------------------------------------
+// Teardown order and upload bounds.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn teardown_destroys_contexts_then_configs_then_surfaces_vpp_context_first() {
+    let st = MockVaState::hevc_lp().with_vpp();
+    let (shared, layer) = mock(st);
+    let mut enc = VaapiEncoder::with_layer(cfg(VideoCodec::Hevc, 0), layer);
+    enc.init(cfg(VideoCodec::Hevc, 0)).await.unwrap();
+    enc.encode(&rgb_dmabuf(1280, 720, 1, false)).await.unwrap();
+    shared.lock().unwrap().calls.clear();
+    drop(enc);
+    let st = shared.lock().unwrap();
+    let kinds: Vec<&str> = st
+        .calls
+        .iter()
+        .map(|c| match c {
+            VaCall::DestroyBuffer { .. } => "buffer",
+            VaCall::DestroyContext { .. } => "context",
+            VaCall::DestroyConfig { .. } => "config",
+            VaCall::DestroySurfaces { .. } => "surfaces",
+            other => panic!("unexpected call during teardown: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["buffer", "context", "context", "config", "config", "surfaces"]
+    );
+    let contexts: Vec<u32> = st
+        .calls
+        .iter()
+        .filter_map(|c| match c {
+            VaCall::DestroyContext { context } => Some(*context),
+            _ => None,
+        })
+        .collect();
+    // The VPP context was created after the encode context, and goes first.
+    assert!(contexts[0] > contexts[1], "{contexts:?}");
+}
+
+#[test]
+fn nv12_image_bounds_accept_a_tight_image_and_reject_an_overrun() {
+    // 64x32: Y plane 64 x 32 at offset 0 pitch 64, UV plane 64 x 16 at offset 2048.
+    assert!(check_nv12_image_bounds(64, 32, 64, 64, 0, 2048, 3072).is_ok());
+    // One byte short of the last chroma row.
+    assert!(check_nv12_image_bounds(64, 32, 64, 64, 0, 2048, 3071).is_err());
+    // Pitch narrower than the row.
+    assert!(check_nv12_image_bounds(64, 32, 32, 64, 0, 2048, 3072).is_err());
+    // Padded pitch pushes the last row out of the buffer.
+    assert!(check_nv12_image_bounds(64, 32, 128, 64, 0, 4096, 4096 + 64 * 16).is_ok());
+    assert!(check_nv12_image_bounds(64, 32, 128, 64, 0, 4096, 5000).is_err());
+    // Offsets that overflow usize are an error, not a wrap.
+    assert!(check_nv12_image_bounds(64, 32, 64, 64, usize::MAX, 0, 3072).is_err());
+}
+
+#[test]
+fn va_image_layout_matches_the_header() {
+    use std::mem::offset_of;
+    // VAImage (libva 2.20): image_id 0, format 4 (VAImageFormat is 48 bytes), buf 52,
+    // width 56, height 58, data_size 60, num_planes 64, pitches 68, offsets 80.
+    assert_eq!(std::mem::size_of::<VaImageFormat>(), 48);
+    assert_eq!(offset_of!(VaImage, format), 4);
+    assert_eq!(offset_of!(VaImage, buf), 52);
+    assert_eq!(offset_of!(VaImage, width), 56);
+    assert_eq!(offset_of!(VaImage, data_size), 60);
+    assert_eq!(offset_of!(VaImage, num_planes), 64);
+    assert_eq!(offset_of!(VaImage, pitches), 68);
+    assert_eq!(offset_of!(VaImage, offsets), 80);
 }
 
 #[test]
@@ -791,7 +1440,7 @@ fn libva_missing_library_is_a_reason_not_a_panic() {
         &["/nonexistent/libva.so.2"],
         &["/nonexistent/libva-drm.so.2"],
     );
-    let err = probe_with(&mut layer, VideoCodec::Hevc).unwrap_err();
+    let err = probe_with(&mut layer, VideoCodec::Hevc, &OFF).unwrap_err();
     assert!(!err.to_string().is_empty());
 }
 
@@ -806,11 +1455,11 @@ fn real_probe_never_panics() {
 #[test]
 fn rate_control_and_hrd_payloads_are_sized_to_the_structs() {
     assert_eq!(
-        abi::rate_control_misc(20_000, 60).len(),
+        abi::rate_control_misc(20_000, 51).len(),
         abi::misc::DATA + abi::misc::rate_control::SIZE
     );
     assert_eq!(
-        abi::hrd_misc(20_000, 60).len(),
+        abi::hrd_misc(20_000).len(),
         abi::misc::DATA + abi::misc::hrd::SIZE
     );
 }

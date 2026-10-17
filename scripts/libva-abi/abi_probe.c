@@ -34,6 +34,7 @@ int main(void) {
     C(VA_ATTRIB_NOT_SUPPORTED);
     C(VAProfileNone); C(VAProfileHEVCMain); C(VAProfileAV1Profile0);
     C(VAProfileH264Main); C(VAProfileH264High);
+    C(VA_PICTURE_H264_INVALID); C(VA_PICTURE_H264_SHORT_TERM_REFERENCE);
     C(VAEntrypointVideoProc);
     C(VAEntrypointEncSlice); C(VAEntrypointEncSliceLP);
     C(VAConfigAttribRTFormat); C(VAConfigAttribRateControl);
@@ -143,6 +144,7 @@ int main(void) {
 
     /* ---- H.264 ---- */
     S(VAPictureH264); O(VAPictureH264, picture_id); O(VAPictureH264, frame_idx); O(VAPictureH264, flags);
+    O(VAPictureH264, TopFieldOrderCnt); O(VAPictureH264, BottomFieldOrderCnt);
     S(VAEncSequenceParameterBufferH264);
     O(VAEncSequenceParameterBufferH264, seq_parameter_set_id);
     O(VAEncSequenceParameterBufferH264, level_idc);
@@ -162,6 +164,14 @@ int main(void) {
     B(VAEncSequenceParameterBufferH264, seq_fields, chroma_format_idc);
     B(VAEncSequenceParameterBufferH264, seq_fields, frame_mbs_only_flag);
     B(VAEncSequenceParameterBufferH264, seq_fields, direct_8x8_inference_flag);
+    B(VAEncSequenceParameterBufferH264, seq_fields, log2_max_frame_num_minus4);
+    B(VAEncSequenceParameterBufferH264, seq_fields, pic_order_cnt_type);
+    B(VAEncSequenceParameterBufferH264, seq_fields, log2_max_pic_order_cnt_lsb_minus4);
+    O(VAEncSequenceParameterBufferH264, frame_cropping_flag);
+    O(VAEncSequenceParameterBufferH264, frame_crop_left_offset);
+    O(VAEncSequenceParameterBufferH264, frame_crop_right_offset);
+    O(VAEncSequenceParameterBufferH264, frame_crop_top_offset);
+    O(VAEncSequenceParameterBufferH264, frame_crop_bottom_offset);
     B(VAEncSequenceParameterBufferH264, vui_fields, timing_info_present_flag);
     B(VAEncSequenceParameterBufferH264, vui_fields, bitstream_restriction_flag);
     S(VAEncPictureParameterBufferH264);
@@ -200,6 +210,7 @@ int main(void) {
     O(VAEncSliceParameterBufferH264, direct_spatial_mv_pred_flag);
     O(VAEncSliceParameterBufferH264, cabac_init_idc);
 
+    C(VA_LSB_FIRST);
     /* ---- AV1 ---- */
     S(VAEncSequenceParameterBufferAV1);
     O(VAEncSequenceParameterBufferAV1, seq_profile);
@@ -241,6 +252,8 @@ int main(void) {
     O(VAEncPictureParameterBufferAV1, filter_level_v);
     O(VAEncPictureParameterBufferAV1, interpolation_filter);
     O(VAEncPictureParameterBufferAV1, base_qindex);
+    O(VAEncPictureParameterBufferAV1, min_base_qindex);
+    O(VAEncPictureParameterBufferAV1, max_base_qindex);
     O(VAEncPictureParameterBufferAV1, y_dc_delta_q);
     O(VAEncPictureParameterBufferAV1, tile_cols);
     O(VAEncPictureParameterBufferAV1, tile_rows);

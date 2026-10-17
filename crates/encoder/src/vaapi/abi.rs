@@ -145,6 +145,8 @@ pub mod h264_picture {
     pub const PICTURE_ID: usize = 0;
     pub const FRAME_IDX: usize = 4;
     pub const FLAGS: usize = 8;
+    pub const TOP_FIELD_ORDER_CNT: usize = 12;
+    pub const BOTTOM_FIELD_ORDER_CNT: usize = 16;
 }
 
 /// `VAEncSequenceParameterBufferH264` (1132 bytes).
@@ -160,6 +162,11 @@ pub mod h264_seq {
     pub const PICTURE_WIDTH_IN_MBS: usize = 24;
     pub const PICTURE_HEIGHT_IN_MBS: usize = 26;
     pub const SEQ_FIELDS: usize = 28;
+    pub const FRAME_CROPPING_FLAG: usize = 1068;
+    pub const FRAME_CROP_LEFT_OFFSET: usize = 1072;
+    pub const FRAME_CROP_RIGHT_OFFSET: usize = 1076;
+    pub const FRAME_CROP_TOP_OFFSET: usize = 1080;
+    pub const FRAME_CROP_BOTTOM_OFFSET: usize = 1084;
     pub const VUI_PARAMETERS_PRESENT_FLAG: usize = 1088;
     pub const VUI_FIELDS: usize = 1092;
     pub const ASPECT_RATIO_IDC: usize = 1096;
@@ -169,6 +176,9 @@ pub mod h264_seq {
     pub const BIT_CHROMA_FORMAT_IDC: u32 = 0;
     pub const BIT_FRAME_MBS_ONLY_FLAG: u32 = 2;
     pub const BIT_DIRECT_8X8_INFERENCE_FLAG: u32 = 5;
+    pub const BIT_LOG2_MAX_FRAME_NUM_MINUS4: u32 = 6;
+    pub const BIT_PIC_ORDER_CNT_TYPE: u32 = 10;
+    pub const BIT_LOG2_MAX_POC_LSB_MINUS4: u32 = 12;
     /// `vui_fields` bit positions.
     pub const VUI_BIT_TIMING_INFO_PRESENT: u32 = 1;
     pub const VUI_BIT_BITSTREAM_RESTRICTION: u32 = 2;
@@ -218,16 +228,47 @@ pub mod h264_slice {
     pub const SLICE_BETA_OFFSET_DIV2: usize = 3122;
 }
 
-/// A `VAPictureH264` entry (36 bytes) with `picture_id` and `frame_idx` set and every
-/// other field zero. The POC and reference-flag fields are left zero: whether a driver
-/// needs them filled is unverified.
-pub fn h264_picture_bytes(picture_id: u32, frame_idx: u32) -> [u8; h264_picture::SIZE] {
+/// `log2_max_frame_num` written in the H.264 sequence buffer: `frame_num` wraps at 256.
+pub const H264_LOG2_MAX_FRAME_NUM: u32 = 8;
+/// `log2_max_pic_order_cnt_lsb` written in the H.264 sequence buffer: POC lsb wraps at 256.
+pub const H264_LOG2_MAX_POC_LSB: u32 = 8;
+
+/// A `VAPictureH264` entry (36 bytes). `flags` is a mix of `VA_PICTURE_H264_*`; both
+/// field order counts are set to `poc` because every picture is a progressive frame.
+pub fn h264_picture_bytes(
+    picture_id: u32,
+    frame_idx: u32,
+    flags: u32,
+    poc: i32,
+) -> [u8; h264_picture::SIZE] {
     let mut b = Buf::zeroed(h264_picture::SIZE);
     b.u32(h264_picture::PICTURE_ID, picture_id)
-        .u32(h264_picture::FRAME_IDX, frame_idx);
+        .u32(h264_picture::FRAME_IDX, frame_idx)
+        .u32(h264_picture::FLAGS, flags)
+        .i32(h264_picture::TOP_FIELD_ORDER_CNT, poc)
+        .i32(h264_picture::BOTTOM_FIELD_ORDER_CNT, poc);
     let mut out = [0u8; h264_picture::SIZE];
     out.copy_from_slice(&b.into_vec());
     out
+}
+
+/// An unused `VAPictureH264` slot: `VA_INVALID_ID` with `VA_PICTURE_H264_INVALID`.
+pub fn h264_invalid_picture() -> [u8; h264_picture::SIZE] {
+    h264_picture_bytes(VA_INVALID_ID, 0, VA_PICTURE_H264_INVALID, 0)
+}
+
+/// A short-term reference `VAPictureH264` for a frame with `frame_num` and `poc`.
+pub fn h264_reference_picture(
+    picture_id: u32,
+    frame_num: u32,
+    poc: i32,
+) -> [u8; h264_picture::SIZE] {
+    h264_picture_bytes(
+        picture_id,
+        frame_num,
+        VA_PICTURE_H264_SHORT_TERM_REFERENCE,
+        poc,
+    )
 }
 
 /// `VAEncSequenceParameterBufferAV1` (88 bytes).
@@ -277,6 +318,8 @@ pub mod av1_pic {
     pub const FILTER_LEVEL_V: usize = 74;
     pub const INTERPOLATION_FILTER: usize = 77;
     pub const BASE_QINDEX: usize = 88;
+    pub const MIN_BASE_QINDEX: usize = 94;
+    pub const MAX_BASE_QINDEX: usize = 95;
     pub const Y_DC_DELTA_Q: usize = 89;
     pub const TILE_COLS: usize = 260;
     pub const TILE_ROWS: usize = 261;
@@ -588,9 +631,20 @@ pub struct H264SeqParams {
     pub max_num_ref_frames: u32,
     pub width_mbs: u16,
     pub height_mbs: u16,
+    /// `frame_crop_right_offset` / `frame_crop_bottom_offset` in 4:2:0 crop units (2
+    /// luma samples). Zero means no cropping.
+    pub crop_right: u32,
+    pub crop_bottom: u32,
 }
 
 impl H264SeqParams {
+    /// Crop offsets that cut a macroblock-aligned picture back to `width` x `height`.
+    pub fn crop_for(width: u32, height: u32) -> (u32, u32) {
+        let w_pad = width.div_ceil(16) * 16 - width;
+        let h_pad = height.div_ceil(16) * 16 - height;
+        (w_pad / 2, h_pad / 2)
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut b = Buf::zeroed(h264_seq::SIZE);
         b.u8(h264_seq::SEQ_PARAMETER_SET_ID, 0)
@@ -606,8 +660,19 @@ impl H264SeqParams {
                 h264_seq::SEQ_FIELDS,
                 (1 << h264_seq::BIT_CHROMA_FORMAT_IDC)
                     | (1 << h264_seq::BIT_FRAME_MBS_ONLY_FLAG)
-                    | (1 << h264_seq::BIT_DIRECT_8X8_INFERENCE_FLAG),
+                    | (1 << h264_seq::BIT_DIRECT_8X8_INFERENCE_FLAG)
+                    | ((H264_LOG2_MAX_FRAME_NUM - 4) << h264_seq::BIT_LOG2_MAX_FRAME_NUM_MINUS4)
+                    // pic_order_cnt_type 0: POC lsb is carried in every slice header.
+                    | (0 << h264_seq::BIT_PIC_ORDER_CNT_TYPE)
+                    | ((H264_LOG2_MAX_POC_LSB - 4) << h264_seq::BIT_LOG2_MAX_POC_LSB_MINUS4),
             );
+        if self.crop_right != 0 || self.crop_bottom != 0 {
+            b.u8(h264_seq::FRAME_CROPPING_FLAG, 1)
+                .u32(h264_seq::FRAME_CROP_LEFT_OFFSET, 0)
+                .u32(h264_seq::FRAME_CROP_RIGHT_OFFSET, self.crop_right)
+                .u32(h264_seq::FRAME_CROP_TOP_OFFSET, 0)
+                .u32(h264_seq::FRAME_CROP_BOTTOM_OFFSET, self.crop_bottom);
+        }
         b.into_vec()
     }
 }
@@ -693,9 +758,13 @@ impl H264SliceParams {
             .u8(h264_slice::CABAC_INIT_IDC, 0)
             .i8(h264_slice::SLICE_QP_DELTA, 0)
             .u8(h264_slice::DISABLE_DEBLOCKING_FILTER_IDC, 0);
-        for (i, r) in self.ref_pic_list0.iter().take(32).enumerate() {
+        let invalid = h264_invalid_picture();
+        for i in 0..32 {
+            let r = self.ref_pic_list0.get(i).unwrap_or(&invalid);
             let off = h264_slice::REF_PIC_LIST0 + i * h264_picture::SIZE;
             b.0[off..off + h264_picture::SIZE].copy_from_slice(r);
+            let off = h264_slice::REF_PIC_LIST1 + i * h264_picture::SIZE;
+            b.0[off..off + h264_picture::SIZE].copy_from_slice(&invalid);
         }
         b.into_vec()
     }
@@ -727,7 +796,10 @@ impl Av1SeqParams {
                     | (1 << av1_seq::BIT_SUBSAMPLING_X)
                     | (1 << av1_seq::BIT_SUBSAMPLING_Y),
             )
-            .u8(av1_seq::ORDER_HINT_BITS_MINUS_1, 6);
+            .u8(
+                av1_seq::ORDER_HINT_BITS_MINUS_1,
+                (AV1_ORDER_HINT_BITS - 1) as u8,
+            );
         b.into_vec()
     }
 }
@@ -752,6 +824,16 @@ pub struct Av1PicParams {
     /// Use one frame OBU instead of separate frame header and tile group OBUs.
     pub enable_frame_obu: bool,
 }
+
+/// `OrderHintBits` written in the AV1 sequence buffer (`order_hint_bits_minus_1` + 1).
+/// `order_hint` in the picture buffer must be masked to this many bits.
+pub const AV1_ORDER_HINT_BITS: u32 = 7;
+/// Mask for `order_hint` values.
+pub const AV1_ORDER_HINT_MASK: u32 = (1 << AV1_ORDER_HINT_BITS) - 1;
+/// Highest AV1 quantizer index (`base_qindex` range is 0..=255).
+pub const AV1_MAX_QINDEX: u8 = 255;
+/// Highest H.264 / HEVC QP for 8-bit video.
+pub const AVC_HEVC_MAX_QP: u32 = 51;
 
 /// AV1 `frame_type` values from the header comment (`picture_flags.frame_type`).
 pub const AV1_KEY_FRAME: u32 = 0;
@@ -783,9 +865,13 @@ impl Av1PicParams {
             .u32(av1_pic::REF_FRAME_CTRL_L1, 0)
             .u32(av1_pic::PICTURE_FLAGS, flags)
             .u8(av1_pic::NUM_TILE_GROUPS_MINUS1, 0)
-            .u8(av1_pic::TILE_COLS, 0)
-            .u8(av1_pic::TILE_ROWS, 0)
+            // One tile covering the picture (tile_cols / tile_rows count tiles, not
+            // tiles minus one).
+            .u8(av1_pic::TILE_COLS, 1)
+            .u8(av1_pic::TILE_ROWS, 1)
             .u8(av1_pic::BASE_QINDEX, self.base_qindex)
+            .u8(av1_pic::MIN_BASE_QINDEX, 1)
+            .u8(av1_pic::MAX_BASE_QINDEX, AV1_MAX_QINDEX)
             .u16(
                 av1_pic::WIDTH_IN_SBS_MINUS_1,
                 self.width_in_sbs.saturating_sub(1),
@@ -810,15 +896,20 @@ pub fn av1_tile_group_bytes() -> Vec<u8> {
     b.into_vec()
 }
 
-/// Rate-control misc buffer (type + payload), CBR at `bitrate_kbps`.
-pub fn rate_control_misc(bitrate_kbps: u32, fps: u32) -> Vec<u8> {
+/// Rate-control window in milliseconds. libva documents `window_size` as the
+/// averaging window in ms; one second is the usual CBR value (ffmpeg uses the same).
+pub const RC_WINDOW_MS: u32 = 1000;
+
+/// Rate-control misc buffer (type + payload), CBR at `bitrate_kbps`. `max_qp` is the
+/// codec's upper QP bound ([`AVC_HEVC_MAX_QP`] or [`AV1_MAX_QINDEX`]).
+pub fn rate_control_misc(bitrate_kbps: u32, max_qp: u32) -> Vec<u8> {
     let bits = bitrate_kbps.saturating_mul(1000);
-    let window_ms = (1000 / fps.max(1)).max(1);
+    let window_ms = RC_WINDOW_MS;
     let mut b = misc_buffer(VA_ENC_MISC_RATE_CONTROL, misc::rate_control::SIZE);
     b.u32(misc::DATA + misc::rate_control::BITS_PER_SECOND, bits)
         .u32(misc::DATA + misc::rate_control::TARGET_PERCENTAGE, 100) // constant bitrate
         .u32(misc::DATA + misc::rate_control::WINDOW_SIZE, window_ms)
-        .u32(misc::DATA + misc::rate_control::MAX_QP, 51);
+        .u32(misc::DATA + misc::rate_control::MAX_QP, max_qp);
     b.into_vec()
 }
 
@@ -829,12 +920,18 @@ pub fn frame_rate_misc(fps: u32) -> Vec<u8> {
     b.into_vec()
 }
 
-/// HRD misc buffer: one frame of VBV buffering, matching the NVENC backend.
-pub fn hrd_misc(bitrate_kbps: u32, fps: u32) -> Vec<u8> {
-    let buffer = bitrate_kbps.saturating_mul(1000) / fps.max(1);
+/// HRD misc buffer: a buffer of about one second of bits (`buffer_size` and
+/// `initial_buffer_fullness` are in bits), initially three-quarters full, as ffmpeg's
+/// VA-API encoders default to. A one-frame buffer, as this used to be, leaves a CBR
+/// rate controller no room to spend bits on an IDR.
+pub fn hrd_misc(bitrate_kbps: u32) -> Vec<u8> {
+    let buffer = bitrate_kbps.saturating_mul(1000);
     let mut b = misc_buffer(VA_ENC_MISC_HRD, misc::hrd::SIZE);
-    b.u32(misc::DATA + misc::hrd::INITIAL_BUFFER_FULLNESS, buffer)
-        .u32(misc::DATA + misc::hrd::BUFFER_SIZE, buffer);
+    b.u32(
+        misc::DATA + misc::hrd::INITIAL_BUFFER_FULLNESS,
+        buffer / 4 * 3,
+    )
+    .u32(misc::DATA + misc::hrd::BUFFER_SIZE, buffer);
     b.into_vec()
 }
 
@@ -1129,6 +1226,207 @@ mod tests {
         check(&f, "VA_FOURCC_NV12", VA_FOURCC_NV12 as i64);
         check(&f, "DRM_FORMAT_ARGB8888", DRM_FORMAT_ARGB8888 as i64);
         check(&f, "DRM_FORMAT_NV12", DRM_FORMAT_NV12 as i64);
+    }
+
+    #[test]
+    fn h264_reference_marking_cropping_and_av1_qindex_match_headers() {
+        let f = fixture();
+        check(&f, "VA_LSB_FIRST", VA_LSB_FIRST as i64);
+        check(
+            &f,
+            "VA_PICTURE_H264_INVALID",
+            VA_PICTURE_H264_INVALID as i64,
+        );
+        check(
+            &f,
+            "VA_PICTURE_H264_SHORT_TERM_REFERENCE",
+            VA_PICTURE_H264_SHORT_TERM_REFERENCE as i64,
+        );
+        let offsets = [
+            (
+                "VAPictureH264.TopFieldOrderCnt",
+                h264_picture::TOP_FIELD_ORDER_CNT,
+            ),
+            (
+                "VAPictureH264.BottomFieldOrderCnt",
+                h264_picture::BOTTOM_FIELD_ORDER_CNT,
+            ),
+            (
+                "VAEncSequenceParameterBufferH264.frame_cropping_flag",
+                h264_seq::FRAME_CROPPING_FLAG,
+            ),
+            (
+                "VAEncSequenceParameterBufferH264.frame_crop_left_offset",
+                h264_seq::FRAME_CROP_LEFT_OFFSET,
+            ),
+            (
+                "VAEncSequenceParameterBufferH264.frame_crop_right_offset",
+                h264_seq::FRAME_CROP_RIGHT_OFFSET,
+            ),
+            (
+                "VAEncSequenceParameterBufferH264.frame_crop_top_offset",
+                h264_seq::FRAME_CROP_TOP_OFFSET,
+            ),
+            (
+                "VAEncSequenceParameterBufferH264.frame_crop_bottom_offset",
+                h264_seq::FRAME_CROP_BOTTOM_OFFSET,
+            ),
+            (
+                "VAEncPictureParameterBufferAV1.min_base_qindex",
+                av1_pic::MIN_BASE_QINDEX,
+            ),
+            (
+                "VAEncPictureParameterBufferAV1.max_base_qindex",
+                av1_pic::MAX_BASE_QINDEX,
+            ),
+        ];
+        for (key, value) in offsets {
+            check(&f, key, value as i64);
+        }
+        let bits = [
+            (
+                "VAEncSequenceParameterBufferH264.seq_fields.log2_max_frame_num_minus4",
+                h264_seq::BIT_LOG2_MAX_FRAME_NUM_MINUS4,
+            ),
+            (
+                "VAEncSequenceParameterBufferH264.seq_fields.pic_order_cnt_type",
+                h264_seq::BIT_PIC_ORDER_CNT_TYPE,
+            ),
+            (
+                "VAEncSequenceParameterBufferH264.seq_fields.log2_max_pic_order_cnt_lsb_minus4",
+                h264_seq::BIT_LOG2_MAX_POC_LSB_MINUS4,
+            ),
+        ];
+        for (key, value) in bits {
+            check(&f, key, value as i64);
+        }
+    }
+
+    #[test]
+    fn h264_sequence_cropping_and_poc_fields_are_written() {
+        let (right, bottom) = H264SeqParams::crop_for(1920, 1080);
+        assert_eq!(
+            (right, bottom),
+            (0, 4),
+            "1080 rows: 8 rows cropped = 4 units"
+        );
+        let seq = H264SeqParams {
+            level_idc: 51,
+            intra_period: 1,
+            intra_idr_period: 1,
+            ip_period: 1,
+            bits_per_second: 1,
+            max_num_ref_frames: 1,
+            width_mbs: 120,
+            height_mbs: 68,
+            crop_right: right,
+            crop_bottom: bottom,
+        }
+        .to_bytes();
+        let u32_at = |off: usize| u32::from_le_bytes(seq[off..off + 4].try_into().unwrap());
+        assert_eq!(seq[h264_seq::FRAME_CROPPING_FLAG], 1);
+        assert_eq!(u32_at(h264_seq::FRAME_CROP_BOTTOM_OFFSET), 4);
+        assert_eq!(u32_at(h264_seq::FRAME_CROP_RIGHT_OFFSET), 0);
+        let fields = u32_at(h264_seq::SEQ_FIELDS);
+        assert_eq!((fields >> h264_seq::BIT_LOG2_MAX_FRAME_NUM_MINUS4) & 0xf, 4);
+        assert_eq!((fields >> h264_seq::BIT_PIC_ORDER_CNT_TYPE) & 0x3, 0);
+        assert_eq!((fields >> h264_seq::BIT_LOG2_MAX_POC_LSB_MINUS4) & 0xf, 4);
+        // 720p needs no cropping.
+        let none = H264SeqParams::crop_for(1280, 720);
+        assert_eq!(none, (0, 0));
+    }
+
+    #[test]
+    fn h264_picture_entries_carry_flags_and_order_counts() {
+        let p = h264_reference_picture(9, 3, 6);
+        let u = |off: usize| u32::from_le_bytes(p[off..off + 4].try_into().unwrap());
+        assert_eq!(u(h264_picture::PICTURE_ID), 9);
+        assert_eq!(u(h264_picture::FRAME_IDX), 3);
+        assert_eq!(u(h264_picture::FLAGS), VA_PICTURE_H264_SHORT_TERM_REFERENCE);
+        assert_eq!(u(h264_picture::TOP_FIELD_ORDER_CNT), 6);
+        assert_eq!(u(h264_picture::BOTTOM_FIELD_ORDER_CNT), 6);
+        let inv = h264_invalid_picture();
+        let u = |off: usize| u32::from_le_bytes(inv[off..off + 4].try_into().unwrap());
+        assert_eq!(u(h264_picture::PICTURE_ID), VA_INVALID_ID);
+        assert_eq!(u(h264_picture::FLAGS), VA_PICTURE_H264_INVALID);
+    }
+
+    #[test]
+    fn h264_slice_lists_pad_unused_entries_with_invalid_pictures() {
+        let slice = H264SliceParams {
+            num_macroblocks: 1,
+            slice_type: 0,
+            idr_pic_id: 0,
+            pic_order_cnt_lsb: 0,
+            num_ref_idx_l0_active_minus1: 0,
+            ref_pic_list0: vec![h264_reference_picture(5, 0, 0)],
+        }
+        .to_bytes();
+        let entry = |list: usize, i: usize| {
+            let off = list + i * h264_picture::SIZE;
+            (
+                u32::from_le_bytes(slice[off..off + 4].try_into().unwrap()),
+                u32::from_le_bytes(slice[off + 8..off + 12].try_into().unwrap()),
+            )
+        };
+        assert_eq!(
+            entry(h264_slice::REF_PIC_LIST0, 0),
+            (5, VA_PICTURE_H264_SHORT_TERM_REFERENCE)
+        );
+        assert_eq!(
+            entry(h264_slice::REF_PIC_LIST0, 1),
+            (VA_INVALID_ID, VA_PICTURE_H264_INVALID)
+        );
+        assert_eq!(
+            entry(h264_slice::REF_PIC_LIST0, 31),
+            (VA_INVALID_ID, VA_PICTURE_H264_INVALID)
+        );
+        assert_eq!(
+            entry(h264_slice::REF_PIC_LIST1, 0),
+            (VA_INVALID_ID, VA_PICTURE_H264_INVALID)
+        );
+    }
+
+    #[test]
+    fn av1_picture_declares_one_tile_and_a_full_qindex_range() {
+        let pic = Av1PicParams {
+            width: 1280,
+            height: 720,
+            reconstructed_frame: 1,
+            coded_buf: 2,
+            reference_frames: [VA_INVALID_ID; 8],
+            ref_frame_idx: [0; 7],
+            frame_type: AV1_KEY_FRAME,
+            refresh_frame_flags: 0xff,
+            order_hint: 0,
+            primary_ref_frame: 7,
+            base_qindex: 100,
+            width_in_sbs: 10,
+            height_in_sbs: 6,
+            enable_frame_obu: false,
+        }
+        .to_bytes();
+        assert_eq!(pic[av1_pic::TILE_COLS], 1);
+        assert_eq!(pic[av1_pic::TILE_ROWS], 1);
+        assert_eq!(pic[av1_pic::MIN_BASE_QINDEX], 1);
+        assert_eq!(pic[av1_pic::MAX_BASE_QINDEX], 255);
+        assert_eq!(AV1_ORDER_HINT_MASK, 0x7f);
+    }
+
+    #[test]
+    fn rate_control_window_is_one_second_and_max_qp_follows_the_codec() {
+        let u = |b: &[u8], off: usize| u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
+        let rc = rate_control_misc(20_000, AVC_HEVC_MAX_QP);
+        assert_eq!(u(&rc, misc::DATA + misc::rate_control::WINDOW_SIZE), 1000);
+        assert_eq!(u(&rc, misc::DATA + misc::rate_control::MAX_QP), 51);
+        let rc = rate_control_misc(20_000, AV1_MAX_QINDEX as u32);
+        assert_eq!(u(&rc, misc::DATA + misc::rate_control::MAX_QP), 255);
+        let hrd = hrd_misc(20_000);
+        assert_eq!(u(&hrd, misc::DATA + misc::hrd::BUFFER_SIZE), 20_000_000);
+        assert_eq!(
+            u(&hrd, misc::DATA + misc::hrd::INITIAL_BUFFER_FULLNESS),
+            15_000_000
+        );
     }
 
     #[test]
@@ -1612,7 +1910,7 @@ mod tests {
             frame_rate_misc(90).len(),
             misc::DATA + misc::frame_rate::SIZE
         );
-        assert_eq!(hrd_misc(1000, 90).len(), misc::DATA + misc::hrd::SIZE);
+        assert_eq!(hrd_misc(1000).len(), misc::DATA + misc::hrd::SIZE);
         assert_eq!(rir_misc(true, 0, 1).len(), misc::DATA + misc::rir::SIZE);
         assert_eq!(
             Av1SeqParams {
@@ -1656,7 +1954,9 @@ mod tests {
                 bits_per_second: 1,
                 max_num_ref_frames: 1,
                 width_mbs: 1,
-                height_mbs: 1
+                height_mbs: 1,
+                crop_right: 0,
+                crop_bottom: 0,
             }
             .to_bytes()
             .len(),
@@ -1741,7 +2041,7 @@ mod tests {
 
     #[test]
     fn misc_payload_fields_are_relative_to_data() {
-        let rc = rate_control_misc(20_000, 60);
+        let rc = rate_control_misc(20_000, AVC_HEVC_MAX_QP);
         assert_eq!(
             u32::from_le_bytes(rc[0..4].try_into().unwrap()),
             VA_ENC_MISC_RATE_CONTROL
@@ -1756,6 +2056,6 @@ mod tests {
         assert_eq!(at(misc::rate_control::BITS_PER_SECOND), 20_000_000);
         assert_eq!(at(misc::rate_control::TARGET_PERCENTAGE), 100);
         assert_eq!(at(misc::rate_control::MAX_QP), 51);
-        assert_eq!(at(misc::rate_control::WINDOW_SIZE), 16);
+        assert_eq!(at(misc::rate_control::WINDOW_SIZE), RC_WINDOW_MS);
     }
 }

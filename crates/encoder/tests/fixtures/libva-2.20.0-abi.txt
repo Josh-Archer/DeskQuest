@@ -11,6 +11,8 @@ C VAProfileHEVCMain 17
 C VAProfileAV1Profile0 32
 C VAProfileH264Main 6
 C VAProfileH264High 7
+C VA_PICTURE_H264_INVALID 1
+C VA_PICTURE_H264_SHORT_TERM_REFERENCE 8
 C VAEntrypointVideoProc 10
 C VAEntrypointEncSlice 6
 C VAEntrypointEncSliceLP 8
@@ -144,6 +146,8 @@ S VAPictureH264 36
 O VAPictureH264.picture_id 0
 O VAPictureH264.frame_idx 4
 O VAPictureH264.flags 8
+O VAPictureH264.TopFieldOrderCnt 12
+O VAPictureH264.BottomFieldOrderCnt 16
 S VAEncSequenceParameterBufferH264 1132
 O VAEncSequenceParameterBufferH264.seq_parameter_set_id 0
 O VAEncSequenceParameterBufferH264.level_idc 1
@@ -163,6 +167,14 @@ O VAEncSequenceParameterBufferH264.time_scale 1112
 B VAEncSequenceParameterBufferH264.seq_fields.chroma_format_idc 0
 B VAEncSequenceParameterBufferH264.seq_fields.frame_mbs_only_flag 2
 B VAEncSequenceParameterBufferH264.seq_fields.direct_8x8_inference_flag 5
+B VAEncSequenceParameterBufferH264.seq_fields.log2_max_frame_num_minus4 6
+B VAEncSequenceParameterBufferH264.seq_fields.pic_order_cnt_type 10
+B VAEncSequenceParameterBufferH264.seq_fields.log2_max_pic_order_cnt_lsb_minus4 12
+O VAEncSequenceParameterBufferH264.frame_cropping_flag 1068
+O VAEncSequenceParameterBufferH264.frame_crop_left_offset 1072
+O VAEncSequenceParameterBufferH264.frame_crop_right_offset 1076
+O VAEncSequenceParameterBufferH264.frame_crop_top_offset 1080
+O VAEncSequenceParameterBufferH264.frame_crop_bottom_offset 1084
 B VAEncSequenceParameterBufferH264.vui_fields.timing_info_present_flag 1
 B VAEncSequenceParameterBufferH264.vui_fields.bitstream_restriction_flag 2
 S VAEncPictureParameterBufferH264 648
@@ -200,6 +212,7 @@ O VAEncSliceParameterBufferH264.slice_alpha_c0_offset_div2 3121
 O VAEncSliceParameterBufferH264.slice_beta_offset_div2 3122
 O VAEncSliceParameterBufferH264.direct_spatial_mv_pred_flag 32
 O VAEncSliceParameterBufferH264.cabac_init_idc 3118
+C VA_LSB_FIRST 1
 S VAEncSequenceParameterBufferAV1 88
 O VAEncSequenceParameterBufferAV1.seq_profile 0
 O VAEncSequenceParameterBufferAV1.seq_level_idx 1
@@ -239,6 +252,8 @@ O VAEncPictureParameterBufferAV1.filter_level_u 73
 O VAEncPictureParameterBufferAV1.filter_level_v 74
 O VAEncPictureParameterBufferAV1.interpolation_filter 77
 O VAEncPictureParameterBufferAV1.base_qindex 88
+O VAEncPictureParameterBufferAV1.min_base_qindex 94
+O VAEncPictureParameterBufferAV1.max_base_qindex 95
 O VAEncPictureParameterBufferAV1.y_dc_delta_q 89
 O VAEncPictureParameterBufferAV1.tile_cols 260
 O VAEncPictureParameterBufferAV1.tile_rows 261
