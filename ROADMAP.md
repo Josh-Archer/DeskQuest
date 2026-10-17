@@ -66,6 +66,8 @@ This roadmap outlines the development trajectory of `linux-quest` from initial a
 ---
 
 ## Phase 2: Linux Capture & Hardware Encoding Engine
+> Status: PipeWire/DMA-BUF capture and NVENC (incl. intra-refresh, RPI) done. VA-API pending ([#28](https://github.com/Josh-Archer/linux-quest/issues/28)).
+
 *Objective: Build a zero-copy capture pipeline on Linux capable of 4K @ 90Hz/120Hz with minimal CPU overhead.*
 
 - **2.1 PipeWire & DMA-BUF Zero-Copy Capture**
@@ -85,6 +87,8 @@ This roadmap outlines the development trajectory of `linux-quest` from initial a
 ---
 
 ## Phase 3: Ultra-Low-Latency Network & USB Transport
+> Status: paced UDP, FEC and ADB bridge done. QUIC pending ([#29](https://github.com/Josh-Archer/linux-quest/issues/29)); mDNS/SSDP discovery pending ([#30](https://github.com/Josh-Archer/linux-quest/issues/30)).
+
 *Objective: Guarantee sub-10ms delivery over wired USB and sub-15ms delivery over Wi-Fi 6/6E.*
 
 - **3.1 USB ADB Reverse-Tethering Auto-Bridge**
@@ -118,6 +122,8 @@ This roadmap outlines the development trajectory of `linux-quest` from initial a
 ---
 
 ## Phase 5: Virtual Multi-Monitor Management on Linux
+> Status: wlroots, Mutter and X11 backends done. VKMS/EVDI pending ([#31](https://github.com/Josh-Archer/linux-quest/issues/31)).
+
 *Objective: Support multiple headless virtual monitors dynamically without physical hardware dongles.*
 
 - **5.1 Wayland Virtual Display Management**
@@ -176,15 +182,17 @@ This roadmap outlines the development trajectory of `linux-quest` from initial a
     - Connected client status (USB/ADB vs Wi-Fi, smoothed RTT, packet loss, and Reed-Solomon/XOR FEC recoveries).
     - Audio stream telemetry (PipeWire capture, Opus low-delay codec, jitter, buffer delay, health, and PLC concealments).
     - Pure decoupled state/model layer with rolling window aggregation and full `TestBackend` snapshot test coverage.
-  - Simple tray icon / systemd service for headless background operation.
+  - [ ] Simple tray icon / systemd service for headless background operation ([#32](https://github.com/Josh-Archer/linux-quest/issues/32)).
 
-- **7.3 Packaging & Distribution**
+- **7.3 Packaging & Distribution** ([#33](https://github.com/Josh-Archer/linux-quest/issues/33))
   - Linux packaging: `.deb`, `.rpm`, AUR (`PKGBUILD`), and Flatpak.
   - Quest client: Pre-built APK releases with fast sideloading scripts (`adb install -r`).
 
 ---
 
 ## 📈 Success Metrics
+*Not yet measured on real hardware: see [#34](https://github.com/Josh-Archer/linux-quest/issues/34).*
+
 - **Motion-to-Photon Latency:** < 10ms (USB), < 15ms (Wi-Fi 6).
 - **CPU Utilization:** < 5% on host during 4K 90Hz stream.
 - **Text Readability:** 1:1 pixel parity matching native monitors with no text chromatic aberration or blurring.
