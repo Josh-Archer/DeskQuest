@@ -26,7 +26,7 @@ pub use discovery::MdnsDiscoveryBackend;
 pub use discovery::{
     refresh, refresh_with_clock, DiscoveredHost, DiscoveryBackend, DiscoveryError,
     HostAdvertisement, HostDirectory, MockDiscoveryBackend, DEFAULT_STALE_AFTER,
-    DISCOVERY_PROTOCOL_VERSION, DISCOVERY_SERVICE_TYPE,
+    DISCOVERY_PROTOCOL_VERSION, DISCOVERY_SERVICE_TYPE, VIDEO_PORT_UNAVAILABLE,
 };
 pub use fec::{FecError, FecHeader, ReedSolomonFec, XorFec};
 pub use input_channel::{

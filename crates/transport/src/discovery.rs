@@ -9,7 +9,7 @@
 //! | instance name  | DNS-SD    | `living-room` |
 //! | control port   | SRV port  | `48444`       |
 //! | `proto`        | TXT       | `1`           |
-//! | `video`        | TXT       | `48445`       |
+//! | `video`        | TXT       | `48445`, omitted when the host has no video listener |
 //! | `input`        | TXT       | `48446`       |
 //! | `codecs`       | TXT       | `av1,hevc`    |
 //!
@@ -36,6 +36,10 @@ pub const DISCOVERY_SERVICE_TYPE: &str = "_linuxquest._tcp.local.";
 
 /// Version of the TXT record layout. Records advertising any other version are ignored.
 pub const DISCOVERY_PROTOCOL_VERSION: u8 = 1;
+
+/// Video port value meaning "no video listener". A host in this state omits the `video` TXT key,
+/// and a client reads a parsed record with this value as "video not available".
+pub const VIDEO_PORT_UNAVAILABLE: u16 = 0;
 
 /// A host that has not been seen for this long is considered gone.
 pub const DEFAULT_STALE_AFTER: Duration = Duration::from_secs(15);
@@ -87,8 +91,9 @@ impl HostAdvertisement {
                 "instance name must not contain dots, backslashes or control characters",
             );
         }
-        if self.control_port == 0 || self.video_port == 0 || self.input_port == 0 {
-            return invalid("ports must be non-zero");
+        // The video port may be VIDEO_PORT_UNAVAILABLE; control and input must be real ports.
+        if self.control_port == 0 || self.input_port == 0 {
+            return invalid("control and input ports must be non-zero");
         }
         if self.codecs.is_empty() {
             return invalid("at least one codec must be advertised");
@@ -97,6 +102,9 @@ impl HostAdvertisement {
     }
 
     /// TXT key/value pairs for this advertisement (the control port lives in the SRV record).
+    ///
+    /// The `video` key is left out when `video_port` is [`VIDEO_PORT_UNAVAILABLE`], so a TXT
+    /// record never names a port the host does not listen on.
     pub fn txt_properties(&self) -> HashMap<String, String> {
         let codecs = self
             .codecs
@@ -104,12 +112,15 @@ impl HostAdvertisement {
             .map(|c| codec_token(*c))
             .collect::<Vec<_>>()
             .join(",");
-        HashMap::from([
+        let mut txt = HashMap::from([
             ("proto".to_string(), DISCOVERY_PROTOCOL_VERSION.to_string()),
-            ("video".to_string(), self.video_port.to_string()),
             ("input".to_string(), self.input_port.to_string()),
             ("codecs".to_string(), codecs),
-        ])
+        ]);
+        if self.video_port != VIDEO_PORT_UNAVAILABLE {
+            txt.insert("video".to_string(), self.video_port.to_string());
+        }
+        txt
     }
 }
 
@@ -142,7 +153,7 @@ impl DiscoveredHost {
         if control_port == 0 {
             return malformed("control port is zero".to_string());
         }
-        let video_port = parse_port(txt, "video")?;
+        let video_port = parse_optional_video_port(txt)?;
         let input_port = parse_port(txt, "input")?;
 
         let codecs = txt
@@ -175,11 +186,28 @@ impl DiscoveredHost {
         })
     }
 
+    /// Whether the host advertised a video listener. False when the host has none.
+    pub fn video_available(&self) -> bool {
+        self.video_port != VIDEO_PORT_UNAVAILABLE
+    }
+
     /// Address to open the control connection to: the first resolved address and the control port.
     pub fn control_addr(&self) -> Option<SocketAddr> {
         self.addresses
             .first()
             .map(|ip| SocketAddr::new(*ip, self.control_port))
+    }
+}
+
+/// The `video` key is optional. Absent means the host has no video listener, which maps to
+/// [`VIDEO_PORT_UNAVAILABLE`]. A present value must parse as a port; zero is accepted and also
+/// means unavailable.
+fn parse_optional_video_port(txt: &HashMap<String, String>) -> Result<u16, DiscoveryError> {
+    match txt.get("video") {
+        None => Ok(VIDEO_PORT_UNAVAILABLE),
+        Some(raw) => raw
+            .parse::<u16>()
+            .map_err(|_| DiscoveryError::MalformedRecord(format!("invalid video port {raw:?}"))),
     }
 }
 
@@ -708,6 +736,41 @@ mod tests {
             parsed.control_addr(),
             Some("10.0.0.7:48444".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn advertisement_without_video_listener_omits_video_key() {
+        let mut ad = advertisement();
+        ad.video_port = VIDEO_PORT_UNAVAILABLE;
+        ad.validate()
+            .expect("a host with no video listener is still publishable");
+
+        let txt = ad.txt_properties();
+        assert!(!txt.contains_key("video"));
+
+        let parsed =
+            DiscoveredHost::from_parts(&ad.name, [IpAddr::from([10, 0, 0, 7])], 48444, &txt)
+                .expect("record without video key should parse");
+        assert_eq!(parsed.video_port, VIDEO_PORT_UNAVAILABLE);
+        assert!(!parsed.video_available());
+        assert_eq!(parsed.input_port, 48446);
+    }
+
+    #[test]
+    fn video_port_zero_in_record_means_unavailable() {
+        let mut txt = advertisement().txt_properties();
+        txt.insert("video".into(), "0".into());
+        let parsed =
+            DiscoveredHost::from_parts("h", [IpAddr::from([10, 0, 0, 7])], 48444, &txt).unwrap();
+        assert!(!parsed.video_available());
+        assert!(DiscoveredHost::from_parts(
+            "h",
+            [IpAddr::from([10, 0, 0, 7])],
+            48444,
+            &advertisement().txt_properties()
+        )
+        .unwrap()
+        .video_available());
     }
 
     #[test]
