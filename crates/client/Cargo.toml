@@ -28,6 +28,11 @@ libc.workspace = true
 audiopus = "0.3.0-rc.0"
 audiopus_sys = { version = "0.2.2", features = ["static"] }
 
+[features]
+default = []
+# Real mDNS browsing for LAN discovery. Off by default; passes through to linux-quest-transport.
+mdns = ["linux-quest-transport/mdns"]
+
 [target.'cfg(target_os = "android")'.dependencies]
 ndk = { version = "0.9", features = ["audio", "media", "nativewindow", "sync", "api-level-30"] }
 ndk-sys = "0.6"
