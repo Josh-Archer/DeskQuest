@@ -9,12 +9,21 @@
 //! Manual entry is independent of discovery: [`parse_manual_host`] turns typed text into an
 //! address, and `ClientConfig::host_addr` can always be set directly.
 //!
+//! Port rule. Wi-Fi/LAN hosts (manual entry and discovery) use the host's control port,
+//! [`MANUAL_DEFAULT_PORT`] = 48444, the port the daemon's control listener binds. The USB/ADB
+//! path is separate: it uses `config::ADB_REVERSE_PORT` (42069) through
+//! `adb reverse tcp:42069 tcp:42069`, and is never a default for manual entry.
+//!
+//! [`scheduler::DiscoveryScheduler`] re-scans on a period while the caller reports the client as
+//! disconnected.
+//!
 //! mDNS cannot reliably detect blocked multicast (see `linux_quest_transport::discovery`). An
 //! empty browse therefore does not prove that no host exists, and the UI should always keep the
 //! manual entry path visible.
 
 pub mod android_jni;
 pub mod multicast_lock;
+pub mod scheduler;
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -167,10 +176,11 @@ pub fn mdns_discovery<L: MulticastLock>(
     Ok(ClientDiscovery::new(MdnsDiscoveryBackend::new()?, lock))
 }
 
-/// Points `config` at a discovered host: `host_addr` becomes its control address.
+/// Points `config` at a discovered host: `host_addr` becomes its control address (port 48444).
 ///
-/// This does not change `transport_mode`, and the current UDP receive path does not read
-/// `host_addr`. Recording the address is the part that works today.
+/// This does not change `transport_mode`. In `Udp` mode the receive path accepts video only from
+/// `host_addr`'s IP (`android::udp_source_filter`), so selecting a host there makes it the video
+/// source. ADB mode is unchanged and does not use discovery.
 pub fn apply_selection(config: &mut ClientConfig, host: &DiscoveredHost) -> ClientResult<()> {
     config.host_addr = host
         .control_addr()
@@ -203,7 +213,9 @@ fn checked_port(addr: SocketAddr) -> ClientResult<SocketAddr> {
     Ok(addr)
 }
 
-/// Default control port for manually entered hosts.
+/// Default port for hosts entered by hand. It is the host's control listener port
+/// (`DEFAULT_CONTROL_PORT`, 48444), the same port discovery advertises. The USB/ADB path uses
+/// `config::ADB_REVERSE_PORT` (42069) and is not affected by this value.
 pub const MANUAL_DEFAULT_PORT: u16 = DEFAULT_CONTROL_PORT;
 
 #[cfg(test)]

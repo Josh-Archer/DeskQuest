@@ -99,6 +99,12 @@ For wireless freedom:
 - Jitter buffer dynamically tuned based on round-trip time (RTT) moving averages.
 - Out-of-band reliable control channel for handshake, screen geometry, resolution updates, and encryption keys.
 
+### Ports
+- Wi-Fi/LAN (manual entry and mDNS discovery): the host's control listener, TCP `48444`. Discovery advertises this port, along with the UDP input port `48442`. Manual entry defaults to `48444`.
+- Wi-Fi video: UDP `48440` on the client. The client accepts datagrams only from the host IP it was given.
+- USB/ADB: `adb reverse tcp:42069 tcp:42069`. This port is separate and is never a default for Wi-Fi entry.
+- The daemon has no video listener yet, so no video port is advertised.
+
 ---
 
 ## 6. Input Injection via Kernel `uinput`
