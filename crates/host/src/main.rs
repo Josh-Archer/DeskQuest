@@ -60,6 +60,10 @@ struct DaemonArgs {
     /// Run daemon with interactive terminal status dashboard in foreground
     #[arg(long)]
     tui: bool,
+
+    /// Do not advertise this daemon on the LAN via mDNS (Quest clients then need manual IP entry)
+    #[arg(long)]
+    no_advertise: bool,
 }
 
 #[derive(Args, Debug, Default)]
@@ -153,15 +157,20 @@ async fn wait_for_shutdown_signal(mut term: tokio::signal::unix::Signal) {
 
 /// Starts the Quest-facing services: the UDP input receiver and the TCP control/clipboard
 /// listener. Both report connection events to `link`, and both stop on the shutdown broadcast.
+///
+/// Returns the ports actually bound, as `(control, input)`; `None` where a bind failed.
 async fn start_stream_services(
     shutdown_tx: &tokio::sync::broadcast::Sender<()>,
     link: SharedLinkTracker,
-) {
+) -> (Option<u16>, Option<u16>) {
+    let mut input_port = None;
+    let mut control_port = None;
     let input_bind_addr =
         std::net::SocketAddr::from(([0, 0, 0, 0], linux_quest_transport::DEFAULT_INPUT_PORT));
     match HostInputReceiver::bind_auto(input_bind_addr).await {
         Ok(input_service) => {
             let mut input_service = input_service.with_link_tracker(link.clone());
+            input_port = input_service.local_addr().ok().map(|a| a.port());
             let running_flag = input_service.running_flag();
             let auto_injector = input_service.injector();
             let mut shutdown_rx_input = shutdown_tx.subscribe();
@@ -198,6 +207,7 @@ async fn start_stream_services(
     match HostClipboardService::bind_auto(control_bind_addr).await {
         Ok(clipboard_service) => {
             let mut clipboard_service = clipboard_service.with_link_tracker(link);
+            control_port = clipboard_service.local_addr().map(|a| a.port());
             let running_flag = clipboard_service.running_flag();
             let mut shutdown_rx_clipboard = shutdown_tx.subscribe();
             tokio::spawn(async move {
@@ -224,6 +234,8 @@ async fn start_stream_services(
             );
         }
     }
+
+    (control_port, input_port)
 }
 
 #[tokio::main]
@@ -234,7 +246,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         || matches!(&cli.command, Some(Commands::Dashboard(_)))
         || matches!(
             &cli.command,
-            Some(Commands::Daemon(DaemonArgs { tui: true }))
+            Some(Commands::Daemon(DaemonArgs { tui: true, .. }))
         );
 
     if !is_tui {
@@ -310,7 +322,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let shutdown_flag_clone = shutdown_flag.clone();
 
-                start_stream_services(&shutdown_tx, link.clone()).await;
+                // The TUI run binds the listeners but does not advertise them.
+                let _ = start_stream_services(&shutdown_tx, link.clone()).await;
 
                 let host_clone = host.clone();
                 let link_clone = link.clone();
@@ -349,9 +362,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let _ = shutdown_tx_clone.send(());
                 });
 
-                start_stream_services(&shutdown_tx, link.clone()).await;
+                let (control_port, input_port) =
+                    start_stream_services(&shutdown_tx, link.clone()).await;
 
-                run_ipc_server(host, link, shutdown_rx).await?;
+                // Advertise only the ports that were really bound above.
+                let listening = match (control_port, input_port) {
+                    (Some(control), Some(input)) => {
+                        Some(linux_quest_host::advertise::ListeningPorts { control, input })
+                    }
+                    _ => None,
+                };
+                let advertiser = linux_quest_host::advertise::advertise_daemon(
+                    !daemon_args.no_advertise,
+                    linux_quest_host::advertise::system_instance_name(),
+                    listening,
+                )
+                .await;
+
+                let served = run_ipc_server(host, link, shutdown_rx).await;
+                if let Some(advertiser) = advertiser {
+                    advertiser.stop().await;
+                }
+                served?;
                 info!("Daemon stopped cleanly.");
             }
         }

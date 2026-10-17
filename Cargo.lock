@@ -828,6 +828,7 @@ version = "0.1.0"
 dependencies = [
  "android-activity",
  "ash",
+ "async-trait",
  "audiopus",
  "audiopus_sys",
  "bincode",

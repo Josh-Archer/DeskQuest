@@ -38,6 +38,8 @@ shlex = "2.0.1"
 [features]
 default = []
 tray = ["dep:ksni"]
+# Real mDNS advertisement of the daemon. Off by default; passes through to linux-quest-transport.
+mdns = ["linux-quest-transport/mdns"]
 
 [dev-dependencies]
 linux-quest-client = { path = "../client" }

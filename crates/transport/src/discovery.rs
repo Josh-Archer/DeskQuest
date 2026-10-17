@@ -9,8 +9,8 @@
 //! | instance name  | DNS-SD    | `living-room` |
 //! | control port   | SRV port  | `48444`       |
 //! | `proto`        | TXT       | `1`           |
-//! | `video`        | TXT       | `48445`       |
-//! | `input`        | TXT       | `48446`       |
+//! | `video`        | TXT       | `48445` (example), omitted when the host has no video listener |
+//! | `input`        | TXT       | `48442`       |
 //! | `codecs`       | TXT       | `av1,hevc`    |
 //!
 //! The client browses for the same type, merges what it sees into a [`HostDirectory`] and
@@ -36,6 +36,10 @@ pub const DISCOVERY_SERVICE_TYPE: &str = "_linuxquest._tcp.local.";
 
 /// Version of the TXT record layout. Records advertising any other version are ignored.
 pub const DISCOVERY_PROTOCOL_VERSION: u8 = 1;
+
+/// Video port value meaning "no video listener". A host in this state omits the `video` TXT key,
+/// and a client reads a parsed record with this value as "video not available".
+pub const VIDEO_PORT_UNAVAILABLE: u16 = 0;
 
 /// A host that has not been seen for this long is considered gone.
 pub const DEFAULT_STALE_AFTER: Duration = Duration::from_secs(15);
@@ -87,8 +91,9 @@ impl HostAdvertisement {
                 "instance name must not contain dots, backslashes or control characters",
             );
         }
-        if self.control_port == 0 || self.video_port == 0 || self.input_port == 0 {
-            return invalid("ports must be non-zero");
+        // The video port may be VIDEO_PORT_UNAVAILABLE; control and input must be real ports.
+        if self.control_port == 0 || self.input_port == 0 {
+            return invalid("control and input ports must be non-zero");
         }
         if self.codecs.is_empty() {
             return invalid("at least one codec must be advertised");
@@ -97,6 +102,9 @@ impl HostAdvertisement {
     }
 
     /// TXT key/value pairs for this advertisement (the control port lives in the SRV record).
+    ///
+    /// The `video` key is left out when `video_port` is [`VIDEO_PORT_UNAVAILABLE`], so a TXT
+    /// record never names a port the host does not listen on.
     pub fn txt_properties(&self) -> HashMap<String, String> {
         let codecs = self
             .codecs
@@ -104,12 +112,15 @@ impl HostAdvertisement {
             .map(|c| codec_token(*c))
             .collect::<Vec<_>>()
             .join(",");
-        HashMap::from([
+        let mut txt = HashMap::from([
             ("proto".to_string(), DISCOVERY_PROTOCOL_VERSION.to_string()),
-            ("video".to_string(), self.video_port.to_string()),
             ("input".to_string(), self.input_port.to_string()),
             ("codecs".to_string(), codecs),
-        ])
+        ]);
+        if self.video_port != VIDEO_PORT_UNAVAILABLE {
+            txt.insert("video".to_string(), self.video_port.to_string());
+        }
+        txt
     }
 }
 
@@ -142,7 +153,7 @@ impl DiscoveredHost {
         if control_port == 0 {
             return malformed("control port is zero".to_string());
         }
-        let video_port = parse_port(txt, "video")?;
+        let video_port = parse_optional_video_port(txt)?;
         let input_port = parse_port(txt, "input")?;
 
         let codecs = txt
@@ -175,11 +186,66 @@ impl DiscoveredHost {
         })
     }
 
-    /// Address to open the control connection to: the first resolved address and the control port.
+    /// Whether the host advertised a video listener. False when the host has none.
+    pub fn video_available(&self) -> bool {
+        self.video_port != VIDEO_PORT_UNAVAILABLE
+    }
+
+    /// Resolved addresses, best first, for choosing which one to connect to.
+    ///
+    /// A multi-homed host (Docker, VPN, virtual bridges) resolves to several addresses, and the
+    /// sorted order alone can put `172.17.0.1` ahead of the LAN address. Ranking:
+    /// private LAN ranges (`192.168/16`, `10/8`, `172.16/12` except the Docker bridge
+    /// `172.17/16`), then other routable IPv4, then IPv6 (global or unique-local), then the
+    /// Docker bridge, then link-local and loopback. Order within a rank is preserved.
+    pub fn ordered_addresses(&self) -> Vec<IpAddr> {
+        let mut ordered = self.addresses.clone();
+        ordered.sort_by_key(|ip| address_rank(*ip));
+        ordered
+    }
+
+    /// Address to open the control connection to: the best-ranked resolved address (see
+    /// [`ordered_addresses`](Self::ordered_addresses)) and the control port.
     pub fn control_addr(&self) -> Option<SocketAddr> {
-        self.addresses
+        self.ordered_addresses()
             .first()
             .map(|ip| SocketAddr::new(*ip, self.control_port))
+    }
+}
+
+fn address_rank(ip: IpAddr) -> u8 {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => {
+            let [a, b, _, _] = v4.octets();
+            if v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() {
+                4
+            } else if a == 172 && b == 17 {
+                3
+            } else if v4.is_private() {
+                0
+            } else {
+                1
+            }
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                4
+            } else {
+                2
+            }
+        }
+    }
+}
+
+/// The `video` key is optional. Absent means the host has no video listener, which maps to
+/// [`VIDEO_PORT_UNAVAILABLE`]. A present value must parse as a port; zero is accepted and also
+/// means unavailable.
+fn parse_optional_video_port(txt: &HashMap<String, String>) -> Result<u16, DiscoveryError> {
+    match txt.get("video") {
+        None => Ok(VIDEO_PORT_UNAVAILABLE),
+        Some(raw) => raw
+            .parse::<u16>()
+            .map_err(|_| DiscoveryError::MalformedRecord(format!("invalid video port {raw:?}"))),
     }
 }
 
@@ -711,6 +777,41 @@ mod tests {
     }
 
     #[test]
+    fn advertisement_without_video_listener_omits_video_key() {
+        let mut ad = advertisement();
+        ad.video_port = VIDEO_PORT_UNAVAILABLE;
+        ad.validate()
+            .expect("a host with no video listener is still publishable");
+
+        let txt = ad.txt_properties();
+        assert!(!txt.contains_key("video"));
+
+        let parsed =
+            DiscoveredHost::from_parts(&ad.name, [IpAddr::from([10, 0, 0, 7])], 48444, &txt)
+                .expect("record without video key should parse");
+        assert_eq!(parsed.video_port, VIDEO_PORT_UNAVAILABLE);
+        assert!(!parsed.video_available());
+        assert_eq!(parsed.input_port, 48446);
+    }
+
+    #[test]
+    fn video_port_zero_in_record_means_unavailable() {
+        let mut txt = advertisement().txt_properties();
+        txt.insert("video".into(), "0".into());
+        let parsed =
+            DiscoveredHost::from_parts("h", [IpAddr::from([10, 0, 0, 7])], 48444, &txt).unwrap();
+        assert!(!parsed.video_available());
+        assert!(DiscoveredHost::from_parts(
+            "h",
+            [IpAddr::from([10, 0, 0, 7])],
+            48444,
+            &advertisement().txt_properties()
+        )
+        .unwrap()
+        .video_available());
+    }
+
+    #[test]
     fn advertisement_validation_rejects_unpublishable_values() {
         let mut ad = advertisement();
         ad.validate().expect("baseline advertisement is valid");
@@ -1077,6 +1178,52 @@ mod tests {
             1
         );
         assert!(directory.get("den", Instant::now()).is_some());
+    }
+
+    fn host_with(addresses: &[IpAddr]) -> DiscoveredHost {
+        DiscoveredHost::from_parts(
+            "h",
+            addresses.iter().copied(),
+            48444,
+            &advertisement().txt_properties(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn lan_address_beats_docker_bridge() {
+        // 172.17.0.1 sorts before 192.168.1.10, so the plain BTreeSet order would pick docker.
+        let docker = IpAddr::from([172, 17, 0, 1]);
+        let lan = IpAddr::from([192, 168, 1, 10]);
+        let host = host_with(&[docker, lan]);
+        assert_eq!(host.addresses[0], docker);
+        assert_eq!(host.ordered_addresses(), vec![lan, docker]);
+        assert_eq!(host.control_addr(), Some(SocketAddr::new(lan, 48444)));
+    }
+
+    #[test]
+    fn docker_bridge_is_used_when_it_is_the_only_candidate() {
+        let docker = IpAddr::from([172, 17, 0, 1]);
+        assert_eq!(
+            host_with(&[docker]).control_addr(),
+            Some(SocketAddr::new(docker, 48444))
+        );
+    }
+
+    #[test]
+    fn private_ranges_rank_above_others() {
+        let ten = IpAddr::from([10, 0, 0, 5]);
+        let corp = IpAddr::from([172, 20, 1, 1]);
+        let public = IpAddr::from([8, 8, 8, 8]);
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        let link_local = IpAddr::from([169, 254, 1, 1]);
+        let docker = IpAddr::from([172, 17, 0, 1]);
+        let host = host_with(&[link_local, v6, public, docker, corp, ten]);
+        // 10.0.0.5 < 172.20.1.1 numerically, so the stable sort keeps ten first.
+        assert_eq!(
+            host.ordered_addresses(),
+            vec![ten, corp, public, v6, docker, link_local]
+        );
     }
 
     #[test]

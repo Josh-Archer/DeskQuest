@@ -11,7 +11,8 @@ use crate::error::{ClientError, ClientResult};
 /// Supported transport protocol modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransportMode {
-    /// Paced UDP datagrams with Reed-Solomon/XOR FEC.
+    /// Paced UDP datagrams with Reed-Solomon/XOR FEC, received on UDP port 48440. Video is
+    /// accepted only from the IP of `ClientConfig::host_addr`.
     Udp,
     /// USB ADB reverse-tethering TCP tunnel (`adb reverse tcp:48444 tcp:48444`, the host control port).
     AdbReverseTcp,
@@ -56,8 +57,26 @@ pub enum DisplayMode {
 /// Configuration settings for the Quest streaming client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
-    /// Remote host address (default `127.0.0.1:48444` for the ADB reverse tunnel to the host control port).
+    /// Remote host address.
+    ///
+    /// - `AdbReverseTcp`: the local end of the ADB reverse tunnel, `127.0.0.1:48444` by default (the ADB reverse
+    ///   tunnel to the host control port).
+    /// - `Udp`: the host's address on the LAN. Its IP (plus `extra_host_ips`) is the only
+    ///   source video datagrams are accepted from. An unspecified IP (`0.0.0.0`) means no
+    ///   source filter.
+    ///
+    /// **The default is `127.0.0.1`, so in `Udp` mode a client that has not been pointed at a
+    /// host drops every LAN video datagram** (the client logs a warning at startup). Set it by
+    /// discovery (`discovery::apply_selection`, which uses the host's control address, port
+    /// `48444`), by manual entry, or set `0.0.0.0` to disable the filter.
     pub host_addr: SocketAddr,
+
+    /// Further IPs of the same host that UDP video may arrive from. A multi-homed host can send
+    /// from a different interface than the one `host_addr` names, so
+    /// `discovery::apply_selection` stores the host's other discovered addresses here. Empty
+    /// unless set by discovery.
+    #[serde(default)]
+    pub extra_host_ips: Vec<IpAddr>,
 
     /// Transport mode (UDP or ADB Reverse TCP).
     pub transport_mode: TransportMode,
@@ -118,6 +137,7 @@ impl Default for ClientConfig {
                 IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
                 DEFAULT_CONTROL_PORT,
             ),
+            extra_host_ips: Vec::new(),
             transport_mode: TransportMode::AdbReverseTcp,
             codec: ClientVideoCodec::Av1,
             display_mode: DisplayMode::CurvedCylinder,
