@@ -165,6 +165,9 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
                 match listener.accept().await {
                     Ok((stream, peer_addr)) => {
                         tracing::info!(peer = %peer_addr, "New control channel connection for clipboard sync");
+                        if let Err(e) = stream.set_nodelay(true) {
+                            tracing::warn!(error = ?e, "Failed to set TCP_NODELAY on control socket");
+                        }
                         self.spawn_peer_handler(stream);
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
