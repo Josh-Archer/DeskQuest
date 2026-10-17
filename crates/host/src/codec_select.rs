@@ -9,8 +9,10 @@ use linux_quest_protocol::VideoCodec;
 /// H.264 is not in that list, so the client never negotiates it.
 pub const CLIENT_DECODE_CODECS: &[VideoCodec] = &[VideoCodec::Av1, VideoCodec::Hevc];
 
-/// Codecs in the order the host prefers them: AV1 for quality per bit, then HEVC,
-/// then H.264.
+/// Every codec the host knows, in the order the capability probes run: AV1, HEVC, H.264.
+/// This is not the order a stream picks codecs in: each backend has its own order
+/// ([`linux_quest_encoder::backend_codecs`]). NVENC puts AV1 first for quality per
+/// bit; VA-API puts HEVC first because its AV1 path is experimental and off by default.
 pub const CODEC_PREFERENCE: &[VideoCodec] = &[VideoCodec::Av1, VideoCodec::Hevc, VideoCodec::H264];
 
 /// The backend and codec a stream will use.
@@ -23,9 +25,10 @@ pub struct StreamPlan {
 /// Picks a stream plan.
 ///
 /// Backends are tried in the preference's order (for `auto`, NVENC then VA-API). For
-/// each backend the codec is the most preferred one that the backend can encode, that
-/// the client can decode, and that `available` reports as usable. `Mock` is only
-/// planned when it is the explicit preference, never as a silent substitute.
+/// each backend the codec is the first one in that backend's own order
+/// ([`linux_quest_encoder::backend_codecs`]) that the client can decode and that
+/// `available` reports as usable. `Mock` is only planned when it is the explicit
+/// preference, never as a silent substitute.
 pub fn plan_stream(
     preference: BackendPreference,
     client: &[VideoCodec],
@@ -38,9 +41,8 @@ pub fn plan_stream(
     };
     for backend in backends {
         let backend_codecs = linux_quest_encoder::backend_codecs(backend);
-        for &codec in CODEC_PREFERENCE {
-            let wanted = client.contains(&codec) && backend_codecs.contains(&codec);
-            if wanted && available(backend, codec) {
+        for &codec in backend_codecs {
+            if client.contains(&codec) && available(backend, codec) {
                 return Some(StreamPlan { backend, codec });
             }
         }
@@ -48,13 +50,12 @@ pub fn plan_stream(
     None
 }
 
-/// Codec to negotiate with a client that advertised `client`: the most preferred codec
-/// the host can encode with `encodable`. Used when the handshake is wired through.
+/// Codec to negotiate with a client that advertised `client`: the first codec in
+/// `encodable` that the client also decodes. `encodable` is in the chosen backend's
+/// own order (see [`linux_quest_encoder::backend_codecs`]), so the host's preference
+/// wins over the client's order. Used when the handshake is wired through.
 pub fn negotiate_codec(client: &[VideoCodec], encodable: &[VideoCodec]) -> Option<VideoCodec> {
-    CODEC_PREFERENCE
-        .iter()
-        .copied()
-        .find(|c| client.contains(c) && encodable.contains(c))
+    encodable.iter().copied().find(|c| client.contains(c))
 }
 
 #[cfg(test)]
@@ -101,7 +102,35 @@ mod tests {
         })
         .unwrap();
         assert_eq!(plan.backend, BackendKind::Vaapi);
-        assert_eq!(plan.codec, VideoCodec::Av1, "VA-API AV1 is available here");
+        assert_eq!(
+            plan.codec,
+            VideoCodec::Hevc,
+            "VA-API's own order puts HEVC before AV1, even when AV1 is reported usable"
+        );
+    }
+
+    #[test]
+    fn vaapi_uses_av1_only_when_hevc_is_not_usable() {
+        let plan = plan_stream(BackendPreference::Vaapi, CLIENT_DECODE_CODECS, |b, c| {
+            b == BackendKind::Vaapi && c == VideoCodec::Av1
+        })
+        .unwrap();
+        assert_eq!(plan.codec, VideoCodec::Av1);
+    }
+
+    #[test]
+    fn vaapi_with_av1_disabled_never_plans_av1() {
+        // The VA-API probe reports AV1 unavailable unless it is opted in.
+        let plan = plan_stream(BackendPreference::Vaapi, CLIENT_DECODE_CODECS, |_, c| {
+            c != VideoCodec::Av1
+        })
+        .unwrap();
+        assert_eq!(plan.codec, VideoCodec::Hevc);
+        assert_eq!(
+            plan_stream(BackendPreference::Vaapi, &[VideoCodec::Av1], |_, c| c
+                != VideoCodec::Av1),
+            None
+        );
     }
 
     #[test]
@@ -150,6 +179,14 @@ mod tests {
                 &[VideoCodec::Av1, VideoCodec::Hevc]
             ),
             Some(VideoCodec::Av1)
+        );
+        // A backend whose own order is HEVC first negotiates HEVC.
+        assert_eq!(
+            negotiate_codec(
+                &[VideoCodec::Av1, VideoCodec::Hevc],
+                &[VideoCodec::Hevc, VideoCodec::Av1]
+            ),
+            Some(VideoCodec::Hevc)
         );
         assert_eq!(
             negotiate_codec(&[VideoCodec::Hevc], &[VideoCodec::Av1]),

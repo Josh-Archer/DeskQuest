@@ -141,14 +141,25 @@ impl From<CliLayoutMode> for DisplayLayoutMode {
 /// backend reports for each codec. Probing talks to libva and NVENC, so it runs on a
 /// blocking thread. The plan is not yet applied to a stream (see `codec_select`).
 async fn log_stream_plan(preference: BackendPreference) {
-    let probes = tokio::task::spawn_blocking(|| {
+    let probes = match tokio::task::spawn_blocking(|| {
         CODEC_PREFERENCE
             .iter()
             .map(|&codec| (codec, probe_backends(codec)))
             .collect::<Vec<_>>()
     })
     .await
-    .unwrap_or_default();
+    {
+        Ok(probes) => probes,
+        Err(e) => {
+            // A panic in a probe (libva and NVENC are loaded and called from here)
+            // must not look like "no encoder found".
+            tracing::error!(
+                "video encoder capability probing failed ({}): {e}. No stream plan was made",
+                if e.is_panic() { "panic" } else { "cancelled" }
+            );
+            return;
+        }
+    };
     for (codec, results) in &probes {
         for p in results {
             info!(
@@ -177,7 +188,10 @@ async fn log_stream_plan(preference: BackendPreference) {
             preference
         ),
         None => tracing::warn!(
-            "no hardware video encoder can serve the Quest client (preference {:?}); streaming will not start",
+            "no hardware video encoder can serve the Quest client (preference {:?}). This plan \
+             is informational only: the daemon does not start a stream from it yet, and the \
+             encoder used by the streaming pipeline (AutoVideoEncoder) falls back to the \
+             software mock, which produces no real video",
             preference
         ),
     }
