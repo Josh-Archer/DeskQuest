@@ -105,6 +105,21 @@ Hotkeys:
 
 ---
 
+## 🔁 Headless Background Service (systemd)
+
+To run the daemon at login without a terminal, install the systemd user unit in [`packaging/systemd/linux-quest-host.service`](packaging/systemd/linux-quest-host.service):
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp packaging/systemd/linux-quest-host.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now linux-quest-host
+```
+
+See [`packaging/README.md`](packaging/README.md) for installation, the `/dev/uinput` udev rule and operating notes. The tray icon is not included yet (tracked in #32).
+
+---
+
 ## 🎮 Kernel Input Injection (`/dev/uinput` Setup)
 
 `linux-quest` uses the Linux kernel's `uinput` subsystem to inject input events with native kernel-level responsiveness:
