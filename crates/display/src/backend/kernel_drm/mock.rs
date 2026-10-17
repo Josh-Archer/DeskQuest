@@ -23,6 +23,27 @@
 //!   `GRABPIX`/next commit/disconnect, and `UPDATE_READY` is only sent after
 //!   `REQUEST_UPDATE` armed it. A compositor model ([`MockKernel::compositor_commit`]) uses
 //!   this so a backend that does not service events is observed to stall.
+//! - **GRABPIX writes the whole dirty rectangle.** The model validates `buf_width/height`
+//!   against the current scanout mode (as the module does), then writes every row of the
+//!   reported rectangle (`y * stride + x1*4 .. y * stride + x2*4`) into the caller's buffer.
+//!   The kernel cannot know a user buffer's length, so the model learns it from
+//!   [`CardHandle::register_buffer`] (the painter declares its real allocation before each
+//!   grab); a write that would leave that allocation is `EFAULT` (counted in
+//!   [`MockKernel::buffer_faults`], nothing is written), an unregistered buffer is `EFAULT`,
+//!   and `stride < width*4` is `EINVAL` (a model rule, not quoted from upstream).
+//!   Limits of this: the registered length is self-reported by the code under test, and the
+//!   model rejects before writing while a real kernel would fault part-way.
+//! - **DRM master.** A freshly opened card fd is master if the card has no master (like
+//!   `drm_master_open`); `DRM_IOCTL_DROP_MASTER` by the master releases it (`EINVAL` for a
+//!   non-master); `DRM_IOCTL_AUTH_MAGIC(0)` is `EINVAL` for the master and `EACCES` otherwise
+//!   (what libevdi's `drm_is_master` relies on); closing the master fd releases master. The
+//!   compositor model cannot commit while any fd is master ([`CommitOutcome::MasterHeld`]).
+//!   Knobs make the drop fail or silently do nothing.
+//! - **Mode changes.** [`MockKernel::compositor_modeset`] sends `MODE_CHANGED` and commits at
+//!   the new mode in one step (events land in the same read); GRABPIX with the old size is
+//!   then `EINVAL` and counted in [`MockKernel::stale_grabs`].
+//! - **Selection lock.** [`KernelOps::lock_selection`] is an exclusive in-process lock (a stand
+//!   in for the cross-process `flock`; the real file handling is tested separately).
 //! - **`add` creates cards asynchronously** (sysfs entry, `/dev/dri` node and permissions
 //!   appear after configurable virtual delays), fails `EACCES` for non-root, `EINVAL` beyond
 //!   16 devices; `remove_all` kills every card (counted; the backend must never call it).
@@ -35,14 +56,27 @@ use std::time::Duration;
 
 use super::abi::{
     self, read_struct, DrmEvdiConnect, DrmEvdiGrabpix, DrmVersion, DRM_EVDI_EVENT_MODE_CHANGED,
-    DRM_EVDI_EVENT_UPDATE_READY, DRM_IOCTL_DROP_MASTER, DRM_IOCTL_EVDI_CONNECT,
-    DRM_IOCTL_EVDI_GRABPIX, DRM_IOCTL_EVDI_REQUEST_UPDATE, DRM_IOCTL_VERSION, GRABPIX_MODE_DIRTY,
+    DRM_EVDI_EVENT_UPDATE_READY, DRM_IOCTL_AUTH_MAGIC, DRM_IOCTL_DROP_MASTER,
+    DRM_IOCTL_EVDI_CONNECT, DRM_IOCTL_EVDI_GRABPIX, DRM_IOCTL_EVDI_REQUEST_UPDATE,
+    DRM_IOCTL_VERSION, GRABPIX_MODE_DIRTY,
 };
-use super::{CardHandle, KernelOps, EVDI_ROOT};
+use super::{CardHandle, KernelOps, SelectionLock, EVDI_ROOT};
 
 const MAX_DEVICES: usize = 16;
 const MAX_EDID: usize = 256 * 128;
 const MAX_DIRTS: usize = 16;
+/// Real-time bound on waiting for the selection lock.
+const LOCK_WAIT_REAL: Duration = Duration::from_secs(10);
+
+/// How `DRM_IOCTL_DROP_MASTER` behaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MasterDrop {
+    Works,
+    /// Fails with `EPERM`.
+    Fails,
+    /// Returns success but the fd stays master.
+    Ineffective,
+}
 
 fn errno(code: i32) -> io::Error {
     io::Error::from_raw_os_error(code)
@@ -96,6 +130,14 @@ struct Card {
     node_at: u64,
     perm_at: u64,
     denied: bool,
+    /// This card's connector status cannot be read.
+    status_unreadable: bool,
+    /// The `device` symlink of a USB card appears at this virtual time.
+    usb_marker_at: u64,
+    /// Fd id that is DRM master of this card.
+    master: Option<u64>,
+    /// Every wait/poll on the card fd fails with `EIO` (simulated fatal fd error).
+    fatal_io: bool,
     open_fds: usize,
     painter: Painter,
 }
@@ -122,7 +164,15 @@ struct State {
     node_delay: u64,
     perm_delay: u64,
     new_cards_denied: bool,
-    status_unreadable: bool,
+    all_status_unreadable: bool,
+    master_drop: MasterDrop,
+    /// `(major, minor, patchlevel)` the evdi nodes report in `DRM_IOCTL_VERSION`.
+    module_version: (i32, i32, i32),
+    /// On the next `add`, also create a USB card whose marker shows after this many ms.
+    usb_on_add: Option<u64>,
+    /// Real-time pause inside every status read, to widen selection races in tests.
+    race_window_ms: u64,
+    selection_locked: bool,
     /// Non-EVDI GPU cards by minor (e.g. `card0` = i915).
     foreign: BTreeMap<u32, String>,
     cards: BTreeMap<u32, Card>,
@@ -136,6 +186,10 @@ struct State {
     opened_nodes: Vec<u32>,
     grabs: Vec<(i32, i32, i32, i32)>,
     open_calls: u32,
+    lock_acquisitions: u32,
+    stale_grabs: u32,
+    buffer_faults: u32,
+    last_grab_buffer_len: Option<usize>,
 }
 
 struct Shared {
@@ -167,6 +221,8 @@ pub enum CommitOutcome {
     NoModes,
     /// The requested mode is not the EDID's preferred mode.
     ModeNotInEdid,
+    /// Some fd is still DRM master of the card, so the compositor cannot take it.
+    MasterHeld,
 }
 
 impl Default for MockKernel {
@@ -192,7 +248,12 @@ impl MockKernel {
                     node_delay: 0,
                     perm_delay: 0,
                     new_cards_denied: false,
-                    status_unreadable: false,
+                    all_status_unreadable: false,
+                    master_drop: MasterDrop::Works,
+                    module_version: (1, 15, 1),
+                    usb_on_add: None,
+                    race_window_ms: 0,
+                    selection_locked: false,
                     foreign,
                     cards: BTreeMap::new(),
                     next_fd: 1,
@@ -204,6 +265,10 @@ impl MockKernel {
                     opened_nodes: Vec::new(),
                     grabs: Vec::new(),
                     open_calls: 0,
+                    lock_acquisitions: 0,
+                    stale_grabs: 0,
+                    buffer_faults: 0,
+                    last_grab_buffer_len: None,
                 }),
                 cv: Condvar::new(),
             }),
@@ -244,9 +309,51 @@ impl MockKernel {
         self
     }
 
-    /// Connector `status` files cannot be read.
+    /// The connector `status` of every card that exists *now* cannot be read (cards created
+    /// later are readable).
     pub fn with_unreadable_status(self) -> Self {
-        self.lock().status_unreadable = true;
+        for card in self.lock().cards.values_mut() {
+            card.status_unreadable = true;
+        }
+        self
+    }
+
+    /// No connector `status` can be read, now or for cards created later.
+    pub fn with_all_status_unreadable(self) -> Self {
+        self.lock().all_status_unreadable = true;
+        self
+    }
+
+    /// The evdi module reports this version in `DRM_IOCTL_VERSION`.
+    pub fn with_module_version(self, major: i32, minor: i32) -> Self {
+        self.lock().module_version = (major, minor, 0);
+        self
+    }
+
+    /// `DRM_IOCTL_DROP_MASTER` fails with `EPERM`.
+    pub fn with_master_drop_failing(self) -> Self {
+        self.lock().master_drop = MasterDrop::Fails;
+        self
+    }
+
+    /// `DRM_IOCTL_DROP_MASTER` reports success but the fd stays master.
+    pub fn with_master_drop_ineffective(self) -> Self {
+        self.lock().master_drop = MasterDrop::Ineffective;
+        self
+    }
+
+    /// The next `add` also creates a USB-attached card (as if a dock was plugged in at the
+    /// same moment) that is visible at once but whose `device` marker only appears `ms`
+    /// virtual milliseconds later.
+    pub fn with_usb_card_appearing_on_add(self, marker_delay_ms: u64) -> Self {
+        self.lock().usb_on_add = Some(marker_delay_ms);
+        self
+    }
+
+    /// Every connector status read pauses this many real milliseconds *after* reading, so two
+    /// processes scanning at the same time both see the same state.
+    pub fn with_status_read_delay(self, ms: u64) -> Self {
+        self.lock().race_window_ms = ms;
         self
     }
 
@@ -298,11 +405,13 @@ impl MockKernel {
             s.next_fd += 1;
             (minor, id)
         };
+        // The marker of an existing USB card is long visible.
         if connected_by_other {
             let fd = MockCardFd {
                 shared: self.shared.clone(),
                 minor,
                 id,
+                registered: Mutex::new(None),
             };
             {
                 let mut s = self.lock();
@@ -352,6 +461,10 @@ impl MockKernel {
                 node_at: now + sysfs + node,
                 perm_at: now + sysfs + node + perm,
                 denied,
+                status_unreadable: false,
+                usb_marker_at: now + sysfs,
+                master: None,
+                fatal_io: false,
                 open_fds: 0,
                 painter: Painter {
                     needs_full_modeset: true,
@@ -433,6 +546,52 @@ impl MockKernel {
         self.lock().open_calls
     }
 
+    /// Whether some fd is DRM master of the card.
+    pub fn has_master(&self, minor: u32) -> bool {
+        self.lock()
+            .cards
+            .get(&minor)
+            .is_some_and(|c| c.master.is_some())
+    }
+
+    /// Whether the client has armed `UPDATE_READY` (its last `REQUEST_UPDATE` returned 0 and no
+    /// frame has been signalled since): a servicing thread in this state is idle in `poll`.
+    pub fn update_armed(&self, minor: u32) -> bool {
+        self.lock()
+            .cards
+            .get(&minor)
+            .is_some_and(|c| c.painter.was_update_requested)
+    }
+
+    /// GRABPIX calls whose buffer size differed from the scanout mode at that moment.
+    pub fn stale_grabs(&self) -> u32 {
+        self.lock().stale_grabs
+    }
+
+    /// GRABPIX calls that would have written outside the registered allocation (or into an
+    /// unregistered one).
+    pub fn buffer_faults(&self) -> u32 {
+        self.lock().buffer_faults
+    }
+
+    /// Length of the allocation registered for the most recent GRABPIX.
+    pub fn last_grab_buffer_len(&self) -> Option<usize> {
+        self.lock().last_grab_buffer_len
+    }
+
+    /// Times the selection lock was taken.
+    pub fn lock_acquisitions(&self) -> u32 {
+        self.lock().lock_acquisitions
+    }
+
+    /// Makes every later wait/read on the card's fd fail with `EIO`, like a dying fd.
+    pub fn inject_fatal_io(&self, minor: u32) {
+        if let Some(c) = self.lock().cards.get_mut(&minor) {
+            c.fatal_io = true;
+        }
+        self.shared.cv.notify_all();
+    }
+
     /// Preferred mode `(width, height)` parsed from the connected EDID, as the connector's
     /// `get_modes` would offer it; `None` if the EDID is invalid.
     pub fn edid_mode(&self, minor: u32) -> Option<(u32, u32)> {
@@ -461,45 +620,48 @@ impl MockKernel {
         let Some(card) = s.cards.get_mut(&minor) else {
             return CommitOutcome::NotConnected;
         };
-        let p = &mut card.painter;
-        if !p.is_connected {
-            return CommitOutcome::NotConnected;
-        }
-        match edid_preferred_mode(&p.edid) {
-            None => return CommitOutcome::NoModes,
-            Some(m) if m != (width, height) => return CommitOutcome::ModeNotInEdid,
-            Some(_) => {}
-        }
-        p.scanout = Some((width, height));
-        if p.needs_full_modeset {
-            p.needs_full_modeset = false;
-            let mut ev = Vec::new();
-            ev.extend_from_slice(&DRM_EVDI_EVENT_MODE_CHANGED.to_ne_bytes());
-            ev.extend_from_slice(&28u32.to_ne_bytes());
-            for v in [width as i32, height as i32, 60, 32] {
-                ev.extend_from_slice(&v.to_ne_bytes());
-            }
-            ev.extend_from_slice(&0x3432_5258u32.to_ne_bytes());
-            p.events.push_back(ev);
-        }
-        p.num_dirts = (p.num_dirts + 1).min(MAX_DIRTS);
-        p.release_vblank();
-        p.commits += 1;
-        if p.num_dirts > 0 && p.is_connected {
-            p.held_vblank = true;
-        } else {
-            p.flips_completed += 1;
-        }
-        if p.was_update_requested && p.num_dirts > 0 {
-            let mut ev = Vec::new();
-            ev.extend_from_slice(&DRM_EVDI_EVENT_UPDATE_READY.to_ne_bytes());
-            ev.extend_from_slice(&8u32.to_ne_bytes());
-            p.events.push_back(ev);
-            p.was_update_requested = false;
-        }
-        let n = p.commits;
+        let outcome = commit_locked(card, width, height);
         self.shared.cv.notify_all();
-        CommitOutcome::Committed(n)
+        outcome
+    }
+
+    /// Models the compositor switching the output to `width`x`height` while running: the module
+    /// sends `MODE_CHANGED` and the modeset commit follows (and, if the client armed
+    /// `update_ready`, `UPDATE_READY`), all queued under one lock so the events land in the
+    /// same `read`. The mode need not be the EDID's preferred one (the model does not parse
+    /// the full mode list). The following commits may use the new size.
+    pub fn compositor_modeset(&self, minor: u32, width: u32, height: u32) -> CommitOutcome {
+        let mut s = self.lock();
+        let Some(card) = s.cards.get_mut(&minor) else {
+            return CommitOutcome::NotConnected;
+        };
+        let outcome = modeset_locked(card, width, height);
+        self.shared.cv.notify_all();
+        outcome
+    }
+
+    /// Like [`compositor_modeset`](Self::compositor_modeset), but a commit at the *old* mode
+    /// is queued first, so an `UPDATE_READY` precedes the `MODE_CHANGED` in the same read.
+    pub fn compositor_commit_then_modeset(
+        &self,
+        minor: u32,
+        width: u32,
+        height: u32,
+    ) -> CommitOutcome {
+        let mut s = self.lock();
+        let Some(card) = s.cards.get_mut(&minor) else {
+            return CommitOutcome::NotConnected;
+        };
+        if let Some((w, h)) = card.painter.scanout {
+            let first = commit_locked(card, w, h);
+            if !matches!(first, CommitOutcome::Committed(_)) {
+                self.shared.cv.notify_all();
+                return first;
+            }
+        }
+        let outcome = modeset_locked(card, width, height);
+        self.shared.cv.notify_all();
+        outcome
     }
 
     /// Waits (real time) until commit number `commit` has completed its page flip.
@@ -534,6 +696,77 @@ impl MockKernel {
             _ => false,
         }
     }
+}
+
+fn push_event(p: &mut Painter, ty: u32, payload: &[i32], len: u32) {
+    let mut ev = Vec::new();
+    ev.extend_from_slice(&ty.to_ne_bytes());
+    ev.extend_from_slice(&len.to_ne_bytes());
+    for v in payload {
+        ev.extend_from_slice(&v.to_ne_bytes());
+    }
+    p.events.push_back(ev);
+}
+
+/// The module's commit path for one frame at `width`x`height`.
+fn commit_locked(card: &mut Card, width: u32, height: u32) -> CommitOutcome {
+    if card.master.is_some() {
+        return CommitOutcome::MasterHeld;
+    }
+    let p = &mut card.painter;
+    if !p.is_connected {
+        return CommitOutcome::NotConnected;
+    }
+    match edid_preferred_mode(&p.edid) {
+        None => return CommitOutcome::NoModes,
+        // A mode set earlier by a modeset is accepted as is.
+        Some(m) if m != (width, height) && p.scanout != Some((width, height)) => {
+            return CommitOutcome::ModeNotInEdid
+        }
+        Some(_) => {}
+    }
+    p.scanout = Some((width, height));
+    if p.needs_full_modeset {
+        p.needs_full_modeset = false;
+        push_event(
+            p,
+            DRM_EVDI_EVENT_MODE_CHANGED,
+            &[width as i32, height as i32, 60, 32, 0x3432_5258],
+            28,
+        );
+    }
+    p.num_dirts = (p.num_dirts + 1).min(MAX_DIRTS);
+    p.release_vblank();
+    p.commits += 1;
+    if p.num_dirts > 0 && p.is_connected {
+        p.held_vblank = true;
+    } else {
+        p.flips_completed += 1;
+    }
+    if p.was_update_requested && p.num_dirts > 0 {
+        push_event(p, DRM_EVDI_EVENT_UPDATE_READY, &[], 8);
+        p.was_update_requested = false;
+    }
+    CommitOutcome::Committed(p.commits)
+}
+
+fn modeset_locked(card: &mut Card, width: u32, height: u32) -> CommitOutcome {
+    if card.master.is_some() {
+        return CommitOutcome::MasterHeld;
+    }
+    let p = &mut card.painter;
+    if !p.is_connected {
+        return CommitOutcome::NotConnected;
+    }
+    p.scanout = Some((width, height));
+    p.needs_full_modeset = false;
+    push_event(
+        p,
+        DRM_EVDI_EVENT_MODE_CHANGED,
+        &[width as i32, height as i32, 60, 32, 0x3432_5258],
+        28,
+    );
+    commit_locked(card, width, height)
 }
 
 fn remove_all(s: &mut State) {
@@ -598,10 +831,12 @@ impl KernelOps for MockKernel {
         }
         if let Some(rest) = p.strip_prefix("/sys/bus/platform/devices/") {
             if let Some(name) = rest.strip_suffix("/device") {
-                return s
-                    .cards
-                    .values()
-                    .any(|c| c.platform == name && c.usb && c.sysfs_visible(s.now_ms));
+                return s.cards.values().any(|c| {
+                    c.platform == name
+                        && c.usb
+                        && c.sysfs_visible(s.now_ms)
+                        && s.now_ms >= c.usb_marker_at
+                });
             }
         }
         false
@@ -660,19 +895,30 @@ impl KernelOps for MockKernel {
         if let Some(rest) = p.strip_prefix("/sys/class/drm/card") {
             if let Some((minor, tail)) = rest.split_once('-') {
                 if let (Ok(minor), Some(_)) = (minor.parse::<u32>(), tail.strip_suffix("/status")) {
-                    if s.status_unreadable {
+                    if s.all_status_unreadable {
                         return Err(errno(libc::EACCES));
                     }
                     if s.foreign.contains_key(&minor) {
                         return Ok("disconnected\n".into());
                     }
                     if let Some(c) = s.cards.get(&minor).filter(|c| c.sysfs_visible(s.now_ms)) {
-                        return Ok(if c.painter.is_connected {
+                        if c.status_unreadable {
+                            return Err(errno(libc::EACCES));
+                        }
+                        let text: String = if c.painter.is_connected {
                             "connected\n"
                         } else {
                             "disconnected\n"
                         }
-                        .into());
+                        .into();
+                        // Widen the scan-to-connect race: the value read above stays
+                        // stale while this reader pauses without holding the state lock.
+                        let pause = s.race_window_ms;
+                        drop(s);
+                        if pause > 0 {
+                            std::thread::sleep(Duration::from_millis(pause));
+                        }
+                        return Ok(text);
                     }
                 }
             }
@@ -724,6 +970,11 @@ impl KernelOps for MockKernel {
             return Err(errno(libc::EINVAL));
         }
         let delays = (s.sysfs_delay, s.node_delay, s.perm_delay);
+        if let Some(marker_delay) = s.usb_on_add.take() {
+            let minor = Self::alloc_card(&mut s, true, delays, true);
+            let now = s.now_ms;
+            s.cards.get_mut(&minor).unwrap().usb_marker_at = now + marker_delay;
+        }
         for _ in 0..count {
             Self::alloc_card(&mut s, false, delays, true);
         }
@@ -743,6 +994,7 @@ impl KernelOps for MockKernel {
                 shared: self.shared.clone(),
                 minor,
                 id,
+                registered: Mutex::new(None),
             }));
         }
         let card = s.cards.get(&minor).ok_or_else(|| errno(libc::ENOENT))?;
@@ -755,11 +1007,42 @@ impl KernelOps for MockKernel {
         s.opened_nodes.push(minor);
         let id = s.next_fd;
         s.next_fd += 1;
-        s.cards.get_mut(&minor).unwrap().open_fds += 1;
+        let card = s.cards.get_mut(&minor).unwrap();
+        card.open_fds += 1;
+        // drm_master_open: the first opener of a master-less node becomes master.
+        if card.master.is_none() {
+            card.master = Some(id);
+        }
         Ok(Arc::new(MockCardFd {
             shared: self.shared.clone(),
             minor,
             id,
+            registered: Mutex::new(None),
+        }))
+    }
+
+    fn lock_selection(&self) -> io::Result<Box<dyn SelectionLock>> {
+        let deadline = std::time::Instant::now() + LOCK_WAIT_REAL;
+        let mut s = self.lock();
+        while s.selection_locked {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "selection lock held too long",
+                ));
+            }
+            s = self
+                .shared
+                .cv
+                .wait_timeout(s, deadline - now)
+                .expect("mock state poisoned")
+                .0;
+        }
+        s.selection_locked = true;
+        s.lock_acquisitions += 1;
+        Ok(Box::new(MockSelectionLock {
+            shared: self.shared.clone(),
         }))
     }
 
@@ -777,11 +1060,28 @@ impl KernelOps for MockKernel {
 // Card fd
 // ---------------------------------------------------------------------------------------
 
+struct MockSelectionLock {
+    shared: Arc<Shared>,
+}
+
+impl SelectionLock for MockSelectionLock {}
+
+impl Drop for MockSelectionLock {
+    fn drop(&mut self) {
+        if let Ok(mut s) = self.shared.state.lock() {
+            s.selection_locked = false;
+        }
+        self.shared.cv.notify_all();
+    }
+}
+
 /// A modelled open fd. Dropping it is `close(2)`.
 struct MockCardFd {
     shared: Arc<Shared>,
     minor: u32,
     id: u64,
+    /// `(address, length)` of the allocation declared via `register_buffer`.
+    registered: Mutex<Option<(usize, usize)>>,
 }
 
 impl MockCardFd {
@@ -795,9 +1095,13 @@ impl Drop for MockCardFd {
         let mut s = self.lock();
         if let Some(card) = s.cards.get_mut(&self.minor) {
             card.open_fds = card.open_fds.saturating_sub(1);
+            if card.master == Some(self.id) {
+                card.master = None;
+            }
             // evdi_painter_close: disconnect only if this fd issued the CONNECT.
             if card.painter.filp == Some(self.id) {
                 card.painter.disconnect();
+                card.fatal_io = false;
             }
         }
         self.shared.cv.notify_all();
@@ -805,6 +1109,10 @@ impl Drop for MockCardFd {
 }
 
 impl CardHandle for MockCardFd {
+    fn register_buffer(&self, ptr: *mut u8, len: usize) {
+        *self.registered.lock().expect("registered poisoned") = Some((ptr as usize, len));
+    }
+
     fn ioctl(&self, request: u32, arg: &mut [u8]) -> io::Result<i32> {
         if abi::ioc_size(request) != arg.len() {
             return Err(errno(libc::EINVAL));
@@ -826,7 +1134,7 @@ impl CardHandle for MockCardFd {
                 // live buffers.
                 let mut v: DrmVersion = unsafe { read_struct(arg) };
                 let (major, minor, patch) = if driver == "evdi" {
-                    (1, 15, 1)
+                    s.module_version
                 } else {
                     (1, 6, 0)
                 };
@@ -850,7 +1158,33 @@ impl CardHandle for MockCardFd {
                 arg.copy_from_slice(out);
                 Ok(0)
             }
-            DRM_IOCTL_DROP_MASTER => Ok(0),
+            DRM_IOCTL_DROP_MASTER => {
+                let mode = s.master_drop;
+                match s.cards.get_mut(&self.minor) {
+                    None => Ok(0), // non-evdi GPU: master is not modelled
+                    Some(card) => match mode {
+                        MasterDrop::Fails => Err(errno(libc::EPERM)),
+                        MasterDrop::Ineffective => Ok(0),
+                        MasterDrop::Works if card.master == Some(self.id) => {
+                            card.master = None;
+                            Ok(0)
+                        }
+                        MasterDrop::Works => Err(errno(libc::EINVAL)),
+                    },
+                }
+            }
+            DRM_IOCTL_AUTH_MAGIC => {
+                // Needs master; magic 0 is invalid. A non-master fd is refused first.
+                let is_master = s
+                    .cards
+                    .get(&self.minor)
+                    .is_some_and(|c| c.master == Some(self.id));
+                Err(errno(if is_master {
+                    libc::EINVAL
+                } else {
+                    libc::EACCES
+                }))
+            }
             _ if abi::ioc_nr(request) >= abi::DRM_COMMAND_BASE && driver != "evdi" => {
                 s.foreign_private_ioctls += 1;
                 Err(errno(libc::EINVAL))
@@ -911,6 +1245,9 @@ impl CardHandle for MockCardFd {
         let deadline = std::time::Instant::now() + timeout;
         let mut s = self.lock();
         loop {
+            if s.cards.get(&self.minor).is_some_and(|c| c.fatal_io) {
+                return Err(errno(libc::EIO));
+            }
             let ready = s
                 .cards
                 .get(&self.minor)
@@ -987,6 +1324,8 @@ impl MockCardFd {
             cmd.buf_byte_stride,
             cmd.num_rects,
         ));
+        let registered = *self.registered.lock().expect("registered poisoned");
+        s.last_grab_buffer_len = registered.map(|(_, len)| len);
         let p = &mut s.cards.get_mut(&self.minor).unwrap().painter;
         let Some((w, h)) = p.scanout else {
             return Err(errno(libc::EAGAIN));
@@ -994,22 +1333,43 @@ impl MockCardFd {
         p.num_dirts = 0;
         // After this point the vblank is released even on error (`err_fb:` path).
         let result = if cmd.buf_width as u32 != w || cmd.buf_height as u32 != h {
+            s.stale_grabs += 1;
+            Err(errno(libc::EINVAL))
+        } else if cmd.buf_byte_stride < (w as i32) * 4 {
             Err(errno(libc::EINVAL))
         } else {
-            // Report one full-frame dirty rect and paint the first pixel; the module cannot
-            // know the buffer length, and neither can this model.
-            // SAFETY: the caller supplied a buffer of at least one pixel and one rect.
-            unsafe {
-                *cmd.rects = abi::DrmClipRect {
-                    x1: 0,
-                    y1: 0,
-                    x2: w as u16,
-                    y2: h as u16,
-                };
-                std::ptr::write_bytes(cmd.buffer, 0xAB, 4);
+            // The dirty rectangle reported is the full frame. Write it row by row at the
+            // caller's stride, after checking the whole extent against the allocation the
+            // caller declared.
+            let stride = cmd.buf_byte_stride as usize;
+            let row_bytes = w as usize * 4;
+            let extent = (h as usize - 1) * stride + row_bytes;
+            let in_bounds = registered.is_some_and(|(base, len)| {
+                let addr = cmd.buffer as usize;
+                addr >= base && (addr - base).checked_add(extent).is_some_and(|e| e <= len)
+            });
+            if in_bounds {
+                // SAFETY: `in_bounds` proved [buffer, buffer + extent) lies inside the live
+                // allocation the caller registered for this call; `rects` holds at least
+                // one entry (`num_rects >= 1` checked above).
+                unsafe {
+                    for y in 0..h as usize {
+                        std::ptr::write_bytes(cmd.buffer.add(y * stride), 0xAB, row_bytes);
+                    }
+                    *cmd.rects = abi::DrmClipRect {
+                        x1: 0,
+                        y1: 0,
+                        x2: w as u16,
+                        y2: h as u16,
+                    };
+                }
+                Ok(0)
+            } else {
+                s.buffer_faults += 1;
+                Err(errno(libc::EFAULT))
             }
-            Ok(0)
         };
+        let p = &mut s.cards.get_mut(&self.minor).unwrap().painter;
         p.release_vblank();
         self.shared.cv.notify_all();
         result

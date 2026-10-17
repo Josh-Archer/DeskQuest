@@ -8,7 +8,9 @@
 use std::time::Duration;
 
 use linux_quest_display::backend::kernel_drm::abi::{
-    self, as_bytes_mut, DrmEvdiConnect, DRM_IOCTL_EVDI_CONNECT, IOC_WRITE,
+    self, as_bytes_mut, DrmClipRect, DrmEvdiConnect, DrmEvdiGrabpix, DRM_IOCTL_AUTH_MAGIC,
+    DRM_IOCTL_DROP_MASTER, DRM_IOCTL_EVDI_CONNECT, DRM_IOCTL_EVDI_GRABPIX, GRABPIX_MODE_DIRTY,
+    IOC_WRITE,
 };
 use linux_quest_display::backend::kernel_drm::mock::CommitOutcome;
 use linux_quest_display::backend::kernel_drm::{
@@ -20,6 +22,17 @@ use linux_quest_display::{
 };
 
 const FRAME_WAIT: Duration = Duration::from_secs(2);
+
+/// Polls `cond` for up to two seconds.
+async fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+    for _ in 0..200 {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    cond()
+}
 
 fn backend(kernel: &MockKernel) -> KernelDrmDisplayBackend {
     KernelDrmDisplayBackend::with_ops(Box::new(kernel.clone()))
@@ -37,6 +50,8 @@ fn raw_connect(
     let card = kernel
         .open_card(std::path::Path::new(&format!("/dev/dri/card{minor}")))
         .unwrap();
+    // A fresh open is DRM master; give it up like libevdi so the compositor model can commit.
+    card.ioctl(DRM_IOCTL_DROP_MASTER, &mut []).unwrap();
     let edid = EdidGenerator::generate(1920, 1080, 60, "raw", 7).unwrap();
     let mut args = DrmEvdiConnect {
         connected: 1,
@@ -440,6 +455,7 @@ fn model_invalid_edid_connects_but_yields_no_modes() {
     let card = kernel
         .open_card(std::path::Path::new(&format!("/dev/dri/card{minor}")))
         .unwrap();
+    card.ioctl(DRM_IOCTL_DROP_MASTER, &mut []).unwrap();
     let mut edid = EdidGenerator::generate(1920, 1080, 60, "x", 1).unwrap();
     edid[10] ^= 0x55;
     let mut args = DrmEvdiConnect {
@@ -518,11 +534,28 @@ async fn card_whose_node_is_another_driver_never_receives_evdi_ioctls() {
     let kernel = kernel.with_card_driver(minor, "i915");
     let mut b = backend(&kernel);
 
-    // The single idle card is skipped with an explanation; `add` then creates a good one.
-    b.create_monitor(&cfg(1)).await.unwrap();
+    // The diagnostic is returned; no extra card is created that would fail the same way.
+    let err = b.create_monitor(&cfg(1)).await.unwrap_err().to_string();
+    assert!(err.contains("i915"), "{err}");
+    assert!(err.contains("Not creating another card"), "{err}");
+    assert_eq!(kernel.add_calls(), 0);
     assert_eq!(kernel.foreign_private_ioctls(), 0);
-    assert_ne!(b.card_index(1), Some(minor));
     assert!(!kernel.is_connected(minor));
+}
+
+#[tokio::test]
+async fn incompatible_module_version_returns_the_diagnostic_instead_of_adding_a_card() {
+    let kernel = MockKernel::new().with_idle_card().with_module_version(1, 5);
+    let mut b = backend(&kernel);
+    let err = b.create_monitor(&cfg(1)).await.unwrap_err().to_string();
+    assert!(err.contains("not compatible"), "{err}");
+    assert!(err.contains("1.5"), "{err}");
+    assert_eq!(
+        kernel.add_calls(),
+        0,
+        "another card would fail the same way"
+    );
+    assert!(kernel.card_minors().len() == 1);
 }
 
 // ---- event servicing -----------------------------------------------------------------------
@@ -541,10 +574,19 @@ async fn serviced_output_keeps_the_compositor_flipping() {
         );
     }
 
+    // The counter is bumped after the ioctl that completed the last flip returns.
+    assert!(wait_until(|| b.painter_stats(1).unwrap().grabs >= 30).await);
+    tokio::time::sleep(Duration::from_millis(100)).await; // an extra grab would show up
     let stats = b.painter_stats(1).unwrap();
     assert_eq!(stats.mode, Some((2560, 1440)));
-    assert!(stats.mode_changes >= 1);
-    assert!(stats.grabs >= 29, "{stats:?}");
+    assert_eq!(stats.mode_changes, 1);
+    // Each of the 30 commits waited for its flip, and a flip completes only through its own
+    // GRABPIX (the next commit never happens before that), so exactly one grab per frame.
+    assert_eq!(stats.grabs, 30, "{stats:?}");
+    assert_eq!(stats.grab_failures, 0, "{stats:?}");
+    assert_eq!(kernel.buffer_faults(), 0);
+    assert_eq!(kernel.stale_grabs(), 0);
+    assert_eq!(kernel.last_grab_buffer_len(), Some(2560 * 1440 * 4));
     // Every GRABPIX used a buffer matching the mode, 4 bytes per pixel, and MAX_DIRTS rects.
     let grabs = kernel.grab_requests();
     assert!(!grabs.is_empty());
@@ -638,4 +680,514 @@ async fn manager_provisions_scales_and_reuses_cards() {
 
     drop(manager);
     assert!(minors.iter().all(|m| !kernel.is_connected(*m)));
+}
+
+// ---- GRABPIX buffer model -------------------------------------------------------------------
+
+/// Issues one GRABPIX with `buf` registered as the allocation. Returns the raw result.
+fn raw_grab(
+    card: &dyn linux_quest_display::backend::kernel_drm::CardHandle,
+    buf: &mut [u8],
+    (w, h): (i32, i32),
+    stride: i32,
+    register: Option<usize>,
+) -> std::io::Result<i32> {
+    if let Some(len) = register {
+        card.register_buffer(buf.as_mut_ptr(), len);
+    }
+    let mut rects = [DrmClipRect::default(); 16];
+    let mut args = DrmEvdiGrabpix {
+        mode: GRABPIX_MODE_DIRTY,
+        buf_width: w,
+        buf_height: h,
+        buf_byte_stride: stride,
+        buffer: buf.as_mut_ptr(),
+        num_rects: 16,
+        _pad: 0,
+        rects: rects.as_mut_ptr(),
+    };
+    // SAFETY: explicit padding only.
+    card.ioctl(DRM_IOCTL_EVDI_GRABPIX, unsafe { as_bytes_mut(&mut args) })
+}
+
+/// Connects a 1920x1080 EDID, arms and presents one frame so a GRABPIX has pixels to copy.
+fn grab_fixture() -> (
+    MockKernel,
+    u32,
+    std::sync::Arc<dyn linux_quest_display::backend::kernel_drm::CardHandle>,
+) {
+    let kernel = MockKernel::new().with_idle_card();
+    let minor = kernel.card_minors()[0];
+    let card = raw_connect(&kernel, minor);
+    assert!(matches!(
+        kernel.compositor_commit(minor, 1920, 1080),
+        CommitOutcome::Committed(_)
+    ));
+    (kernel, minor, card)
+}
+
+#[test]
+fn model_grabpix_writes_the_whole_rect_at_the_given_stride() {
+    let (kernel, _minor, card) = grab_fixture();
+    let stride = 1920 * 4 + 64; // padded rows
+    let len = 1079 * stride + 1920 * 4;
+    let mut buf = vec![0u8; len as usize];
+    raw_grab(
+        card.as_ref(),
+        &mut buf,
+        (1920, 1080),
+        stride,
+        Some(len as usize),
+    )
+    .unwrap();
+    // First and last pixel of the rect were written; row padding was not.
+    assert_eq!(&buf[..4], &[0xAB; 4]);
+    assert_eq!(&buf[len as usize - 4..], &[0xAB; 4]);
+    assert_eq!(
+        buf[(1920 * 4) as usize],
+        0,
+        "padding between rows untouched"
+    );
+    assert_eq!(kernel.buffer_faults(), 0);
+}
+
+#[test]
+fn model_grabpix_faults_when_the_allocation_is_too_small() {
+    let (kernel, minor, card) = grab_fixture();
+    // The painter-shrinking bug: 16 bytes instead of w*h*4.
+    let mut buf = vec![0u8; 16];
+    let err = raw_grab(card.as_ref(), &mut buf, (1920, 1080), 1920 * 4, Some(16)).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EFAULT));
+    assert_eq!(kernel.buffer_faults(), 1);
+    assert_eq!(buf, vec![0u8; 16], "nothing written outside the check");
+    // One byte short is still a fault.
+    let need = 1920 * 1080 * 4;
+    let mut buf = vec![0u8; need - 1];
+    assert!(raw_grab(
+        card.as_ref(),
+        &mut buf,
+        (1920, 1080),
+        1920 * 4,
+        Some(need - 1)
+    )
+    .is_err());
+    assert_eq!(kernel.buffer_faults(), 2);
+    // The vblank was still released on the error path (module's `err_fb:`).
+    assert!(kernel.wait_flip(minor, 1, FRAME_WAIT));
+}
+
+#[test]
+fn model_grabpix_needs_a_registered_buffer_the_right_stride_and_the_current_mode() {
+    let (kernel, _minor, card) = grab_fixture();
+    let need = 1920 * 1080 * 4;
+    let mut buf = vec![0u8; need];
+    // Never registered (a fresh fd shares nothing with earlier registrations).
+    let other = kernel
+        .open_card(std::path::Path::new("/dev/dri/card1"))
+        .unwrap();
+    let err = raw_grab(other.as_ref(), &mut buf, (1920, 1080), 1920 * 4, None).unwrap_err();
+    assert!(err.raw_os_error().is_some());
+    // Stride below one row.
+    let err = raw_grab(
+        card.as_ref(),
+        &mut buf,
+        (1920, 1080),
+        1920 * 4 - 4,
+        Some(need),
+    )
+    .unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+    // Buffer dimensions must equal the current mode.
+    let err = raw_grab(card.as_ref(), &mut buf, (1280, 720), 1280 * 4, Some(need)).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+    assert_eq!(kernel.stale_grabs(), 1);
+    // Correct call works.
+    raw_grab(card.as_ref(), &mut buf, (1920, 1080), 1920 * 4, Some(need)).unwrap();
+}
+
+// ---- DRM master ----------------------------------------------------------------------------
+
+#[test]
+fn model_fresh_open_is_master_until_dropped_and_blocks_the_compositor() {
+    let kernel = MockKernel::new().with_idle_card();
+    let minor = kernel.card_minors()[0];
+    let card = kernel
+        .open_card(std::path::Path::new(&format!("/dev/dri/card{minor}")))
+        .unwrap();
+    assert!(kernel.has_master(minor));
+    // libevdi's probe: master => EINVAL for magic 0, non-master => EACCES.
+    let probe = |c: &dyn linux_quest_display::backend::kernel_drm::CardHandle| {
+        c.ioctl(DRM_IOCTL_AUTH_MAGIC, &mut [0u8; 4])
+            .unwrap_err()
+            .raw_os_error()
+    };
+    assert_eq!(probe(card.as_ref()), Some(libc::EINVAL));
+    // A second fd is not master and cannot drop it.
+    let second = kernel
+        .open_card(std::path::Path::new(&format!("/dev/dri/card{minor}")))
+        .unwrap();
+    assert_eq!(probe(second.as_ref()), Some(libc::EACCES));
+    assert_eq!(
+        second
+            .ioctl(DRM_IOCTL_DROP_MASTER, &mut [])
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EINVAL)
+    );
+    // Connect from the second fd; the compositor still cannot take the card.
+    let edid = EdidGenerator::generate(1920, 1080, 60, "m", 1).unwrap();
+    let mut args = DrmEvdiConnect {
+        connected: 1,
+        dev_index: minor as i32,
+        edid: edid.as_ptr(),
+        edid_length: edid.len() as u32,
+        pixel_area_limit: 0,
+        pixel_per_second_limit: 0,
+        _pad: 0,
+    };
+    // SAFETY: explicit padding only.
+    second
+        .ioctl(DRM_IOCTL_EVDI_CONNECT, unsafe { as_bytes_mut(&mut args) })
+        .unwrap();
+    assert_eq!(
+        kernel.compositor_commit(minor, 1920, 1080),
+        CommitOutcome::MasterHeld
+    );
+    card.ioctl(DRM_IOCTL_DROP_MASTER, &mut []).unwrap();
+    assert!(!kernel.has_master(minor));
+    assert_eq!(probe(card.as_ref()), Some(libc::EACCES));
+    assert!(matches!(
+        kernel.compositor_commit(minor, 1920, 1080),
+        CommitOutcome::Committed(_)
+    ));
+    // Closing the master fd also releases master.
+    drop(second);
+    let third = kernel
+        .open_card(std::path::Path::new(&format!("/dev/dri/card{minor}")))
+        .unwrap();
+    assert!(
+        kernel.has_master(minor),
+        "first opener of a master-less node"
+    );
+    drop(third);
+    assert!(!kernel.has_master(minor));
+}
+
+#[tokio::test]
+async fn backend_drops_master_so_the_compositor_can_take_the_card() {
+    let kernel = MockKernel::new();
+    let mut b = backend(&kernel);
+    b.create_monitor(&cfg(1)).await.unwrap();
+    let minor = b.card_index(1).unwrap();
+    assert!(!kernel.has_master(minor), "backend fd must not stay master");
+    assert!(kernel.commit_and_wait(minor, 2560, 1440, FRAME_WAIT));
+
+    // Same for the reuse path.
+    b.destroy_monitor(1).await.unwrap();
+    b.create_monitor(&cfg(1)).await.unwrap();
+    assert!(!kernel.has_master(minor));
+    assert!(kernel.commit_and_wait(minor, 2560, 1440, FRAME_WAIT));
+}
+
+#[tokio::test]
+async fn failed_master_drop_fails_the_open_with_a_clear_error() {
+    let kernel = MockKernel::new()
+        .with_idle_card()
+        .with_master_drop_failing();
+    let minor = kernel.card_minors()[0];
+    let mut b = backend(&kernel);
+    let err = b.create_monitor(&cfg(1)).await.unwrap_err().to_string();
+    assert!(err.contains("DRM master"), "{err}");
+    assert!(err.contains("DRM_IOCTL_DROP_MASTER failed"), "{err}");
+    assert!(!kernel.is_connected(minor), "must not CONNECT while master");
+    assert_eq!(kernel.open_fds(minor), 0, "the fd was closed again");
+    assert_eq!(kernel.add_calls(), 0, "a new card would fail the same way");
+    assert!(b.list_monitors().is_empty());
+}
+
+#[tokio::test]
+async fn ineffective_master_drop_is_caught_by_the_recheck() {
+    let kernel = MockKernel::new().with_master_drop_ineffective();
+    let mut b = backend(&kernel);
+    let err = b.create_monitor(&cfg(1)).await.unwrap_err().to_string();
+    assert!(err.contains("still master"), "{err}");
+    let minor = kernel.card_minors()[0];
+    assert!(!kernel.is_connected(minor));
+    assert_eq!(kernel.open_fds(minor), 0);
+}
+
+// ---- card selection races -------------------------------------------------------------------
+
+#[tokio::test]
+async fn add_path_treats_unreadable_status_as_busy() {
+    // Nothing can be read, including the status of the card `add` creates: it must not be
+    // connected (the old code accepted anything that was not `connected`).
+    let kernel = MockKernel::new().with_all_status_unreadable();
+    let mut b = backend(&kernel);
+    let err = b.create_monitor(&cfg(1)).await.unwrap_err().to_string();
+    assert!(err.contains("unreadable connector status"), "{err}");
+    assert!(kernel.opened_nodes().is_empty(), "no card may be opened");
+    assert!(kernel
+        .card_minors()
+        .iter()
+        .all(|m| !kernel.is_connected(*m)));
+}
+
+#[tokio::test]
+async fn usb_marker_that_appears_after_the_card_is_not_missed() {
+    // A dock's card shows up at the same time as ours, without its `device` marker yet; the
+    // marker appears 50ms later (< USB_SETTLE).
+    let kernel = MockKernel::new().with_usb_card_appearing_on_add(50);
+    let mut b = backend(&kernel);
+    b.create_monitor(&cfg(1)).await.unwrap();
+
+    let usb: Vec<u32> = scan_evdi_cards(&kernel)
+        .iter()
+        .filter(|c| c.usb_attached)
+        .map(|c| c.index)
+        .collect();
+    assert_eq!(usb.len(), 1, "the dock card exists and is marked by now");
+    assert!(
+        !kernel.opened_nodes().contains(&usb[0]),
+        "the dock's card must never be opened"
+    );
+    assert_ne!(b.card_index(1), Some(usb[0]));
+    assert!(!kernel.is_connected(usb[0]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_clients_racing_for_one_idle_card_never_share_it() {
+    // Each status read pauses 100ms after reading, so without a lock both clients would see
+    // the same idle card and both CONNECT to it.
+    let kernel = MockKernel::new()
+        .with_idle_card()
+        .with_status_read_delay(100);
+    let mut a = backend(&kernel);
+    let mut b = backend(&kernel);
+
+    let (ca, cb) = (cfg(1), cfg(1));
+    let (ra, rb) = tokio::join!(a.create_monitor(&ca), b.create_monitor(&cb));
+
+    assert_eq!(
+        kernel.double_connects(),
+        0,
+        "one client stole the other's card"
+    );
+    let mut cards = Vec::new();
+    for (r, backend) in [(&ra, &a), (&rb, &b)] {
+        if r.is_ok() {
+            cards.push(backend.card_index(1).unwrap());
+        }
+    }
+    assert!(
+        !cards.is_empty(),
+        "at least one must succeed: {ra:?} {rb:?}"
+    );
+    let unique: std::collections::HashSet<_> = cards.iter().collect();
+    assert_eq!(unique.len(), cards.len(), "both on one card: {cards:?}");
+    for card in &cards {
+        assert!(kernel.is_connected(*card));
+    }
+    assert_eq!(kernel.lock_acquisitions(), 2);
+    assert_eq!(kernel.remove_all_calls(), 0);
+}
+
+// ---- mid-stream mode changes ----------------------------------------------------------------
+
+#[tokio::test]
+async fn mid_stream_modeset_reallocates_the_buffer_and_keeps_servicing() {
+    let kernel = MockKernel::new();
+    let mut b = backend(&kernel);
+    b.create_monitor(&cfg(1)).await.unwrap();
+    let minor = b.card_index(1).unwrap();
+    for _ in 0..3 {
+        assert!(kernel.commit_and_wait(minor, 2560, 1440, FRAME_WAIT));
+    }
+    assert_eq!(kernel.last_grab_buffer_len(), Some(2560 * 1440 * 4));
+    // Wait for the painter to be idle in poll (armed), so the events below arrive together.
+    assert!(wait_until(|| kernel.update_armed(minor)).await);
+
+    // MODE_CHANGED and the modeset commit's UPDATE_READY arrive in the same read.
+    let CommitOutcome::Committed(n) = kernel.compositor_modeset(minor, 1920, 1080) else {
+        panic!("modeset refused");
+    };
+    assert!(
+        kernel.wait_flip(minor, n, FRAME_WAIT),
+        "modeset frame stalled"
+    );
+    for _ in 0..5 {
+        assert!(kernel.commit_and_wait(minor, 1920, 1080, FRAME_WAIT));
+    }
+
+    let stats = b.painter_stats(1).unwrap();
+    assert_eq!(stats.mode, Some((1920, 1080)));
+    assert_eq!(stats.mode_changes, 2);
+    assert_eq!(
+        stats.grab_failures,
+        0,
+        "{stats:?} {:?}",
+        kernel.grab_requests()
+    );
+    assert_eq!(
+        kernel.stale_grabs(),
+        0,
+        "grabbed with stale dimensions {:?}",
+        kernel.grab_requests()
+    );
+    assert_eq!(kernel.buffer_faults(), 0);
+    assert_eq!(kernel.last_grab_buffer_len(), Some(1920 * 1080 * 4));
+    let grabs = kernel.grab_requests();
+    assert_eq!(*grabs.last().unwrap(), (1920, 1080, 1920 * 4, 16));
+    // No grab ever mixed the two sizes.
+    assert!(grabs
+        .iter()
+        .all(|g| *g == (2560, 1440, 2560 * 4, 16) || *g == (1920, 1080, 1920 * 4, 16)));
+}
+
+#[tokio::test]
+async fn update_ready_in_front_of_mode_changed_in_one_read_is_not_grabbed_stale() {
+    let kernel = MockKernel::new();
+    let mut b = backend(&kernel);
+    b.create_monitor(&cfg(1)).await.unwrap();
+    let minor = b.card_index(1).unwrap();
+    assert!(kernel.commit_and_wait(minor, 2560, 1440, FRAME_WAIT));
+    assert!(wait_until(|| kernel.update_armed(minor)).await);
+
+    // One read delivers [UPDATE_READY, MODE_CHANGED]: the UPDATE_READY refers to a frame of
+    // the new scanout, so it must be answered with a buffer for the new mode.
+    let CommitOutcome::Committed(n) = kernel.compositor_commit_then_modeset(minor, 1280, 720)
+    else {
+        panic!("modeset refused");
+    };
+    assert!(kernel.wait_flip(minor, n, FRAME_WAIT), "stalled");
+    assert!(kernel.commit_and_wait(minor, 1280, 720, FRAME_WAIT));
+
+    let stats = b.painter_stats(1).unwrap();
+    assert_eq!(stats.mode, Some((1280, 720)));
+    assert_eq!(kernel.stale_grabs(), 0, "grabbed with stale dimensions");
+    assert_eq!(stats.grab_failures, 0, "{stats:?}");
+    assert_eq!(kernel.last_grab_buffer_len(), Some(1280 * 720 * 4));
+}
+
+#[tokio::test]
+async fn implausible_mode_is_refused_without_allocating_and_servicing_recovers() {
+    let kernel = MockKernel::new();
+    let mut b = backend(&kernel);
+    b.create_monitor(&cfg(1)).await.unwrap();
+    let minor = b.card_index(1).unwrap();
+    assert!(kernel.commit_and_wait(minor, 2560, 1440, FRAME_WAIT));
+    assert!(wait_until(|| kernel.update_armed(minor)).await);
+    let grabs_before = b.painter_stats(1).unwrap().grabs;
+
+    // Wider than MAX_DIMENSION (8192): refused, no buffer, no grab.
+    assert!(matches!(
+        kernel.compositor_modeset(minor, 9000, 100),
+        CommitOutcome::Committed(_)
+    ));
+    assert!(wait_until(|| b.painter_stats(1).unwrap().rejected_modes == 1).await);
+    let stats = b.painter_stats(1).unwrap();
+    assert_eq!(stats.mode, None);
+    assert_eq!(stats.grabs, grabs_before);
+    assert_eq!(kernel.buffer_faults(), 0);
+
+    // A sane mode afterwards is serviced again.
+    let CommitOutcome::Committed(n) = kernel.compositor_modeset(minor, 1920, 1080) else {
+        panic!("modeset refused");
+    };
+    assert!(kernel.wait_flip(minor, n, FRAME_WAIT));
+    assert_eq!(b.painter_stats(1).unwrap().mode, Some((1920, 1080)));
+}
+
+#[tokio::test]
+async fn modesets_racing_the_rearm_keep_servicing_and_end_on_the_right_buffer() {
+    // No waiting for the painter between modesets: it is sometimes busy re-arming when the
+    // compositor changes mode, which is the stale-dimension race. Individual grabs may be
+    // refused (the module answers EINVAL), but servicing must carry on with the final mode.
+    let kernel = MockKernel::new();
+    let mut b = backend(&kernel);
+    b.create_monitor(&cfg(1)).await.unwrap();
+    let minor = b.card_index(1).unwrap();
+    assert!(kernel.commit_and_wait(minor, 2560, 1440, FRAME_WAIT));
+
+    let sizes = [(1920u32, 1080u32), (1280, 720), (2560, 1440), (1600, 900)];
+    for i in 0..24 {
+        let (w, h) = sizes[i % sizes.len()];
+        let CommitOutcome::Committed(n) = kernel.compositor_modeset(minor, w, h) else {
+            panic!("modeset refused");
+        };
+        assert!(
+            kernel.wait_flip(minor, n, FRAME_WAIT),
+            "stalled at modeset {i}"
+        );
+    }
+    let (w, h) = sizes[23 % sizes.len()];
+    assert!(wait_until(|| b.painter_stats(1).unwrap().mode == Some((w as i32, h as i32))).await);
+    for _ in 0..5 {
+        assert!(kernel.commit_and_wait(minor, w, h, FRAME_WAIT));
+    }
+    assert_eq!(kernel.last_grab_buffer_len(), Some((w * h * 4) as usize));
+    assert_eq!(kernel.buffer_faults(), 0);
+}
+
+// ---- dead painter ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn dead_painter_marks_the_monitor_failed_and_check_health_tears_it_down() {
+    let kernel = MockKernel::new();
+    let mut b = backend(&kernel);
+    b.create_monitor(&cfg(1)).await.unwrap();
+    let minor = b.card_index(1).unwrap();
+    assert_eq!(b.list_monitors().len(), 1);
+    assert!(b.failed_monitors().is_empty());
+
+    kernel.inject_fatal_io(minor);
+
+    assert!(wait_until(|| !b.failed_monitors().is_empty()).await);
+    let failed = b.failed_monitors();
+    assert_eq!(failed[0].0, 1);
+    assert!(failed[0].1.contains("poll failed"), "{failed:?}");
+    // No longer reported as a live monitor, though still registered.
+    assert!(b.list_monitors().is_empty());
+    assert!(kernel.is_connected(minor), "not torn down until checked");
+
+    let errors = b.check_health();
+    assert_eq!(errors.len(), 1);
+    let text = errors[0].1.to_string();
+    assert!(
+        text.contains("torn down") && text.contains("poll failed"),
+        "{text}"
+    );
+    assert!(
+        !kernel.is_connected(minor),
+        "fd closed, monitor disconnected"
+    );
+    assert_eq!(kernel.open_fds(minor), 0);
+    assert_eq!(b.card_index(1), None);
+    assert!(b.check_health().is_empty());
+}
+
+#[tokio::test]
+async fn create_monitor_reaps_a_dead_monitor_and_reuses_its_card() {
+    let kernel = MockKernel::new();
+    let mut b = backend(&kernel);
+    b.create_monitor(&cfg(1)).await.unwrap();
+    let minor = b.card_index(1).unwrap();
+    kernel.inject_fatal_io(minor);
+    assert!(wait_until(|| !b.failed_monitors().is_empty()).await);
+
+    // Same id again: not "already active", and the freed card is reused.
+    b.create_monitor(&cfg(1)).await.unwrap();
+    assert_eq!(b.card_index(1), Some(minor));
+    assert_eq!(kernel.add_calls(), 1);
+    assert!(b.failed_monitors().is_empty());
+    assert!(kernel.commit_and_wait(minor, 2560, 1440, FRAME_WAIT));
+}
+
+#[tokio::test]
+async fn healthy_monitor_is_not_reported_failed() {
+    let kernel = MockKernel::new();
+    let mut b = backend(&kernel);
+    b.create_monitor(&cfg(1)).await.unwrap();
+    assert!(b.check_health().is_empty());
+    assert_eq!(b.list_monitors().len(), 1);
 }

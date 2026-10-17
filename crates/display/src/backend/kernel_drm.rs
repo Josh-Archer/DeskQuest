@@ -38,11 +38,27 @@
 //!
 //! # Card selection and creation
 //!
+//! Scan, select and CONNECT run under an exclusive `flock` ([`KernelOps::lock_selection`]) so
+//! two processes (or two backends in one process) using this crate cannot both pick the same
+//! idle card. The lock is held until CONNECT has succeeded.
+//!
 //! 1. Reuse an evdi card that is not USB-attached and whose connector status is
-//!    `disconnected`.
+//!    `disconnected` (an unreadable status counts as busy).
 //! 2. Otherwise write `1` to `add`, then poll (bounded, [`ADD_WAIT`]) for a card that was not
 //!    in the before-set, retrying `open` on `ENOENT`/`EACCES` while udev creates the node and
-//!    applies its permissions.
+//!    applies its permissions. A new card is only chosen if, after a short settle delay
+//!    ([`USB_SETTLE`]), it still has no USB marker and its status reads `disconnected`:
+//!    the module creates the `device` symlink of a USB-attached card slightly after the card
+//!    itself appears.
+//! 3. After opening, the fd is made non-master like libevdi does (see `drop_master`); if it
+//!    is still master afterwards the open fails.
+//!
+//! Remaining limits (not solvable from here): the lock only serialises clients that take it.
+//! The DisplayLink service, other `libevdi` users and anything writing `add` directly do not,
+//! so a card they create or connect between our scan and our CONNECT can still be taken
+//! ("double connect" silently replaces the other client). A USB marker that appears later than
+//! [`USB_SETTLE`] after the card shows up is not seen either. If no lock file can be created
+//! safely the monitor creation fails instead of proceeding unlocked.
 //!
 //! Before any EVDI ioctl, the opened node is checked with `DRM_IOCTL_VERSION` to be driver
 //! `evdi`: request `0x40` is `DRM_COMMAND_BASE + 0` for every DRM driver, so sending it to an
@@ -70,11 +86,12 @@ pub mod painter;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::{VirtualDisplayBackend, VirtualMonitor};
 use crate::config::VirtualMonitorConfig;
@@ -86,8 +103,8 @@ pub use mock::MockKernel;
 pub use painter::{PainterService, PainterSnapshot};
 
 use abi::{
-    as_bytes_mut, DrmEvdiConnect, DrmVersion, DRM_IOCTL_DROP_MASTER, DRM_IOCTL_EVDI_CONNECT,
-    DRM_IOCTL_VERSION, EVDI_DRIVER_NAME, MIN_MODULE_MINOR, MODULE_MAJOR,
+    as_bytes_mut, DrmEvdiConnect, DrmVersion, DRM_IOCTL_AUTH_MAGIC, DRM_IOCTL_DROP_MASTER,
+    DRM_IOCTL_EVDI_CONNECT, DRM_IOCTL_VERSION, EVDI_DRIVER_NAME, MIN_MODULE_MINOR, MODULE_MAJOR,
 };
 
 /// Root of the EVDI sysfs interface (`root_device_register("evdi")`).
@@ -103,6 +120,11 @@ const EVDI_DEVICE_COUNT_MAX: usize = 16;
 pub const ADD_WAIT: Duration = Duration::from_millis(2000);
 /// Poll interval while waiting for `add`.
 pub const ADD_POLL: Duration = Duration::from_millis(20);
+/// Settle delay before trusting the (absence of a) USB marker on a freshly added card.
+pub const USB_SETTLE: Duration = Duration::from_millis(100);
+/// How long to wait for the cross-process selection lock.
+pub const LOCK_WAIT: Duration = Duration::from_secs(10);
+const LOCK_POLL: Duration = Duration::from_millis(20);
 /// Maximum EDID size the module accepts: `255 * 128 + sizeof(struct edid)`.
 const MAX_EDID_SIZE: usize = 256 * 128;
 
@@ -121,7 +143,15 @@ pub trait CardHandle: Send + Sync {
     fn read(&self, buf: &mut [u8]) -> io::Result<usize>;
     /// Waits until the fd is readable or `timeout` elapses. `Ok(false)` on timeout.
     fn wait_readable(&self, timeout: Duration) -> io::Result<bool>;
+    /// Declares the allocation behind the destination buffer of the next `GRABPIX`. The real
+    /// kernel cannot know a user buffer's length (an undersized one is a user-space memory
+    /// bug), so [`SysCard`] ignores this; the model in [`mock`] uses it to bounds-check what
+    /// the kernel would write.
+    fn register_buffer(&self, _ptr: *mut u8, _len: usize) {}
 }
+
+/// Guard for the cross-process card-selection lock; dropping it releases the lock.
+pub trait SelectionLock: Send {}
 
 /// Raw kernel/filesystem access used by this backend.
 ///
@@ -142,6 +172,8 @@ pub trait KernelOps: Send + Sync {
     fn write_attr(&self, path: &Path, data: &[u8]) -> io::Result<()>;
     /// Opens a DRM card node read/write, non-blocking, close-on-exec.
     fn open_card(&self, path: &Path) -> io::Result<Arc<dyn CardHandle>>;
+    /// Takes the exclusive card-selection lock (waiting a bounded time), see the module docs.
+    fn lock_selection(&self) -> io::Result<Box<dyn SelectionLock>>;
     /// Effective uid, for diagnostics.
     fn euid(&self) -> u32;
     /// Sleeps; the model uses a virtual clock.
@@ -277,9 +309,113 @@ impl KernelOps for SysKernel {
         Ok(Arc::new(SysCard { file }))
     }
 
+    fn lock_selection(&self) -> io::Result<Box<dyn SelectionLock>> {
+        let euid = self.euid();
+        let path = lock_file_path(euid);
+        let file = open_lock_file(&path, euid)?;
+        flock_exclusive(&file, LOCK_WAIT, LOCK_POLL)
+            .map_err(|e| io::Error::new(e.kind(), format!("lock file {}: {e}", path.display())))?;
+        Ok(Box::new(FlockGuard { _file: file }))
+    }
+
     fn euid(&self) -> u32 {
         // SAFETY: geteuid(2) has no preconditions and cannot fail.
         unsafe { libc::geteuid() }
+    }
+}
+
+/// Holds the locked file; closing it releases the `flock`.
+struct FlockGuard {
+    _file: std::fs::File,
+}
+
+impl SelectionLock for FlockGuard {}
+
+/// Whether `dir` is a directory owned by `euid` that nobody else can write to.
+fn private_dir(dir: &Path, euid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(dir).is_ok_and(|m| m.is_dir() && m.uid() == euid && m.mode() & 0o022 == 0)
+}
+
+/// Where the selection lock lives: `$XDG_RUNTIME_DIR` or `/run/user/$UID` if that is a private
+/// directory of ours, else `/tmp/linux-quest-evdi-$UID.lock` (sticky, world-writable: the file
+/// itself is verified by [`open_lock_file`]).
+fn lock_file_path(euid: u32) -> PathBuf {
+    const NAME: &str = "linux-quest-evdi.lock";
+    let xdg = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute() && private_dir(p, euid));
+    if let Some(dir) = xdg {
+        return dir.join(NAME);
+    }
+    let run = PathBuf::from(format!("/run/user/{euid}"));
+    if private_dir(&run, euid) {
+        return run.join(NAME);
+    }
+    PathBuf::from(format!("/tmp/linux-quest-evdi-{euid}.lock"))
+}
+
+/// Opens (creating with mode 0600) the lock file without following symlinks and verifies it
+/// is a regular, single-link file owned by `euid` that only the owner can access. Anything
+/// else (a file pre-created by another user, a symlink, a hard link) is refused.
+fn open_lock_file(path: &Path, euid: u32) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("cannot open lock file {} safely: {e}", path.display()),
+            )
+        })?;
+    let md = file.metadata()?;
+    if !md.file_type().is_file() || md.uid() != euid || md.mode() & 0o077 != 0 || md.nlink() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing lock file {}: it must be a regular file with a single link, owned by \
+                 uid {euid} and mode 0600 (found uid {}, mode {:o}, {} link(s))",
+                path.display(),
+                md.uid(),
+                md.mode() & 0o7777,
+                md.nlink()
+            ),
+        ));
+    }
+    Ok(file)
+}
+
+/// `flock(LOCK_EX)` polled with `LOCK_NB` so a stuck holder cannot hang us forever.
+fn flock_exclusive(file: &std::fs::File, wait: Duration, poll: Duration) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        // SAFETY: the fd is open for the duration of the call.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        match err.kind() {
+            io::ErrorKind::WouldBlock => {}
+            io::ErrorKind::Interrupted => continue,
+            _ => return Err(err),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "another process held the EVDI card-selection lock for more than {}s",
+                    wait.as_secs_f32()
+                ),
+            ));
+        }
+        std::thread::sleep(poll);
     }
 }
 
@@ -504,6 +640,7 @@ pub struct EvdiOutput {
     index: u32,
     service: Option<PainterService>,
     card: Arc<dyn CardHandle>,
+    failure_logged: AtomicBool,
 }
 
 impl EvdiOutput {
@@ -523,13 +660,39 @@ impl EvdiOutput {
             .as_ref()
             .is_some_and(PainterService::is_running)
     }
+
+    /// `Err(reason)` if nobody services the card any more (painter thread died on a fatal
+    /// error or panicked): the compositor sees a connected output that never presents.
+    pub fn health(&self) -> Result<(), String> {
+        if self.is_serviced() {
+            return Ok(());
+        }
+        Err(self
+            .service
+            .as_ref()
+            .and_then(PainterService::failure)
+            .unwrap_or_else(|| "painter thread is not running".into()))
+    }
+
+    /// Logs the failure at error level, the first time only.
+    fn log_failure_once(&self, id: u32, reason: &str) {
+        if !self.failure_logged.swap(true, Ordering::Relaxed) {
+            error!(
+                "EVDI monitor {id} on card{} failed and is no longer serviced: {reason}",
+                self.index
+            );
+        }
+    }
 }
 
 impl Drop for EvdiOutput {
     fn drop(&mut self) {
         // Stop and join the thread (it holds a clone of the fd), then `self.card` is dropped
         // after this body returns: the last reference closes the fd and the module
-        // disconnects. Nothing here can panic.
+        // disconnects. Nothing here can panic. The join is bounded by `painter::STOP_TIMEOUT`
+        // (normally one `POLL_INTERVAL`); if the thread is stuck in the kernel it is detached
+        // and keeps the fd open until it returns. Async callers go through `destroy_monitor`,
+        // which runs this on a blocking thread.
         if let Some(mut service) = self.service.take() {
             service.stop();
         }
@@ -546,6 +709,7 @@ enum ConnectError {
     Open(io::Error),
     NotEvdi(String),
     ModuleVersion(String),
+    Master(String),
     Ioctl(&'static str, io::Error),
     Thread(io::Error),
 }
@@ -557,6 +721,15 @@ impl ConnectError {
             self,
             ConnectError::Open(e)
                 if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied)
+        )
+    }
+
+    /// Failures that say the card or module is unusable for us, not that udev is still
+    /// working: creating yet another card would fail the same way.
+    fn is_environment_fault(&self) -> bool {
+        matches!(
+            self,
+            ConnectError::NotEvdi(_) | ConnectError::ModuleVersion(_) | ConnectError::Master(_)
         )
     }
 
@@ -577,6 +750,11 @@ impl ConnectError {
             ConnectError::ModuleVersion(v) => format!(
                 "{}: EVDI module version {v} is not compatible (need {MODULE_MAJOR}.x with \
                  x >= {MIN_MODULE_MINOR}); update evdi-dkms",
+                path.display()
+            ),
+            ConnectError::Master(why) => format!(
+                "{}: this process is still DRM master of the card ({why}); a compositor could \
+                 not take it. Refusing to connect",
                 path.display()
             ),
             ConnectError::Ioctl(what, e) => format!("{what} on {} failed: {e}", path.display()),
@@ -620,6 +798,34 @@ fn verify_evdi(card: &dyn CardHandle) -> Result<(), ConnectError> {
     Ok(())
 }
 
+/// libevdi's `drm_is_master`: `DRM_IOCTL_AUTH_MAGIC` with magic 0 needs master, so a non-master
+/// fd fails with `EACCES`; anything else (success or `EINVAL`) means master.
+fn is_master(card: &dyn CardHandle) -> bool {
+    let mut magic = [0u8; 4];
+    match card.ioctl(DRM_IOCTL_AUTH_MAGIC, &mut magic) {
+        Err(e) => e.raw_os_error() != Some(libc::EACCES),
+        Ok(_) => true,
+    }
+}
+
+/// Like libevdi's `open_as_slave`: a fresh open of an idle primary node can be DRM master,
+/// which would stop the compositor from taking master on the card. Drop it, then verify; fail
+/// if it cannot be dropped or the fd is still master afterwards.
+fn drop_master(card: &dyn CardHandle, index: u32) -> Result<(), ConnectError> {
+    if !is_master(card) {
+        return Ok(());
+    }
+    debug!("card{index}: fd is DRM master after open, dropping it");
+    card.ioctl(DRM_IOCTL_DROP_MASTER, &mut [])
+        .map_err(|e| ConnectError::Master(format!("DRM_IOCTL_DROP_MASTER failed: {e}")))?;
+    if is_master(card) {
+        return Err(ConnectError::Master(
+            "still master after DRM_IOCTL_DROP_MASTER".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Opens `/dev/dri/card{index}`, verifies it, connects `edid`, and starts servicing.
 fn open_and_connect(
     ops: &dyn KernelOps,
@@ -630,11 +836,7 @@ fn open_and_connect(
     let card = ops.open_card(&path).map_err(ConnectError::Open)?;
     verify_evdi(card.as_ref())?;
 
-    // Like libevdi: a fresh open of an idle primary node makes this fd DRM master, which
-    // would stop the compositor from taking master on the card. Best effort.
-    if let Err(e) = card.ioctl(DRM_IOCTL_DROP_MASTER, &mut []) {
-        debug!("DROP_MASTER on card{index}: {e} (not master, ignoring)");
-    }
+    drop_master(card.as_ref(), index)?;
 
     let mut args = DrmEvdiConnect {
         connected: 1,
@@ -660,6 +862,7 @@ fn open_and_connect(
         index,
         service: Some(service),
         card,
+        failure_logged: AtomicBool::new(false),
     })
 }
 
@@ -682,13 +885,23 @@ fn add_error(err: &io::Error, euid: u32) -> DisplayError {
 }
 
 /// Finds an idle card or creates one, and connects `edid` to it. Blocking.
+///
+/// Holds the cross-process selection lock for the whole call, i.e. until CONNECT succeeded
+/// (the returned output keeps the connection; the lock is released on return).
 fn acquire_output(
     ops: &dyn KernelOps,
     edid: &[u8],
     held: &HashSet<u32>,
 ) -> Result<EvdiOutput, DisplayError> {
     let euid = ops.euid();
+    let _lock = ops.lock_selection().map_err(|e| {
+        DisplayError::CommandFailed(format!(
+            "cannot take the EVDI card-selection lock ({e}); not choosing a card without it, \
+             because another process could be taking the same one"
+        ))
+    })?;
     let mut notes: Vec<String> = Vec::new();
+    let mut environment_fault: Option<String> = None;
 
     // 1. Reuse an idle card.
     let cards = scan_evdi_cards(ops);
@@ -704,9 +917,19 @@ fn acquire_output(
             Err(e) => {
                 let note = e.describe(&card.node(), euid);
                 warn!("Skipping EVDI card{}: {note}", card.index);
+                if e.is_environment_fault() {
+                    environment_fault.get_or_insert_with(|| note.clone());
+                }
                 notes.push(note);
             }
         }
+    }
+    // A wrong driver, incompatible module or undroppable master is not fixed by adding
+    // another card (it would fail the same way): report it instead.
+    if let Some(fault) = environment_fault {
+        return Err(DisplayError::CommandFailed(format!(
+            "{fault}. Not creating another card, it would fail the same way"
+        )));
     }
 
     // 2. Create one.
@@ -722,13 +945,50 @@ fn acquire_output(
 
     let attempts = (ADD_WAIT.as_millis() / ADD_POLL.as_millis()).max(1);
     let mut last_transient: Option<String> = None;
+    let mut settled: HashSet<u32> = HashSet::new();
+    let mut rejected: HashMap<u32, String> = HashMap::new();
     for _ in 0..attempts {
-        for card in scan_evdi_cards(ops).iter().filter(|c| {
-            !before.contains(&c.index)
-                && !held.contains(&c.index)
-                && !c.usb_attached
-                && c.connected != Some(true)
-        }) {
+        for fresh in scan_evdi_cards(ops)
+            .into_iter()
+            .filter(|c| !before.contains(&c.index) && !held.contains(&c.index))
+        {
+            // The module creates the `device` symlink of a USB-attached card a moment after
+            // the card appears: look again once, after a bounded settle delay, before
+            // trusting "no USB marker".
+            let card = if settled.insert(fresh.index) {
+                ops.sleep(USB_SETTLE);
+                match scan_evdi_cards(ops)
+                    .into_iter()
+                    .find(|c| c.index == fresh.index)
+                {
+                    Some(c) => c,
+                    None => continue,
+                }
+            } else {
+                fresh
+            };
+            if card.usb_attached {
+                rejected.insert(card.index, format!("card{} is USB-attached", card.index));
+                continue;
+            }
+            match card.connected {
+                Some(false) => {}
+                Some(true) => {
+                    rejected.insert(
+                        card.index,
+                        format!("card{} is already connected to another client", card.index),
+                    );
+                    continue;
+                }
+                None => {
+                    // Unreadable status is treated as busy, exactly as on the reuse path.
+                    rejected.insert(
+                        card.index,
+                        format!("card{} has an unreadable connector status", card.index),
+                    );
+                    continue;
+                }
+            }
             match open_and_connect(ops, card.index, edid) {
                 Ok(out) => {
                     info!("Created and connected EVDI card{}", card.index);
@@ -751,11 +1011,16 @@ fn acquire_output(
             ADD_WAIT.as_millis()
         ),
         None => format!(
-            "wrote 1 to {EVDI_ROOT}/add but no new evdi DRM card appeared within {}ms (check \
-             `dmesg | grep -i evdi`)",
+            "wrote 1 to {EVDI_ROOT}/add but no usable new evdi DRM card appeared within {}ms \
+             (check `dmesg | grep -i evdi`)",
             ADD_WAIT.as_millis()
         ),
     };
+    if !rejected.is_empty() {
+        let mut why: Vec<_> = rejected.into_values().collect();
+        why.sort();
+        msg.push_str(&format!(". New card(s) not used: {}", why.join("; ")));
+    }
     msg.push_str(
         ". The added device stays in place and will be reused by the next attempt; it is \
          never removed individually",
@@ -819,6 +1084,42 @@ impl KernelDrmDisplayBackend {
         self.outputs.get(&id).and_then(EvdiOutput::stats)
     }
 
+    /// Monitors whose painter thread died (fatal error or panic), with the reason. Their
+    /// outputs are still registered but nobody services them: the compositor sees a
+    /// connected output that never presents.
+    pub fn failed_monitors(&self) -> Vec<(u32, String)> {
+        let mut failed: Vec<_> = self
+            .outputs
+            .iter()
+            .filter_map(|(id, out)| out.health().err().map(|why| (*id, why)))
+            .collect();
+        failed.sort_by_key(|(id, _)| *id);
+        failed
+    }
+
+    /// Health check: tears down every monitor whose painter died (closing its fd frees the
+    /// card for reuse) and returns one error per torn-down monitor. Logs at error level the
+    /// first time a failure is seen. Also run at the start of `init`/`create_monitor`.
+    pub fn check_health(&mut self) -> Vec<(u32, DisplayError)> {
+        let mut errors = Vec::new();
+        for (id, why) in self.failed_monitors() {
+            if let Some(out) = self.outputs.remove(&id) {
+                out.log_failure_once(id, &why);
+                // The thread already exited, so this drop does not block.
+                let card = out.card_index();
+                drop(out);
+                errors.push((
+                    id,
+                    DisplayError::CommandFailed(format!(
+                        "monitor {id} on card{card} failed and was torn down: {why}"
+                    )),
+                ));
+            }
+            self.monitors.remove(&id);
+        }
+        errors
+    }
+
     fn unavailable_error(&self) -> DisplayError {
         DisplayError::BackendUnavailable(format!(
             "Kernel DRM dummy display (EVDI) unavailable: {}",
@@ -836,7 +1137,10 @@ impl Default for KernelDrmDisplayBackend {
 impl Drop for KernelDrmDisplayBackend {
     fn drop(&mut self) {
         // Dropping each output joins its painter thread and closes its fd, which disconnects
-        // the monitor in the kernel. Best effort; nothing here panics.
+        // the monitor in the kernel. Best effort; nothing here panics. This blocks the
+        // calling thread for about one painter poll interval per output (bounded by
+        // `painter::STOP_TIMEOUT` each if a thread is stuck in the kernel); call
+        // `destroy_monitor` first from async code if that matters.
         if !self.outputs.is_empty() {
             debug!("Dropping {} EVDI output(s)", self.outputs.len());
             self.outputs.clear();
@@ -855,6 +1159,7 @@ impl VirtualDisplayBackend for KernelDrmDisplayBackend {
     }
 
     async fn init(&mut self) -> Result<(), DisplayError> {
+        self.check_health();
         self.refresh_probe();
         if !self.available {
             return Err(self.unavailable_error());
@@ -866,6 +1171,8 @@ impl VirtualDisplayBackend for KernelDrmDisplayBackend {
         &mut self,
         config: &VirtualMonitorConfig,
     ) -> Result<VirtualMonitor, DisplayError> {
+        // Reap monitors whose painter died so their ids and cards are free again.
+        self.check_health();
         self.refresh_probe();
         if !self.available {
             return Err(self.unavailable_error());
@@ -959,9 +1266,160 @@ impl VirtualDisplayBackend for KernelDrmDisplayBackend {
         Ok(())
     }
 
+    /// Lists the monitors that are alive. A monitor whose painter died is *not* listed (it is
+    /// failed, see [`KernelDrmDisplayBackend::failed_monitors`]); it is logged at error level
+    /// the first time and torn down by the next [`KernelDrmDisplayBackend::check_health`],
+    /// `init` or `create_monitor`.
     fn list_monitors(&self) -> Vec<VirtualMonitor> {
-        let mut list: Vec<_> = self.monitors.values().cloned().collect();
+        let mut list: Vec<_> = self
+            .monitors
+            .values()
+            .filter(|m| match self.outputs.get(&m.id) {
+                Some(out) => match out.health() {
+                    Ok(()) => true,
+                    Err(why) => {
+                        out.log_failure_once(m.id, &why);
+                        false
+                    }
+                },
+                None => false,
+            })
+            .cloned()
+            .collect();
         list.sort_by_key(|m| m.id);
         list
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    /// A fresh scratch directory under the system temp dir.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lq-evdi-lock-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn euid() -> u32 {
+        SysKernel.euid()
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn lock_file_is_created_private_and_excludes_a_second_holder() {
+        let dir = scratch("excl");
+        let path = dir.join("evdi.lock");
+        let first = open_lock_file(&path, euid()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o600);
+        flock_exclusive(&first, Duration::from_millis(50), Duration::from_millis(5)).unwrap();
+
+        // A second open file description conflicts, even inside one process.
+        let second = open_lock_file(&path, euid()).unwrap();
+        let err = flock_exclusive(&second, Duration::from_millis(60), Duration::from_millis(5))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+
+        drop(first); // releases the lock
+        flock_exclusive(
+            &second,
+            Duration::from_millis(200),
+            Duration::from_millis(5),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn lock_waits_for_a_holder_that_releases_in_time() {
+        let dir = scratch("wait");
+        let path = dir.join("evdi.lock");
+        let holder = open_lock_file(&path, euid()).unwrap();
+        flock_exclusive(&holder, Duration::from_millis(50), Duration::from_millis(5)).unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            drop(holder);
+        });
+        let waiter = open_lock_file(&path, euid()).unwrap();
+        flock_exclusive(&waiter, Duration::from_secs(2), Duration::from_millis(5)).unwrap();
+        releaser.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn symlinked_lock_file_is_refused() {
+        let dir = scratch("link");
+        let target = dir.join("target");
+        std::fs::write(&target, b"").unwrap();
+        set_mode(&target, 0o600);
+        let link = dir.join("evdi.lock");
+        symlink(&target, &link).unwrap();
+        let err = open_lock_file(&link, euid()).unwrap_err();
+        assert!(err.to_string().contains("safely"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn lock_file_with_loose_permissions_is_refused() {
+        let dir = scratch("mode");
+        let path = dir.join("evdi.lock");
+        std::fs::write(&path, b"").unwrap();
+        set_mode(&path, 0o644);
+        let err = open_lock_file(&path, euid()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("mode 0600"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn lock_file_owned_by_someone_else_is_refused() {
+        let dir = scratch("owner");
+        let path = dir.join("evdi.lock");
+        std::fs::write(&path, b"").unwrap();
+        set_mode(&path, 0o600);
+        // Ask for a different effective uid than the file's owner: the same check that
+        // rejects a file pre-created by another user in /tmp.
+        let err = open_lock_file(&path, euid() + 1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("owned by"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hard_linked_lock_file_is_refused() {
+        let dir = scratch("hard");
+        let path = dir.join("evdi.lock");
+        std::fs::write(&path, b"").unwrap();
+        set_mode(&path, 0o600);
+        std::fs::hard_link(&path, dir.join("other")).unwrap();
+        assert!(open_lock_file(&path, euid()).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn lock_path_is_private_runtime_dir_or_tmp_and_world_writable_dirs_are_not_trusted() {
+        let text = lock_file_path(euid()).to_string_lossy().into_owned();
+        assert!(
+            text.ends_with("linux-quest-evdi.lock")
+                || text == format!("/tmp/linux-quest-evdi-{}.lock", euid()),
+            "{text}"
+        );
+        let dir = scratch("perm");
+        set_mode(&dir, 0o777);
+        assert!(!private_dir(&dir, euid()));
+        set_mode(&dir, 0o700);
+        assert!(private_dir(&dir, euid()));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

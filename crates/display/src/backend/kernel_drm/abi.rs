@@ -19,6 +19,15 @@
 use std::ffi::{c_char, c_void};
 use std::mem::size_of;
 
+// The struct layouts below (`usize` lengths, 8-byte pointers, the explicit `_pad` fields) are
+// the LP64 layouts verified against a C compiler. A 32-bit build would silently produce
+// wrong sizes and therefore wrong ioctl request numbers, so refuse to compile instead.
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!(
+    "the EVDI backend ABI is only verified for 64-bit (LP64) targets; the struct layouts and \
+     ioctl request numbers in kernel_drm::abi would be wrong on this target"
+);
+
 // ---------------------------------------------------------------------------------------
 // ioctl request encoding (asm-generic/ioctl.h, as used on x86, arm, arm64, riscv, ...)
 // ---------------------------------------------------------------------------------------
@@ -109,6 +118,10 @@ pub struct DrmVersion {
 pub const DRM_IOCTL_VERSION: u32 = iowr(DRM_IOCTL_BASE, 0x00, size_of::<DrmVersion>());
 /// `DRM_IOCTL_DROP_MASTER` = `DRM_IO(0x1f)`.
 pub const DRM_IOCTL_DROP_MASTER: u32 = ioc(IOC_NONE, DRM_IOCTL_BASE, 0x1f, 0);
+/// `DRM_IOCTL_AUTH_MAGIC` = `DRM_IOW(0x11, struct drm_auth)`; `struct drm_auth` is one
+/// `unsigned int`. libevdi (`drm_is_master`) uses `AUTH_MAGIC` with magic 0 as a master probe:
+/// it needs master, so a non-master fd fails with `EACCES` and a master fd with `EINVAL`.
+pub const DRM_IOCTL_AUTH_MAGIC: u32 = ioc(IOC_WRITE, DRM_IOCTL_BASE, 0x11, 4);
 
 // ---------------------------------------------------------------------------------------
 // EVDI
@@ -547,6 +560,12 @@ mod tests {
             f.len(),
             "fixture has lines this test does not compare"
         );
+    }
+
+    #[test]
+    fn auth_magic_matches_the_kernel_header_value() {
+        // include/uapi/drm/drm.h: DRM_IOW(0x11, struct drm_auth) with a 4-byte struct.
+        assert_eq!(DRM_IOCTL_AUTH_MAGIC, 0x4004_6411);
     }
 
     #[test]
