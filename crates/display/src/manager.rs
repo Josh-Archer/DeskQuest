@@ -11,6 +11,48 @@ use crate::edid::EdidGenerator;
 use crate::error::DisplayError;
 use crate::layout::{DisplayLayout, DisplayLayoutMode};
 
+/// One entry in the automatic backend selection: a backend that is available, or the reasons
+/// it is not.
+pub(crate) struct Candidate {
+    label: &'static str,
+    backend: Option<Box<dyn VirtualDisplayBackend>>,
+    hints: Vec<String>,
+}
+
+impl Candidate {
+    pub(crate) fn available(
+        label: &'static str,
+        backend: impl VirtualDisplayBackend + 'static,
+    ) -> Self {
+        Self {
+            label,
+            backend: Some(Box::new(backend)),
+            hints: Vec::new(),
+        }
+    }
+
+    pub(crate) fn unavailable(label: &'static str, hints: Vec<String>) -> Self {
+        Self {
+            label,
+            backend: None,
+            hints,
+        }
+    }
+
+    pub(crate) fn probed(
+        label: &'static str,
+        is_available: bool,
+        hints: Vec<String>,
+        backend: impl VirtualDisplayBackend + 'static,
+    ) -> Self {
+        if is_available {
+            Self::available(label, backend)
+        } else {
+            Self::unavailable(label, hints)
+        }
+    }
+}
+
 /// High-level virtual multi-monitor manager managing monitor lifecycle, layouts, and display servers.
 pub struct VirtualDisplayManager {
     backend: Box<dyn VirtualDisplayBackend>,
@@ -31,57 +73,83 @@ impl VirtualDisplayManager {
     /// Automatically discovers and selects the best available display backend for the current environment.
     ///
     /// Selection order: wlroots (Sway/Hyprland), GNOME Mutter, X11, then the kernel DRM
-    /// dummy-display fallback (VKMS/EVDI, see [`crate::backend::kernel_drm`]).
+    /// dummy-display fallback (EVDI, see [`crate::backend::kernel_drm`]), which is always last.
     ///
-    /// Returns `DisplayError::BackendUnavailable` if none of these is usable. The message
-    /// includes the kernel fallback's diagnostics (missing module, permissions) so the user
-    /// knows what to fix.
+    /// A backend that is unavailable, or whose `init` fails, is skipped and the next one is
+    /// tried. If none works the error is `DisplayError::BackendUnavailable` listing every
+    /// backend's diagnostic, including the commands that fix the kernel fallback (install
+    /// `evdi-dkms`, `modprobe evdi`, group membership/udev).
     pub async fn create_auto() -> Result<Self, DisplayError> {
-        // 1. Check wlroots / Sway / Hyprland (preferred when Wayland socket is active)
-        let wlr = WlrDisplayBackend::new();
-        if wlr.is_available() {
-            info!("Selected wlroots/Wayland display backend: {}", wlr.name());
-            let mut mgr = Self::new(Box::new(wlr));
-            mgr.backend.init().await?;
-            return Ok(mgr);
-        }
+        let mut candidates = Vec::new();
 
-        // 2. Check GNOME Mutter (D-Bus)
-        if let Ok(conn) = zbus::Connection::session().await {
-            if MutterDisplayBackend::probe_screencast_service(&conn).await {
-                info!("Selected GNOME Mutter display backend");
-                let mut mutter = MutterDisplayBackend::new();
-                mutter.init().await?;
-                return Ok(Self::new(Box::new(mutter)));
+        let wlr = WlrDisplayBackend::new();
+        candidates.push(Candidate::probed(
+            "wlroots (Sway/Hyprland)",
+            wlr.is_available(),
+            vec!["neither SWAYSOCK nor HYPRLAND_INSTANCE_SIGNATURE is set".into()],
+            wlr,
+        ));
+
+        // Mutter needs an async D-Bus probe, so it cannot use `is_available()`.
+        let mutter_probe = match zbus::Connection::session().await {
+            Ok(conn) if MutterDisplayBackend::probe_screencast_service(&conn).await => Ok(()),
+            Ok(_) => Err("org.gnome.Mutter.ScreenCast is not owned on the session bus".to_string()),
+            Err(e) => Err(format!("no D-Bus session bus: {e}")),
+        };
+        candidates.push(match mutter_probe {
+            Ok(()) => Candidate::available("GNOME Mutter", MutterDisplayBackend::new()),
+            Err(why) => Candidate::unavailable("GNOME Mutter", vec![why]),
+        });
+
+        let x11 = X11DisplayBackend::new();
+        candidates.push(Candidate::probed(
+            "X11 (xrandr)",
+            x11.is_available(),
+            vec!["$DISPLAY is not set".into()],
+            x11,
+        ));
+
+        // Kernel EVDI fallback: last resort for sessions without a virtual output API.
+        let kernel = KernelDrmDisplayBackend::new();
+        let hints = kernel.diagnostics().to_vec();
+        candidates.push(Candidate::probed(
+            "kernel DRM (EVDI)",
+            kernel.is_available(),
+            hints,
+            kernel,
+        ));
+
+        Self::select(candidates).await
+    }
+
+    /// Picks the first candidate that is available and initialises, in order. Crate-visible so
+    /// selection and the aggregated error can be tested with fake backends.
+    pub(crate) async fn select(candidates: Vec<Candidate>) -> Result<Self, DisplayError> {
+        let mut failures: Vec<String> = Vec::new();
+        for candidate in candidates {
+            let Candidate {
+                label,
+                backend,
+                hints,
+            } = candidate;
+            match backend {
+                None => failures.push(format!("{label}: {}", hints.join("; "))),
+                Some(mut backend) => match backend.init().await {
+                    Ok(()) => {
+                        info!("Selected display backend: {}", backend.name());
+                        return Ok(Self::new(backend));
+                    }
+                    Err(e) => failures.push(format!("{label}: init failed: {e}")),
+                },
             }
         }
-
-        // 3. Check X11 (xrandr)
-        let x11 = X11DisplayBackend::new();
-        if x11.is_available() {
-            info!("Selected X11 display backend: {}", x11.name());
-            let mut mgr = Self::new(Box::new(x11));
-            mgr.backend.init().await?;
-            return Ok(mgr);
-        }
-
-        // 4. Kernel DRM dummy display (VKMS / EVDI): last resort for compositors without a
-        // virtual output API. Needs no session socket, only the kernel module and access.
-        let kernel = KernelDrmDisplayBackend::new();
-        if kernel.is_available() {
-            info!(
-                "Selected kernel DRM dummy-display backend: {}",
-                kernel.name()
-            );
-            let mut mgr = Self::new(Box::new(kernel));
-            mgr.backend.init().await?;
-            return Ok(mgr);
-        }
-
         Err(DisplayError::BackendUnavailable(format!(
-            "No supported display server detected (GNOME Mutter, Sway, Hyprland, or X11), \
-             and the kernel DRM fallback (VKMS/EVDI) is unavailable: {}",
-            kernel.diagnostics().join("; ")
+            "No usable display backend. {}",
+            failures
+                .iter()
+                .map(|f| format!("[{f}]"))
+                .collect::<Vec<_>>()
+                .join(" ")
         )))
     }
 
@@ -265,5 +333,142 @@ impl VirtualDisplayManager {
     /// Returns a list of all currently active virtual monitors.
     pub fn list_active_monitors(&self) -> Vec<VirtualMonitor> {
         self.backend.list_monitors()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::kernel_drm::MockKernel;
+    use async_trait::async_trait;
+
+    /// Backend whose `init` result is scripted.
+    struct Fake {
+        name: &'static str,
+        init_error: Option<&'static str>,
+    }
+
+    #[async_trait]
+    impl VirtualDisplayBackend for Fake {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        async fn init(&mut self) -> Result<(), DisplayError> {
+            match self.init_error {
+                Some(why) => Err(DisplayError::BackendUnavailable(why.into())),
+                None => Ok(()),
+            }
+        }
+        async fn create_monitor(
+            &mut self,
+            _config: &VirtualMonitorConfig,
+        ) -> Result<VirtualMonitor, DisplayError> {
+            Err(DisplayError::InvalidConfiguration("fake".into()))
+        }
+        async fn destroy_monitor(&mut self, _id: u32) -> Result<(), DisplayError> {
+            Ok(())
+        }
+        async fn apply_layout(&mut self, _layout: &DisplayLayout) -> Result<(), DisplayError> {
+            Ok(())
+        }
+        fn list_monitors(&self) -> Vec<VirtualMonitor> {
+            Vec::new()
+        }
+    }
+
+    fn fake(name: &'static str, init_error: Option<&'static str>) -> Fake {
+        Fake { name, init_error }
+    }
+
+    #[tokio::test]
+    async fn select_prefers_earlier_backends_over_the_kernel_fallback() {
+        let kernel = KernelDrmDisplayBackend::with_ops(Box::new(MockKernel::new()));
+        assert!(kernel.is_available());
+        let mgr = VirtualDisplayManager::select(vec![
+            Candidate::unavailable("wlroots", vec!["no socket".into()]),
+            Candidate::available("X11", fake("x11", None)),
+            Candidate::available("kernel DRM (EVDI)", kernel),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(mgr.backend_name(), "x11");
+    }
+
+    #[tokio::test]
+    async fn select_falls_through_a_failing_init_to_the_next_backend() {
+        let mgr = VirtualDisplayManager::select(vec![
+            Candidate::available("Mutter", fake("mutter", Some("bus gone"))),
+            Candidate::available("kernel", fake("kernel", None)),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(mgr.backend_name(), "kernel");
+    }
+
+    #[tokio::test]
+    async fn select_uses_the_kernel_fallback_when_nothing_else_works() {
+        let kernel = KernelDrmDisplayBackend::with_ops(Box::new(MockKernel::new()));
+        let mgr = VirtualDisplayManager::select(vec![
+            Candidate::unavailable("wlroots", vec!["no socket".into()]),
+            Candidate::unavailable("X11", vec!["no DISPLAY".into()]),
+            Candidate::available("kernel DRM (EVDI)", kernel),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(mgr.backend_name(), "Kernel DRM (EVDI)");
+    }
+
+    #[tokio::test]
+    async fn select_reports_every_backend_when_nothing_works() {
+        let kernel =
+            KernelDrmDisplayBackend::with_ops(Box::new(MockKernel::new().without_module()));
+        let hints = kernel.diagnostics().to_vec();
+        let Err(err) = VirtualDisplayManager::select(vec![
+            Candidate::unavailable("wlroots (Sway/Hyprland)", vec!["no SWAYSOCK".into()]),
+            Candidate::available("GNOME Mutter", fake("mutter", Some("bus gone"))),
+            Candidate::unavailable("X11 (xrandr)", vec!["$DISPLAY is not set".into()]),
+            Candidate::probed("kernel DRM (EVDI)", kernel.is_available(), hints, kernel),
+        ])
+        .await
+        else {
+            panic!("nothing should be usable");
+        };
+        let DisplayError::BackendUnavailable(msg) = err else {
+            panic!("wrong error kind: {err:?}");
+        };
+        for needle in [
+            "wlroots (Sway/Hyprland): no SWAYSOCK",
+            "GNOME Mutter: init failed",
+            "bus gone",
+            "X11 (xrandr): $DISPLAY is not set",
+            "kernel DRM (EVDI):",
+            "apt install evdi-dkms",
+            "sudo modprobe evdi",
+        ] {
+            assert!(msg.contains(needle), "missing `{needle}` in: {msg}");
+        }
+    }
+
+    /// Smoke test of the real discovery path. Only asserts when the machine has no usable
+    /// display backend (true in the sandbox and most CI); otherwise it skips.
+    #[tokio::test]
+    async fn create_auto_error_lists_all_four_backends() {
+        match VirtualDisplayManager::create_auto().await {
+            Ok(_) => {}
+            Err(DisplayError::BackendUnavailable(msg)) => {
+                for label in ["wlroots", "GNOME Mutter", "X11", "kernel DRM (EVDI)"] {
+                    assert!(msg.contains(label), "missing {label} in: {msg}");
+                }
+                let order: Vec<usize> = ["wlroots", "GNOME Mutter", "X11", "kernel DRM (EVDI)"]
+                    .iter()
+                    .map(|l| msg.find(l).unwrap())
+                    .collect();
+                assert!(order.windows(2).all(|w| w[0] < w[1]), "kernel must be last");
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
     }
 }

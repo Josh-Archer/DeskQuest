@@ -185,7 +185,7 @@ The project is structured into 7 core phases. Status reflects what is merged on 
 - [~] **Phase 2:** Linux Capture & Hardware Encoding Engine (PipeWire DMA-BUF capture, NVENC AV1/HEVC with intra-refresh and reference picture invalidation done; VA-API backend for AMD/Intel pending)
 - [~] **Phase 3:** Low-Latency Network & USB Transport (paced UDP, Reed-Solomon/XOR FEC, ADB reverse tunnel done; QUIC control channel and mDNS/SSDP LAN discovery pending)
 - [x] **Phase 4:** Meta Quest OpenXR Client & Hardware Decoder (AMediaCodec, Vulkan, Composition Layers)
-- [~] **Phase 5:** Virtual Multi-Monitor Management on Linux (wlroots, Mutter and X11 backends with dynamic EDID done; VKMS/EVDI kernel dummy-driver fallback pending)
+- [~] **Phase 5:** Virtual Multi-Monitor Management on Linux (wlroots, Mutter and X11 backends with dynamic EDID done; EVDI kernel dummy-driver fallback implemented but never run against real EVDI, see #31)
 - [x] **Phase 6:** Spatial Workspace, Passthrough & Input Redirection (6DoF screens, passthrough, controller/hand manipulation, uinput injection, clipboard sync)
 - [~] **Phase 7:** Audio Streaming & Production Polish (Opus audio with A/V sync and Ratatui dashboard done; tray icon/systemd service and packaging pending)
 
