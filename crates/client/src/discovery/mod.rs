@@ -11,8 +11,8 @@
 //!
 //! Port rule. Wi-Fi/LAN hosts (manual entry and discovery) use the host's control port,
 //! [`MANUAL_DEFAULT_PORT`] = 48444, the port the daemon's control listener binds. The USB/ADB
-//! path is separate: it uses `config::ADB_REVERSE_PORT` (42069) through
-//! `adb reverse tcp:42069 tcp:42069`, and is never a default for manual entry.
+//! path uses the same port: `adb reverse tcp:48444 tcp:48444` makes the host control port
+//! reachable as `127.0.0.1:48444` (the `ClientConfig` default).
 //!
 //! [`scheduler::DiscoveryScheduler`] re-scans on a period while the caller reports the client as
 //! disconnected.
@@ -236,8 +236,8 @@ fn checked_port(addr: SocketAddr) -> ClientResult<SocketAddr> {
 }
 
 /// Default port for hosts entered by hand. It is the host's control listener port
-/// (`DEFAULT_CONTROL_PORT`, 48444), the same port discovery advertises. The USB/ADB path uses
-/// `config::ADB_REVERSE_PORT` (42069) and is not affected by this value.
+/// (`DEFAULT_CONTROL_PORT`, 48444), the same port discovery advertises. The USB/ADB path uses the
+/// same port (`adb reverse tcp:48444 tcp:48444`).
 pub const MANUAL_DEFAULT_PORT: u16 = DEFAULT_CONTROL_PORT;
 
 #[cfg(test)]

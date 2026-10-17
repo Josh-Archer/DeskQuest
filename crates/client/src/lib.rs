@@ -30,7 +30,7 @@ pub use clipboard::{
     AndroidClipboardManager, ClientClipboardSync, ClipboardManager, MockClipboardManager,
     DEFAULT_CLIENT_CLIPBOARD_DEBOUNCE_DURATION, DEFAULT_CLIENT_CLIPBOARD_POLL_INTERVAL,
 };
-pub use config::{ClientConfig, ClientVideoCodec, DisplayMode, TransportMode, ADB_REVERSE_PORT};
+pub use config::{ClientConfig, ClientVideoCodec, DisplayMode, TransportMode};
 pub use decoder::{create_decoder, DecodedFrame, DecoderStats, HardwareVideoDecoder};
 pub use discovery::scheduler::{DiscoveryScheduler, DEFAULT_RESCAN_PERIOD, MIN_RESCAN_PERIOD};
 pub use discovery::{
