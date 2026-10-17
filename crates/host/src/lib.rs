@@ -12,6 +12,7 @@ use thiserror::Error;
 
 pub mod audio_pipeline;
 pub mod clipboard_service;
+pub mod codec_select;
 pub mod input_receiver;
 pub mod ipc;
 pub mod multi_display;

@@ -5,6 +5,8 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use linux_quest_display::DisplayLayoutMode;
+use linux_quest_encoder::{probe_backends, BackendPreference};
+use linux_quest_host::codec_select::{plan_stream, CLIENT_DECODE_CODECS, CODEC_PREFERENCE};
 use linux_quest_host::tui::{run_dashboard_with_source, IpcTelemetrySource, MockTelemetrySource};
 use linux_quest_host::{
     daemon_socket_path, run_ipc_server, send_daemon_request, DaemonRequest, DaemonResponse,
@@ -44,6 +46,15 @@ struct DaemonArgs {
     /// Run daemon with interactive terminal status dashboard in foreground
     #[arg(long)]
     tui: bool,
+
+    /// Video encoder backend: auto (NVENC, then VA-API), nvenc, vaapi or mock.
+    /// Overrides LINUX_QUEST_VIDEO_ENCODER when given.
+    #[arg(long, value_name = "BACKEND", value_parser = parse_encoder_backend)]
+    encoder: Option<BackendPreference>,
+}
+
+fn parse_encoder_backend(value: &str) -> Result<BackendPreference, String> {
+    value.parse()
 }
 
 #[derive(Args, Debug, Default)]
@@ -126,6 +137,52 @@ impl From<CliLayoutMode> for DisplayLayoutMode {
     }
 }
 
+/// Logs which backend and codec a stream would use with `preference`, given what each
+/// backend reports for each codec. Probing talks to libva and NVENC, so it runs on a
+/// blocking thread. The plan is not yet applied to a stream (see `codec_select`).
+async fn log_stream_plan(preference: BackendPreference) {
+    let probes = tokio::task::spawn_blocking(|| {
+        CODEC_PREFERENCE
+            .iter()
+            .map(|&codec| (codec, probe_backends(codec)))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    for (codec, results) in &probes {
+        for p in results {
+            info!(
+                "encoder probe {:?} for {:?}: {} ({})",
+                p.kind.name(),
+                codec,
+                if p.available {
+                    "available"
+                } else {
+                    "unavailable"
+                },
+                p.reason
+            );
+        }
+    }
+    let plan = plan_stream(preference, CLIENT_DECODE_CODECS, |backend, codec| {
+        probes.iter().any(|(c, results)| {
+            *c == codec && results.iter().any(|p| p.kind == backend && p.available)
+        })
+    });
+    match plan {
+        Some(plan) => info!(
+            "video stream plan: encoder {} with {:?} (preference {:?})",
+            plan.backend.name(),
+            plan.codec,
+            preference
+        ),
+        None => tracing::warn!(
+            "no hardware video encoder can serve the Quest client (preference {:?}); streaming will not start",
+            preference
+        ),
+    }
+}
+
 /// Resolves on SIGINT (Ctrl-C) or when the pre-registered SIGTERM stream fires.
 /// SIGTERM is what systemd sends on `systemctl --user stop`.
 async fn wait_for_shutdown_signal(mut term: tokio::signal::unix::Signal) {
@@ -143,7 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         || matches!(&cli.command, Some(Commands::Dashboard(_)))
         || matches!(
             &cli.command,
-            Some(Commands::Daemon(DaemonArgs { tui: true }))
+            Some(Commands::Daemon(DaemonArgs { tui: true, .. }))
         );
 
     if !is_tui {
@@ -192,6 +249,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
         Commands::Daemon(daemon_args) => {
+            let preference = daemon_args
+                .encoder
+                .unwrap_or_else(BackendPreference::from_env);
+            log_stream_plan(preference).await;
             let host = Arc::new(MultiDisplayHost::create_auto().await?);
             let run_tui = daemon_args.tui || cli.tui;
 
