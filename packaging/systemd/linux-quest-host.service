@@ -1,0 +1,22 @@
+[Unit]
+Description=Linux Quest host daemon (virtual displays, input and clipboard streaming)
+Documentation=https://github.com/Josh-Archer/linux-quest
+# Run only inside a graphical login, and stop with it.
+PartOf=graphical-session.target
+After=graphical-session.target pipewire.service
+# Give up after repeated fast failures (e.g. another instance holds the lock).
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Adjust this path if the binary is installed elsewhere (e.g. ~/.cargo/bin/linux-quest-host).
+ExecStart=/usr/bin/linux-quest-host daemon
+# The daemon handles SIGTERM as a clean shutdown (removes its socket and PID file).
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

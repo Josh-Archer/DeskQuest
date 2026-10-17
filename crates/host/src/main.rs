@@ -126,6 +126,15 @@ impl From<CliLayoutMode> for DisplayLayoutMode {
     }
 }
 
+/// Resolves on SIGINT (Ctrl-C) or when the pre-registered SIGTERM stream fires.
+/// SIGTERM is what systemd sends on `systemctl --user stop`.
+async fn wait_for_shutdown_signal(mut term: tokio::signal::unix::Signal) {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
@@ -219,9 +228,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                 let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
                 let shutdown_tx_clone = shutdown_tx.clone();
+                // systemd stops units with SIGTERM; Ctrl-C delivers SIGINT. Handle both.
+                let term_signal =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
                 tokio::spawn(async move {
-                    let _ = tokio::signal::ctrl_c().await;
-                    info!("Ctrl-C signal received; stopping daemon...");
+                    wait_for_shutdown_signal(term_signal).await;
+                    info!("Shutdown signal received; stopping daemon...");
                     let _ = shutdown_tx_clone.send(());
                 });
 
@@ -372,4 +384,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wait_for_shutdown_signal;
+    use tokio::signal::unix::{signal, SignalKind};
+
+    #[tokio::test]
+    async fn sigterm_triggers_daemon_shutdown() {
+        // Register the handler before raising the signal; otherwise SIGTERM's default
+        // action would terminate the test process.
+        let term = signal(SignalKind::terminate()).expect("register SIGTERM handler");
+        let pid = std::process::id() as libc::pid_t;
+        // SAFETY: kill(2) with our own pid and a standard signal number.
+        let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+        assert_eq!(rc, 0, "kill(SIGTERM) failed");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_shutdown_signal(term),
+        )
+        .await
+        .expect("SIGTERM should resolve the shutdown future");
+    }
 }
