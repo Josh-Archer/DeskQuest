@@ -9,6 +9,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 
 use linux_quest_protocol::{InputBatch, InputEvent, RedundantKeyEvent};
@@ -166,7 +167,15 @@ pub struct InputChannelReceiver {
     drop_stale: bool,
     seen_key_ids: HashSet<u64>,
     max_seen_history: usize,
+    /// When the current peer last sent a valid packet (or when the peer was set).
+    last_peer_packet: Instant,
+    /// A different sender may take over once the current peer has been silent this long.
+    relatch_after: Duration,
 }
+
+/// Default silence after which the input peer may be replaced by a new sender.
+/// Matches the host's link liveness window.
+pub const DEFAULT_RELATCH_AFTER: Duration = Duration::from_secs(5);
 
 impl InputChannelReceiver {
     pub fn new(socket: UdpSocket, remote_addr: Option<SocketAddr>, drop_stale: bool) -> Self {
@@ -177,7 +186,15 @@ impl InputChannelReceiver {
             drop_stale,
             seen_key_ids: HashSet::with_capacity(128),
             max_seen_history: 1024,
+            last_peer_packet: Instant::now(),
+            relatch_after: DEFAULT_RELATCH_AFTER,
         }
+    }
+
+    /// Overrides how long the current peer must be silent before a new sender can replace it.
+    pub fn with_relatch_after(mut self, relatch_after: Duration) -> Self {
+        self.relatch_after = relatch_after;
+        self
     }
 
     pub async fn bind(
@@ -191,6 +208,7 @@ impl InputChannelReceiver {
 
     pub fn set_remote_addr(&mut self, remote_addr: SocketAddr) {
         self.remote_addr = Some(remote_addr);
+        self.last_peer_packet = Instant::now();
     }
 
     pub fn remote_addr(&self) -> Option<SocketAddr> {
@@ -213,15 +231,30 @@ impl InputChannelReceiver {
         loop {
             let (len, sender_addr) = self.socket.recv_from(&mut buf).await?;
 
+            let mut relatch = false;
             if let Some(expected) = self.remote_addr {
                 if sender_addr != expected {
-                    continue;
+                    // Only a peer that has gone quiet can be replaced, and only by a
+                    // datagram that decodes as a valid input packet.
+                    if self.last_peer_packet.elapsed() < self.relatch_after
+                        || InputBatch::decode(&buf[..len]).is_err()
+                    {
+                        continue;
+                    }
+                    relatch = true;
                 }
-            } else {
-                self.remote_addr = Some(sender_addr);
             }
 
             let batch = InputBatch::decode(&buf[..len])?;
+            if relatch || self.remote_addr.is_none() {
+                self.remote_addr = Some(sender_addr);
+            }
+            if relatch {
+                // New sender: its sequence and key ids restart.
+                self.highest_sequence_seen = 0;
+                self.seen_key_ids.clear();
+            }
+            self.last_peer_packet = Instant::now();
             let is_stale = batch.sequence <= self.highest_sequence_seen;
 
             let mut out_events = Vec::new();
