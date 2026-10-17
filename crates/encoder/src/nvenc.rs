@@ -987,6 +987,7 @@ mod tests {
             bitrate_kbps: 60_000,
             intra_refresh_period: 60,
             max_chunk_size: 1400,
+            colour: crate::ColourConfig::default(),
         });
 
         encoder
@@ -998,6 +999,7 @@ mod tests {
                 bitrate_kbps: 60_000,
                 intra_refresh_period: 60,
                 max_chunk_size: 1400,
+                colour: crate::ColourConfig::default(),
             })
             .await
             .expect("Hardware NVENC AV1 init failed on available device");
@@ -1134,6 +1136,7 @@ mod tests {
             bitrate_kbps: 60_000,
             intra_refresh_period: 60,
             max_chunk_size: 1400,
+            colour: crate::ColourConfig::default(),
         });
 
         hevc_encoder
@@ -1145,6 +1148,7 @@ mod tests {
                 bitrate_kbps: 60_000,
                 intra_refresh_period: 60,
                 max_chunk_size: 1400,
+                colour: crate::ColourConfig::default(),
             })
             .await
             .expect("HEVC hardware NVENC init must succeed with status 0");

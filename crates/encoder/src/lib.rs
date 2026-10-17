@@ -30,6 +30,49 @@ pub enum EncoderError {
     UnsupportedCodec(VideoCodec),
 }
 
+/// Colour description of the encoded stream and of the RGB to NV12 conversion.
+///
+/// Values are ITU-T H.273 code points. The default is BT.709 with limited (video)
+/// range, which is what HD content and most decoders expect. The HEVC VA-API path
+/// signals this in the VUI when the driver accepts packed parameter sets; see the
+/// `vaapi` module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColourConfig {
+    /// colour_primaries: 1 = BT.709, 6 = BT.601 (525), 9 = BT.2020.
+    pub primaries: u8,
+    /// transfer_characteristics: 1 = BT.709, 13 = sRGB/sYCC.
+    pub transfer: u8,
+    /// matrix_coeffs: 1 = BT.709, 6 = BT.601, 9 = BT.2020 non-constant luminance.
+    pub matrix: u8,
+    /// True for full range (0-255 luma), false for limited (16-235 luma).
+    pub full_range: bool,
+    /// Write the colour description into the bitstream (VUI) when the backend can.
+    pub signal: bool,
+}
+
+impl Default for ColourConfig {
+    fn default() -> Self {
+        Self {
+            primaries: 1,
+            transfer: 1,
+            matrix: 1,
+            full_range: false,
+            signal: true,
+        }
+    }
+}
+
+impl ColourConfig {
+    /// Luma and chroma kr/kb coefficients for the matrix. Returns `(kr, kb)`.
+    pub fn luma_coefficients(&self) -> (f32, f32) {
+        match self.matrix {
+            6 | 5 => (0.299, 0.114),
+            9 | 10 => (0.2627, 0.0593),
+            _ => (0.2126, 0.0722),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
     pub codec: VideoCodec,
@@ -39,6 +82,7 @@ pub struct EncoderConfig {
     pub bitrate_kbps: u32,
     pub intra_refresh_period: u32,
     pub max_chunk_size: usize,
+    pub colour: ColourConfig,
 }
 
 impl Default for EncoderConfig {
@@ -51,7 +95,17 @@ impl Default for EncoderConfig {
             bitrate_kbps: 80_000,
             intra_refresh_period: 30,
             max_chunk_size: 1200,
+            colour: ColourConfig::default(),
         }
+    }
+}
+
+/// Codecs a backend can encode, most preferred first.
+pub fn backend_codecs(kind: BackendKind) -> &'static [VideoCodec] {
+    match kind {
+        BackendKind::Nvenc => &[VideoCodec::Av1, VideoCodec::Hevc, VideoCodec::H264],
+        BackendKind::Vaapi => &[VideoCodec::Hevc, VideoCodec::Av1, VideoCodec::H264],
+        BackendKind::Mock => &[VideoCodec::Av1, VideoCodec::Hevc, VideoCodec::H264],
     }
 }
 
@@ -417,6 +471,7 @@ mod tests {
             bitrate_kbps: 80_000,
             intra_refresh_period: 30,
             max_chunk_size: 1024,
+            colour: ColourConfig::default(),
         };
 
         let mut encoder = MockVideoEncoder::new(config);
