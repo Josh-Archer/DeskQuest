@@ -553,9 +553,14 @@ mod tests {
 
     #[test]
     fn test_auto_input_injector_fallback() {
-        // When /dev/uinput is unavailable, AutoInputInjector creates a MockInputInjector fallback
+        // When /dev/uinput is unavailable, AutoInputInjector creates a MockInputInjector
+        // fallback; when the user can open it (a desktop), it uses uinput instead.
+        let uinput_openable = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/uinput")
+            .is_ok();
         let mut auto = AutoInputInjector::new();
-        assert!(!auto.is_uinput());
+        assert_eq!(auto.is_uinput(), uinput_openable);
 
         let ev = InputEvent::MouseMoveRelative { dx: 10, dy: -2 };
         auto.inject_event(ev.clone()).unwrap();
