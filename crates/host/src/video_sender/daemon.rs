@@ -31,11 +31,15 @@ impl<C: DisplayCapture> CaptureFrameSource<C> {
     pub async fn open(mut capture: C, allow_synthetic: bool) -> Result<Self, CaptureError> {
         capture.init().await?;
         if !allow_synthetic && capture.backend_type() == CaptureBackendType::Synthetic {
-            return Err(CaptureError::BackendUnavailable(
-                "only the synthetic test-pattern capture is available; PipeWire screencast \
-                 capture does not yet negotiate a stream node"
-                    .into(),
-            ));
+            let hint = if cfg!(feature = "pipewire-capture") {
+                "PipeWire screencast capture was not usable (is the PipeWire socket in \
+                 $XDG_RUNTIME_DIR and libpipewire-0.3 loadable?)"
+            } else {
+                "this build has no real capture; rebuild with --features pipewire-capture"
+            };
+            return Err(CaptureError::BackendUnavailable(format!(
+                "only the synthetic test-pattern capture is available; {hint}"
+            )));
         }
         Ok(Self { capture })
     }
@@ -183,6 +187,8 @@ mod tests {
             .err()
             .expect("synthetic capture must be rejected");
         assert!(matches!(err, CaptureError::BackendUnavailable(_)));
+        #[cfg(not(feature = "pipewire-capture"))]
+        assert!(err.to_string().contains("--features pipewire-capture"));
 
         let mut source = CaptureFrameSource::open(SyntheticCapture::new(0, 64, 64, 60), true)
             .await
