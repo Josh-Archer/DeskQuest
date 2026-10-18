@@ -90,4 +90,4 @@ LAUNCH_SERIAL=""
 if [[ -n "${ANDROID_SERIAL:-}" ]]; then
     LAUNCH_SERIAL="-s ${ANDROID_SERIAL} "
 fi
-echo "  adb ${LAUNCH_SERIAL}shell am start -n com.linuxquest.client/android.app.NativeActivity"
+echo "  adb ${LAUNCH_SERIAL}shell am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n com.linuxquest.client/android.app.NativeActivity"

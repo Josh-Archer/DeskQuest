@@ -175,5 +175,5 @@ fi
 
 if [[ "${RUN_ON_DEVICE}" == "true" ]]; then
     echo "Launching linux-quest client on Meta Quest..."
-    "${ADB}" shell am start -n com.linuxquest.client/android.app.NativeActivity
+    "${ADB}" shell am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n com.linuxquest.client/android.app.NativeActivity
 fi
