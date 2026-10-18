@@ -37,6 +37,9 @@ pub struct JitterBufferStats {
     pub packets_delivered: u64,
     pub packets_lost: u64,
     pub packets_reconstructed_fec: u64,
+    /// Times the sender's sequence jumped far backwards (the host restarted its stream) and
+    /// the buffer started over.
+    pub stream_restarts: u64,
 }
 
 impl JitterBufferStats {
@@ -87,6 +90,10 @@ impl FecBlockTracker {
 /// Base offset used for continuous 64-bit sequence number unwrapping.
 /// Starts at 2^32 so that differences backwards from the initial sequence
 /// can never underflow u64 even under severe packet reordering.
+/// A packet this many sequence numbers behind the playout cursor means the sender restarted.
+/// Real reordering is a few packets; at 10,000 datagrams/s this is over 6 s of traffic.
+const STREAM_RESTART_BEHIND: u64 = 1 << 16;
+
 const SEQUENCE_EPOCH_OFFSET: u64 = 1u64 << 32;
 
 /// Maximum number of active FEC blocks tracked simultaneously in memory.
@@ -236,6 +243,23 @@ impl AdaptiveJitterBuffer {
         }
     }
 
+    /// Forgets all sequence, FEC and queue state, keeping the statistics.
+    fn restart_stream(&mut self) {
+        tracing::info!(
+            expected = ?self.expected_unwrapped,
+            "video sequence jumped far backwards; treating it as a new stream"
+        );
+        self.last_arrival_instant = None;
+        self.last_sender_timestamp_us = None;
+        self.highest_seen_unwrapped = None;
+        self.expected_unwrapped = None;
+        self.fec_hold_anchor = None;
+        self.received_parity_ranges.clear();
+        self.queue.clear();
+        self.fec_blocks.clear();
+        self.stats.stream_restarts += 1;
+    }
+
     pub fn stats(&self) -> &JitterBufferStats {
         &self.stats
     }
@@ -322,7 +346,18 @@ impl AdaptiveJitterBuffer {
         }
 
         let seq = packet.header.sequence;
-        let unwrapped_seq = self.unwrap_sequence(seq);
+        let mut unwrapped_seq = self.unwrap_sequence(seq);
+
+        // A packet far behind the playout cursor is not reordering: the sender restarted and
+        // its sequence started over. Without this every new packet would be stale until the
+        // new sequence caught up with the old one, hours later.
+        if self
+            .expected_unwrapped
+            .is_some_and(|expected| unwrapped_seq.saturating_add(STREAM_RESTART_BEHIND) < expected)
+        {
+            self.restart_stream();
+            unwrapped_seq = self.unwrap_sequence(seq);
+        }
 
         let is_stale = match self.expected_unwrapped {
             Some(expected) => unwrapped_seq < expected,
@@ -995,6 +1030,58 @@ mod tests {
         let playout_time = now + Duration::from_millis(5);
         let popped = jb.pop_ready_packet(playout_time).expect("Should be ready");
         assert_eq!(popped.header.sequence, 1);
+    }
+
+    #[test]
+    fn sender_restart_with_a_lower_sequence_starts_a_new_stream() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig::default());
+        let mut now = Instant::now();
+        let packet = |seq: u32| {
+            let payload = Bytes::from_static(b"chunk");
+            let header = PacketHeader::new(PacketType::VideoFrameChunk, 0, seq, 1000, &payload);
+            Packet::new(header, payload)
+        };
+        // An old stream, well past the restart threshold.
+        for seq in 200_000..200_010 {
+            jb.ingest_packet(packet(seq), now);
+            now += Duration::from_millis(1);
+            while jb
+                .pop_ready_packet(now + Duration::from_millis(30))
+                .is_some()
+            {}
+        }
+        assert_eq!(jb.stats().stream_restarts, 0);
+
+        // The sender restarted: its sequence starts over at 0.
+        jb.ingest_packet(packet(0), now);
+        assert_eq!(jb.stats().stream_restarts, 1);
+        jb.ingest_packet(packet(1), now);
+        let first = jb
+            .pop_ready_packet(now + Duration::from_millis(30))
+            .expect("new stream is delivered");
+        assert_eq!(first.header.sequence, 0);
+        assert_eq!(
+            jb.pop_ready_packet(now + Duration::from_millis(30))
+                .map(|p| p.header.sequence),
+            Some(1)
+        );
+        assert_eq!(jb.stats().stream_restarts, 1);
+    }
+
+    #[test]
+    fn modest_reordering_is_not_a_restart() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig::default());
+        let now = Instant::now();
+        let payload = Bytes::from_static(b"chunk");
+        for seq in [5000u32, 5001, 4000] {
+            let header = PacketHeader::new(PacketType::VideoFrameChunk, 0, seq, 1000, &payload);
+            jb.ingest_packet(Packet::new(header, payload.clone()), now);
+            while jb
+                .pop_ready_packet(now + Duration::from_millis(30))
+                .is_some()
+            {}
+        }
+        assert_eq!(jb.stats().stream_restarts, 0);
     }
 
     #[test]
