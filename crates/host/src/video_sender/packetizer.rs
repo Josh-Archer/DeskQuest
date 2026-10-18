@@ -73,8 +73,8 @@ pub struct FecConfig {
     /// balanced blocks. Smaller blocks recover bursts sooner but cost more parity per packet.
     pub group_size: usize,
     /// Parity packets per source packet, rounded up and at least one. `0.0` turns FEC off.
-    /// With the defaults (20 sources, 0.10) every block of 11..=20 packets carries 2 parity
-    /// packets and tolerates any 2 lost datagrams out of its 22.
+    /// With the defaults (20 sources, 0.25) every block of 17..=20 sources carries 5 parity
+    /// packets and tolerates any 5 lost datagrams out of its 22 to 25.
     pub parity_ratio: f64,
 }
 
@@ -82,7 +82,7 @@ impl Default for FecConfig {
     fn default() -> Self {
         Self {
             group_size: 20,
-            parity_ratio: 0.10,
+            parity_ratio: 0.25,
         }
     }
 }
@@ -424,10 +424,12 @@ mod tests {
     #[test]
     fn parity_ratio_rounding() {
         let fec = FecConfig::default();
-        assert_eq!(fec.parity_for(1), 1);
-        assert_eq!(fec.parity_for(10), 1);
-        assert_eq!(fec.parity_for(11), 2);
-        assert_eq!(fec.parity_for(20), 2);
+        assert_eq!(fec.parity_for(1), 1, "a tiny block still gets one parity");
+        assert_eq!(fec.parity_for(4), 1);
+        assert_eq!(fec.parity_for(5), 2, "5 * 0.25 = 1.25 rounds up");
+        assert_eq!(fec.parity_for(16), 4, "16 * 0.25 is exactly 4");
+        assert_eq!(fec.parity_for(17), 5);
+        assert_eq!(fec.parity_for(20), 5);
         let thirty = FecConfig {
             group_size: 30,
             parity_ratio: 0.1,
@@ -448,10 +450,10 @@ mod tests {
     #[test]
     fn datagrams_follow_the_client_wire_layout() {
         let mut p = Packetizer::new(7, 1200, FecConfig::default());
-        // 25 chunks: two balanced blocks of 13 and 12 sources, 2 parity each.
+        // 25 chunks: two balanced blocks of 13 and 12 sources, 4 and 3 parity (25% each).
         let f = frame(1, 25 * 1200 - 17, true, 1200);
         let datagrams = p.packetize(&f, 5_000).unwrap();
-        assert_eq!(datagrams.len(), 25 + 4);
+        assert_eq!(datagrams.len(), 25 + 7);
 
         let mut seqs = Vec::new();
         let mut block_ids = Vec::new();
@@ -486,11 +488,11 @@ mod tests {
                 other => panic!("unexpected {other:?}"),
             }
         }
-        assert_eq!((sources, parities), (25, 4));
-        // Block ids: 13+2 datagrams share one, 12+2 share the next, strictly increasing.
-        assert!(block_ids[..15].iter().all(|b| *b == block_ids[0]));
-        assert!(block_ids[15..].iter().all(|b| *b == block_ids[15]));
-        assert!(block_ids[15] > block_ids[0]);
+        assert_eq!((sources, parities), (25, 7));
+        // Block ids: 13+4 datagrams share one, 12+3 share the next, strictly increasing.
+        assert!(block_ids[..17].iter().all(|b| *b == block_ids[0]));
+        assert!(block_ids[17..].iter().all(|b| *b == block_ids[17]));
+        assert!(block_ids[17] > block_ids[0]);
 
         // FEC index is the position in the block; parity indices follow the sources.
         let idx = |n: usize| {
@@ -503,9 +505,10 @@ mod tests {
         assert_eq!(idx(12), 12);
         assert_eq!(idx(13), 13, "first parity of a 13-source block");
         assert_eq!(idx(14), 14);
-        assert_eq!(idx(15), 0, "next block restarts at 0");
-        assert_eq!(idx(26), 11, "last source of the 12-source block");
-        assert_eq!(idx(27), 12, "first parity of the 12-source block");
+        assert_eq!(idx(16), 16, "last parity of the 13-source block");
+        assert_eq!(idx(17), 0, "next block restarts at 0");
+        assert_eq!(idx(28), 11, "last source of the 12-source block");
+        assert_eq!(idx(29), 12, "first parity of the 12-source block");
     }
 
     #[test]
