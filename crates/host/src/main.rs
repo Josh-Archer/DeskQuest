@@ -95,6 +95,10 @@ struct DaemonArgs {
     /// encode, transport and decode on the headset)
     #[arg(long, conflicts_with = "no_video")]
     test_pattern: bool,
+
+    /// Video bitrate in Mbit/s (default 30)
+    #[arg(long, value_name = "MBPS", default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=500))]
+    bitrate: u32,
 }
 
 fn parse_encoder_backend(value: &str) -> Result<BackendPreference, String> {
@@ -351,6 +355,7 @@ async fn start_video(
         video_port: args.video_port,
         encoder: args.encoder.unwrap_or_else(BackendPreference::from_env),
         test_pattern: args.test_pattern,
+        bitrate_mbps: args.bitrate,
     };
     match linux_quest_host::video_sender::daemon::start_daemon_video_sender(
         link,
@@ -657,8 +662,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 #[cfg(test)]
 mod tests {
-    use super::wait_for_shutdown_signal;
+    use super::{wait_for_shutdown_signal, Cli, Commands};
+    use clap::Parser;
     use tokio::signal::unix::{signal, SignalKind};
+
+    fn parse_daemon(args: &[&str]) -> super::DaemonArgs {
+        let argv = std::iter::once("linux-quest-host").chain(args.iter().copied());
+        match Cli::try_parse_from(argv)
+            .expect("daemon args should parse")
+            .command
+        {
+            Some(Commands::Daemon(daemon)) => daemon,
+            other => panic!("expected daemon subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn daemon_bitrate_option_parses_and_defaults_to_30() {
+        assert_eq!(parse_daemon(&["daemon", "--bitrate", "12"]).bitrate, 12);
+        assert_eq!(parse_daemon(&["daemon"]).bitrate, 30);
+        assert!(Cli::try_parse_from(["linux-quest-host", "daemon", "--bitrate", "0"]).is_err());
+        assert!(Cli::try_parse_from(["linux-quest-host", "daemon", "--bitrate", "501"]).is_err());
+    }
 
     #[tokio::test]
     async fn sigterm_triggers_daemon_shutdown() {
