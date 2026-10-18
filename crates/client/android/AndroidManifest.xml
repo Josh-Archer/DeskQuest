@@ -16,6 +16,21 @@
     <!-- WifiManager.MulticastLock for LAN host discovery (mDNS) -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 
+    <!-- Hand tracking (XR_EXT_hand_tracking). Without the permission and the (optional) feature
+         Horizon OS assumes the app needs controllers and blocks launch with "controller
+         required" when they are off. required=false keeps controllers working too. -->
+    <uses-permission android:name="com.oculus.permission.HAND_TRACKING" />
+    <uses-feature
+        android:name="oculus.software.handtracking"
+        android:required="false" />
+    <!-- Passthrough (XR_FB_passthrough), optional. -->
+    <uses-feature
+        android:name="com.oculus.feature.PASSTHROUGH"
+        android:required="false" />
+    <!-- Khronos OpenXR loader runtime discovery (same as Khronos hello_xr). -->
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR" />
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR_SYSTEM" />
+
     <!-- Meta Quest 3 VR & Hardware Features -->
     <uses-feature
         android:name="android.hardware.vr.headtracking"
@@ -48,7 +63,8 @@
             android:name="android.app.NativeActivity"
             android:label="linux-quest"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
-            android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|uiMode"
+            android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|smallestScreenSize|uiMode|locale|layoutDirection|fontScale|colorMode|touchscreen|mcc|mnc"
+            android:launchMode="singleTask"
             android:screenOrientation="landscape"
             android:resizeableActivity="false"
             android:exported="true">
@@ -65,9 +81,6 @@
             <meta-data
                 android:name="com.oculus.supportedDevices"
                 android:value="quest3|questpro" />
-            <meta-data
-                android:name="com.oculus.intent.category.VR"
-                android:value="vr_only" />
 
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

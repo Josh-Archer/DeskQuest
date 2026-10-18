@@ -44,6 +44,12 @@ pub struct OpenXrContext {
     hud_images: Vec<vk::Image>,
     #[cfg(target_os = "android")]
     surface_window: Option<ndk::native_window::NativeWindow>,
+    #[cfg(target_os = "android")]
+    android_surface_pfn: Option<openxr::raw::AndroidSurfaceSwapchainKHR>,
+    #[cfg(target_os = "android")]
+    supports_fb_surface_create: bool,
+    swapchain_format: u32,
+    swapchains_created: bool,
     refresh_rate_manager: Option<RefreshRateManager>,
     session_state: SessionState,
     session_running: Arc<AtomicBool>,
@@ -78,6 +84,12 @@ impl OpenXrContext {
             hud_images: Vec::new(),
             #[cfg(target_os = "android")]
             surface_window: None,
+            #[cfg(target_os = "android")]
+            android_surface_pfn: None,
+            #[cfg(target_os = "android")]
+            supports_fb_surface_create: false,
+            swapchain_format: vk::Format::R8G8B8A8_UNORM.as_raw() as u32,
+            swapchains_created: true,
             refresh_rate_manager: Some(refresh_mgr),
             session_state: SessionState::FOCUSED,
             session_running: Arc::new(AtomicBool::new(true)),
@@ -453,12 +465,12 @@ impl OpenXrContext {
                 vk::Format::R8G8B8A8_UNORM.as_raw() as u32
             };
 
-        // Create initial swapchains
+        // Swapchains are NOT created here. On Horizon OS the runtime rejects
+        // xrCreateSwapchainAndroidSurfaceKHR until the activity is ready and the session is
+        // running (SessionState::READY handled by `poll_events`). `create_swapchains` does it.
         #[cfg(target_os = "android")]
-        let (desktop_swapchain, surface_window, desktop_swapchain_is_surface) = if available_exts
-            .khr_android_surface_swapchain
-        {
-            let pfn = unsafe {
+        let android_surface_pfn = if available_exts.khr_android_surface_swapchain {
+            Some(unsafe {
                 openxr::raw::AndroidSurfaceSwapchainKHR::load(&entry, instance.as_raw()).map_err(
                     |e| {
                         ClientError::OpenXr(format!(
@@ -466,7 +478,76 @@ impl OpenXrContext {
                         ))
                     },
                 )?
-            };
+            })
+        } else {
+            None
+        };
+
+        Ok(Self {
+            instance: Some(instance),
+            system,
+            session: Some(session),
+            frame_waiter: Some(parking_lot::Mutex::new(frame_waiter)),
+            frame_stream: Some(parking_lot::Mutex::new(frame_stream)),
+            stage_space: Some(stage_space),
+            view_space: Some(view_space),
+            desktop_swapchain: None,
+            hud_swapchain: None,
+            hud_images: Vec::new(),
+            #[cfg(target_os = "android")]
+            surface_window: None,
+            #[cfg(target_os = "android")]
+            android_surface_pfn,
+            #[cfg(target_os = "android")]
+            supports_fb_surface_create: available_exts.fb_android_surface_swapchain_create,
+            swapchain_format,
+            swapchains_created: false,
+            refresh_rate_manager,
+            session_state: SessionState::IDLE,
+            session_running: Arc::new(AtomicBool::new(false)),
+            supports_cylinder,
+            desktop_swapchain_is_surface: false,
+            supports_layer_settings: available_exts.fb_composition_layer_settings,
+            should_exit: Arc::new(AtomicBool::new(false)),
+            timespec_converter,
+            passthrough,
+            interaction,
+            hand_tracking,
+            screen_transform: None,
+            is_simulated: false,
+        })
+    }
+
+    /// Whether the desktop and HUD swapchains exist (always true for a simulated context).
+    pub fn swapchains_created(&self) -> bool {
+        self.swapchains_created
+    }
+
+    /// Creates the desktop (Android surface) and HUD swapchains.
+    ///
+    /// Must only be called once the session is running (`SessionState::READY` handled and
+    /// `xrBeginSession` succeeded): Horizon OS answers `xrCreateSwapchainAndroidSurfaceKHR`
+    /// with a runtime failure before that. Returns `Ok(())` without doing anything if the
+    /// swapchains already exist, and an error (to retry later) if the session is not running.
+    pub fn create_swapchains(&mut self, config: &ClientConfig) -> ClientResult<()> {
+        if self.swapchains_created {
+            return Ok(());
+        }
+        if !self.is_session_running() {
+            return Err(ClientError::OpenXr(
+                "create_swapchains called before the OpenXR session is running".into(),
+            ));
+        }
+        let session = self
+            .session
+            .clone()
+            .ok_or_else(|| ClientError::OpenXr("Session not initialized".into()))?;
+        let swapchain_format = self.swapchain_format;
+
+        #[cfg(target_os = "android")]
+        let (desktop_swapchain, surface_window, desktop_swapchain_is_surface) = if let Some(pfn) =
+            self.android_surface_pfn
+        {
             let fb_surface_create_info = openxr::sys::AndroidSurfaceSwapchainCreateInfoFB {
                 ty: openxr::sys::StructureType::ANDROID_SURFACE_SWAPCHAIN_CREATE_INFO_FB,
                 next: std::ptr::null(),
@@ -474,7 +555,7 @@ impl OpenXrContext {
             };
             let info = openxr::sys::SwapchainCreateInfo {
                 ty: openxr::sys::StructureType::SWAPCHAIN_CREATE_INFO,
-                next: if available_exts.fb_android_surface_swapchain_create {
+                next: if self.supports_fb_surface_create {
                     &fb_surface_create_info as *const _ as *const std::ffi::c_void
                 } else {
                     std::ptr::null()
@@ -508,34 +589,31 @@ impl OpenXrContext {
             }
             let sc =
                 unsafe { openxr::Swapchain::<Vulkan>::from_raw(session.clone(), raw_swapchain) };
-            let native_window = if !surface.is_null() {
-                let ctx = ndk_context::android_context();
-                let vm = unsafe { jni::JavaVM::from_raw(ctx.vm() as *mut jni::sys::JavaVM) }
-                    .map_err(|e| ClientError::OpenXr(format!("JNI JavaVM error: {e:?}")))?;
-                let (_guard, env_raw) = match vm.get_env() {
-                    Ok(env) => (None, env.get_raw()),
-                    Err(_) => {
-                        let guard = vm.attach_current_thread().map_err(|e| {
-                            ClientError::OpenXr(format!("JNI attach thread failed: {e:?}"))
-                        })?;
-                        let raw = guard.get_raw();
-                        (Some(guard), raw)
-                    }
-                };
-                let win = unsafe { ndk_sys::ANativeWindow_fromSurface(env_raw as _, surface as _) };
-                if win.is_null() {
-                    return Err(ClientError::OpenXr(
-                        "ANativeWindow_fromSurface returned NULL".into(),
-                    ));
-                }
-                std::ptr::NonNull::new(win)
-                    .map(|ptr| unsafe { ndk::native_window::NativeWindow::from_ptr(ptr) })
-            } else {
+            if surface.is_null() {
                 return Err(ClientError::OpenXr(
                     "xrCreateSwapchainAndroidSurfaceKHR returned a null surface jobject".into(),
                 ));
+            }
+            let ctx = ndk_context::android_context();
+            let vm = unsafe { jni::JavaVM::from_raw(ctx.vm() as *mut jni::sys::JavaVM) }
+                .map_err(|e| ClientError::OpenXr(format!("JNI JavaVM error: {e:?}")))?;
+            let (_guard, env_raw) = match vm.get_env() {
+                Ok(env) => (None, env.get_raw()),
+                Err(_) => {
+                    let guard = vm.attach_current_thread().map_err(|e| {
+                        ClientError::OpenXr(format!("JNI attach thread failed: {e:?}"))
+                    })?;
+                    let raw = guard.get_raw();
+                    (Some(guard), raw)
+                }
             };
-            (Some(sc), native_window, true)
+            let win = unsafe { ndk_sys::ANativeWindow_fromSurface(env_raw as _, surface as _) };
+            let native_window = std::ptr::NonNull::new(win)
+                .map(|ptr| unsafe { ndk::native_window::NativeWindow::from_ptr(ptr) })
+                .ok_or_else(|| {
+                    ClientError::OpenXr("ANativeWindow_fromSurface returned NULL".into())
+                })?;
+            (Some(sc), Some(native_window), true)
         } else {
             if !config.force_mock_decoder {
                 return Err(ClientError::OpenXr(
@@ -594,7 +672,6 @@ impl OpenXrContext {
         let hud_swapchain = session
             .create_swapchain(&hud_info)
             .map_err(|e| ClientError::OpenXr(format!("Failed to create HUD swapchain: {e:?}")))?;
-
         let hud_images = hud_swapchain
             .enumerate_images()
             .map(|imgs| {
@@ -604,33 +681,16 @@ impl OpenXrContext {
             })
             .unwrap_or_default();
 
-        Ok(Self {
-            instance: Some(instance),
-            system,
-            session: Some(session),
-            frame_waiter: Some(parking_lot::Mutex::new(frame_waiter)),
-            frame_stream: Some(parking_lot::Mutex::new(frame_stream)),
-            stage_space: Some(stage_space),
-            view_space: Some(view_space),
-            desktop_swapchain,
-            hud_swapchain: Some(hud_swapchain),
-            hud_images,
-            #[cfg(target_os = "android")]
-            surface_window,
-            refresh_rate_manager,
-            session_state: SessionState::IDLE,
-            session_running: Arc::new(AtomicBool::new(false)),
-            supports_cylinder,
-            desktop_swapchain_is_surface,
-            supports_layer_settings: available_exts.fb_composition_layer_settings,
-            should_exit: Arc::new(AtomicBool::new(false)),
-            timespec_converter,
-            passthrough,
-            interaction,
-            hand_tracking,
-            screen_transform: None,
-            is_simulated: false,
-        })
+        self.desktop_swapchain = desktop_swapchain;
+        self.desktop_swapchain_is_surface = desktop_swapchain_is_surface;
+        #[cfg(target_os = "android")]
+        {
+            self.surface_window = surface_window;
+        }
+        self.hud_swapchain = Some(hud_swapchain);
+        self.hud_images = hud_images;
+        self.swapchains_created = true;
+        Ok(())
     }
 
     /// Whether this OpenXR context is running in simulated/mock mode.
@@ -738,29 +798,39 @@ impl OpenXrContext {
             match event {
                 openxr::Event::SessionStateChanged(state_event) => {
                     let new_state = state_event.state();
-                    tracing::info!(old = ?self.session_state, new = ?new_state, "OpenXR SessionState changed");
+                    tracing::info!(old = ?self.session_state, new = ?new_state, "lq-lifecycle: OpenXR SessionState changed");
                     self.session_state = new_state;
 
                     match new_state {
                         SessionState::READY => {
                             if let Some(session) = &self.session {
-                                session
-                                    .begin(ViewConfigurationType::PRIMARY_STEREO)
-                                    .map_err(|e| {
-                                        ClientError::OpenXr(format!("Session begin failed: {e:?}"))
-                                    })?;
-                                self.session_running.store(true, Ordering::SeqCst);
+                                if !self.session_running.load(Ordering::SeqCst) {
+                                    session
+                                        .begin(ViewConfigurationType::PRIMARY_STEREO)
+                                        .map_err(|e| {
+                                            ClientError::OpenXr(format!(
+                                                "Session begin failed: {e:?}"
+                                            ))
+                                        })?;
+                                    self.session_running.store(true, Ordering::SeqCst);
+                                    tracing::info!("lq-lifecycle: xrBeginSession succeeded");
+                                }
                             }
                         }
                         SessionState::STOPPING => {
                             if let Some(session) = &self.session {
-                                let _ = session.end();
+                                if let Err(e) = session.end() {
+                                    tracing::warn!(error = ?e, "lq-lifecycle: xrEndSession failed");
+                                } else {
+                                    tracing::info!("lq-lifecycle: xrEndSession succeeded");
+                                }
                                 self.session_running.store(false, Ordering::SeqCst);
                             }
                         }
                         SessionState::EXITING | SessionState::LOSS_PENDING => {
                             self.session_running.store(false, Ordering::SeqCst);
                             self.should_exit.store(true, Ordering::SeqCst);
+                            tracing::info!(state = ?new_state, "lq-lifecycle: session ending, exiting");
                         }
                         _ => {}
                     }

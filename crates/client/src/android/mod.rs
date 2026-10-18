@@ -1,10 +1,15 @@
 //! Android NativeActivity integration and main entry point.
 
+pub mod lifecycle;
+
 #[cfg(target_os = "android")]
 use std::time::Duration;
 
 #[cfg(target_os = "android")]
 use android_activity::{AndroidApp, MainEvent, PollEvent};
+
+#[cfg(target_os = "android")]
+use self::lifecycle::{AppLifecycle, LifecycleEvent, NextAction, LOG_TAG};
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -135,13 +140,6 @@ pub fn android_main(app: AndroidApp) {
     // trips the "exactly once" assertion in ndk-context and aborts the app at startup.
 
     let config = ClientConfig::default();
-    let mut runtime = match QuestClientRuntime::new(config.clone()) {
-        Ok(rt) => rt,
-        Err(e) => {
-            tracing::error!(error = ?e, "Failed to initialize Quest client runtime");
-            return;
-        }
-    };
 
     // Background transport packet receiver (bounded channel: 512 packets, drops on overflow)
     let (packet_tx, packet_rx) =
@@ -295,53 +293,125 @@ pub fn android_main(app: AndroidApp) {
         }
     });
 
-    let mut is_active = false;
+    // The XR session is created only once the activity has a window and is resumed (Horizon OS
+    // rejects xrCreateSession / xrCreateSwapchainAndroidSurfaceKHR with "Activity is not yet in
+    // the ready state" before that), and swapchains only once the session is running.
+    // See `lifecycle` for the pure decision logic; every transition logs with tag `lq-lifecycle`.
+    let mut lifecycle = AppLifecycle::new();
+    if app.native_window().is_some() {
+        lifecycle.on_event(LifecycleEvent::InitWindow);
+    }
+    let mut runtime: Option<QuestClientRuntime> = None;
+    let mut create_failures = 0u32;
+    let mut next_create_attempt = std::time::Instant::now();
+    let mut swapchain_failures = 0u32;
+    const MAX_STARTUP_FAILURES: u32 = 5;
 
-    // Main Android event and render loop
-    while runtime.is_running() && !runtime.should_exit() {
+    loop {
+        let action = lifecycle.decide_next_action();
         app.poll_events(
-            Some(if is_active {
+            Some(if action == NextAction::RenderFrame {
                 Duration::ZERO
             } else {
                 Duration::from_millis(50)
             }),
             |event| {
                 if let PollEvent::Main(main_event) = event {
-                    match main_event {
-                        MainEvent::Resume { .. } => {
-                            tracing::info!("Android activity resumed");
-                            is_active = true;
-                        }
-                        MainEvent::Pause => {
-                            tracing::info!("Android activity paused");
-                            is_active = false;
-                        }
-                        MainEvent::Destroy => {
-                            tracing::info!("Android activity destroying");
-                            runtime.stop();
-                        }
-                        _ => {}
+                    let translated = match main_event {
+                        MainEvent::InitWindow { .. } => Some(LifecycleEvent::InitWindow),
+                        MainEvent::TerminateWindow { .. } => Some(LifecycleEvent::TermWindow),
+                        MainEvent::Resume { .. } => Some(LifecycleEvent::Resume),
+                        MainEvent::Pause => Some(LifecycleEvent::Pause),
+                        MainEvent::GainedFocus => Some(LifecycleEvent::GainedFocus),
+                        MainEvent::LostFocus => Some(LifecycleEvent::LostFocus),
+                        MainEvent::Destroy => Some(LifecycleEvent::Destroy),
+                        _ => None,
+                    };
+                    if let Some(ev) = translated {
+                        lifecycle.on_event(ev);
                     }
                 }
             },
         );
 
-        // Ingest any received transport packets
+        // Ingest any received transport packets (dropped until the runtime exists)
         while let Ok(pkt) = packet_rx.try_recv() {
-            runtime.ingest_packet(pkt, std::time::Instant::now());
+            if let Some(rt) = runtime.as_mut() {
+                rt.ingest_packet(pkt, std::time::Instant::now());
+            }
         }
 
-        if is_active {
-            if let Err(e) = runtime.step_frame() {
-                tracing::warn!(error = ?e, "Error stepping client frame");
+        match lifecycle.decide_next_action() {
+            NextAction::Wait => {}
+            NextAction::CreateSession => {
+                if std::time::Instant::now() >= next_create_attempt {
+                    tracing::info!("{LOG_TAG}: window ready and resumed, creating OpenXR session");
+                    match QuestClientRuntime::new(config.clone()) {
+                        Ok(rt) => {
+                            runtime = Some(rt);
+                            lifecycle.on_session_created();
+                        }
+                        Err(e) => {
+                            create_failures += 1;
+                            tracing::error!(
+                                error = ?e,
+                                attempt = create_failures,
+                                "{LOG_TAG}: failed to initialize Quest client runtime"
+                            );
+                            if create_failures >= MAX_STARTUP_FAILURES {
+                                break;
+                            }
+                            next_create_attempt =
+                                std::time::Instant::now() + Duration::from_millis(500);
+                        }
+                    }
+                }
             }
-        } else {
-            // While paused, continue polling OpenXR events so state machine can transition
-            if let Err(e) = runtime.poll_events() {
-                tracing::warn!(error = ?e, "Error polling OpenXR events while paused");
+            NextAction::PollEvents => {
+                if let Some(rt) = runtime.as_mut() {
+                    if let Err(e) = rt.poll_events() {
+                        tracing::warn!(error = ?e, "{LOG_TAG}: error polling OpenXR events");
+                    }
+                }
+            }
+            NextAction::CreateSwapchains => {
+                if let Some(rt) = runtime.as_mut() {
+                    match rt.create_swapchains() {
+                        Ok(()) => lifecycle.on_swapchains_created(),
+                        Err(e) => {
+                            swapchain_failures += 1;
+                            tracing::error!(
+                                error = ?e,
+                                attempt = swapchain_failures,
+                                "{LOG_TAG}: failed to create swapchains"
+                            );
+                            if swapchain_failures >= MAX_STARTUP_FAILURES {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            NextAction::RenderFrame => {
+                if let Some(rt) = runtime.as_mut() {
+                    if let Err(e) = rt.step_frame() {
+                        tracing::warn!(error = ?e, "Error stepping client frame");
+                    }
+                }
+            }
+            NextAction::Exit => break,
+        }
+
+        // Mirror the OpenXR session state into the lifecycle machine.
+        if let Some(rt) = runtime.as_ref() {
+            lifecycle.on_session_running(rt.is_session_running());
+            if rt.should_exit() {
+                lifecycle.on_exit_requested();
             }
         }
     }
+    tracing::info!("{LOG_TAG}: leaving main loop");
+    drop(runtime);
 
     running_flag.store(false, std::sync::atomic::Ordering::Relaxed);
     let _ = receiver_handle.join();

@@ -33,6 +33,7 @@ pub struct QuestClientRuntime {
     interaction_state_machine: GrabStateMachine,
     gesture_detector: HandGestureDetector,
     is_running: bool,
+    swapchains_ready: bool,
 }
 
 impl QuestClientRuntime {
@@ -77,19 +78,24 @@ impl QuestClientRuntime {
 
         openxr_context.set_screen_transform(screen_transform.clone());
 
-        #[cfg(target_os = "android")]
-        let surface_ptr = openxr_context
-            .surface_window()
-            .map(|win| win.ptr().as_ptr() as *mut std::ffi::c_void);
-        #[cfg(not(target_os = "android"))]
-        let surface_ptr = None;
-
-        let decoder = create_decoder(
-            &config,
-            config.stream_width,
-            config.stream_height,
-            surface_ptr,
-        )?;
+        // On Horizon OS the Android surface swapchain (the decoder's output surface) can only be
+        // created once the session is running, so a live context defers it: until
+        // `create_swapchains` runs, a mock decoder stands in and `step_frame` does nothing.
+        let swapchains_ready = openxr_context.swapchains_created();
+        let decoder = if swapchains_ready {
+            Self::build_decoder(&config, &openxr_context)?
+        } else {
+            let placeholder = ClientConfig {
+                force_mock_decoder: true,
+                ..config.clone()
+            };
+            create_decoder(
+                &placeholder,
+                config.stream_width,
+                config.stream_height,
+                None,
+            )?
+        };
 
         let receiver = ClientReceiver::new(&config);
         let audio_receiver = AudioReceiver::new(AudioReceiverConfig::default());
@@ -113,7 +119,46 @@ impl QuestClientRuntime {
             interaction_state_machine,
             gesture_detector,
             is_running: true,
+            swapchains_ready,
         })
+    }
+
+    fn build_decoder(
+        config: &ClientConfig,
+        openxr_context: &OpenXrContext,
+    ) -> ClientResult<Box<dyn HardwareVideoDecoder>> {
+        #[cfg(target_os = "android")]
+        let surface_ptr = openxr_context
+            .surface_window()
+            .map(|win| win.ptr().as_ptr() as *mut std::ffi::c_void);
+        #[cfg(not(target_os = "android"))]
+        let surface_ptr = {
+            let _ = openxr_context;
+            None
+        };
+        create_decoder(
+            config,
+            config.stream_width,
+            config.stream_height,
+            surface_ptr,
+        )
+    }
+
+    /// Whether the swapchains (and the decoder bound to their surface) exist.
+    pub fn swapchains_ready(&self) -> bool {
+        self.swapchains_ready
+    }
+
+    /// Creates the swapchains and the real decoder. Call only once the OpenXR session is
+    /// running; returns an error (retry on the next loop iteration) otherwise.
+    pub fn create_swapchains(&mut self) -> ClientResult<()> {
+        if self.swapchains_ready {
+            return Ok(());
+        }
+        self.openxr_context.create_swapchains(&self.config)?;
+        self.decoder = Self::build_decoder(&self.config, &self.openxr_context)?;
+        self.swapchains_ready = true;
+        Ok(())
     }
 
     /// Processes a single frame iteration of the VR display presentation loop at current time.
@@ -130,6 +175,9 @@ impl QuestClientRuntime {
 
         // If running in live mode, ensure the OpenXR session has transitioned to running
         if !self.openxr_context.is_simulated() && !self.openxr_context.is_session_running() {
+            return Ok(FramePacingMetrics::default());
+        }
+        if !self.swapchains_ready {
             return Ok(FramePacingMetrics::default());
         }
 
