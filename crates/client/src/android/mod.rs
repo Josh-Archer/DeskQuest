@@ -130,19 +130,15 @@ pub fn android_main(app: AndroidApp) {
 
     tracing::info!("linux-quest Quest client starting up on Android / Horizon OS");
 
-    // Initialize Android context for OpenXR and MediaCodec
-    unsafe {
-        ndk_context::initialize_android_context(app.vm_as_ptr(), app.activity_as_ptr());
-    }
+    // android-activity initialises `ndk_context` (JavaVM + activity) before calling
+    // `android_main`, for OpenXR, MediaCodec and JNI users. Initialising it again here
+    // trips the "exactly once" assertion in ndk-context and aborts the app at startup.
 
     let config = ClientConfig::default();
     let mut runtime = match QuestClientRuntime::new(config.clone()) {
         Ok(rt) => rt,
         Err(e) => {
             tracing::error!(error = ?e, "Failed to initialize Quest client runtime");
-            unsafe {
-                ndk_context::release_android_context();
-            }
             return;
         }
     };
@@ -351,10 +347,6 @@ pub fn android_main(app: AndroidApp) {
     let _ = receiver_handle.join();
     if let Some(sender) = input_sender {
         sender.stop();
-    }
-
-    unsafe {
-        ndk_context::release_android_context();
     }
 
     tracing::info!("linux-quest client runtime exited cleanly");
