@@ -173,8 +173,16 @@ mod tests {
         let mut sender = InputChannelSender::new(s_sender, Some(addr_receiver), 4);
         let receiver = InputChannelReceiver::new(s_receiver, Some(addr_sender), true);
 
+        // uinput when the user can open /dev/uinput (a desktop), the mock fallback otherwise.
+        let uinput_openable = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/uinput")
+            .is_ok();
         let mut host_receiver = HostInputReceiver::new_auto(receiver);
-        assert!(!host_receiver.injector().lock().unwrap().is_uinput());
+        assert_eq!(
+            host_receiver.injector().lock().unwrap().is_uinput(),
+            uinput_openable
+        );
 
         let events = vec![InputEvent::MouseMoveRelative { dx: 5, dy: -3 }];
         sender.send_events(events, 100_000).await.unwrap();

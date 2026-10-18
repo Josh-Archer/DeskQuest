@@ -92,12 +92,12 @@ where
         let serialized =
             bincode::serialize(msg).map_err(|e| ControlError::Serialization(e.to_string()))?;
 
-        let len = (serialized.len() as u32).to_be_bytes();
-        self.writer.write_all(&len).await.map_err(map_io_error)?;
-        self.writer
-            .write_all(&serialized)
-            .await
-            .map_err(map_io_error)?;
+        // Single buffer + single write: two small writes on a TCP socket trigger the
+        // Nagle / delayed-ACK interaction (~40+ ms stalls per round trip).
+        let mut frame = Vec::with_capacity(4 + serialized.len());
+        frame.extend_from_slice(&(serialized.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&serialized);
+        self.writer.write_all(&frame).await.map_err(map_io_error)?;
         self.writer.flush().await.map_err(map_io_error)?;
         Ok(())
     }
@@ -146,6 +146,8 @@ impl ControlChannel<tokio::net::tcp::OwnedReadHalf, tokio::net::tcp::OwnedWriteH
         let (client_res, server_res) = tokio::join!(client_fut, server_fut);
         let client_stream = client_res?;
         let (server_stream, _) = server_res?;
+        client_stream.set_nodelay(true)?;
+        server_stream.set_nodelay(true)?;
 
         let (cr, cw) = client_stream.into_split();
         let (sr, sw) = server_stream.into_split();
@@ -157,6 +159,83 @@ impl ControlChannel<tokio::net::tcp::OwnedReadHalf, tokio::net::tcp::OwnedWriteH
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+
+    /// AsyncWrite that records the size of every write call.
+    struct RecordingWriter(Arc<Mutex<Vec<usize>>>);
+
+    impl AsyncWrite for RecordingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.0.lock().unwrap().push(buf.len());
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_message_issues_single_write() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let mut ch = ControlChannel::new(tokio::io::empty(), RecordingWriter(writes.clone()));
+        let msg = ControlMessage::Heartbeat {
+            sequence: 1,
+            timestamp_us: 2,
+        };
+        ch.send_message(&msg).await.unwrap();
+        let body_len = bincode::serialize(&msg).unwrap().len();
+        assert_eq!(*writes.lock().unwrap(), vec![4 + body_len]);
+    }
+
+    #[tokio::test]
+    async fn test_connected_pair_has_nodelay() {
+        let (client, server) = ControlChannel::create_connected_pair().await.unwrap();
+        for ch in [client, server] {
+            assert!(ch.writer.as_ref().nodelay().unwrap());
+            assert!(ch.reader.as_ref().nodelay().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_control_ping_pong_latency() {
+        let (mut client, mut server) = ControlChannel::create_connected_pair().await.unwrap();
+        let echo = tokio::spawn(async move {
+            while let Ok(m) = server.recv_message().await {
+                if server.send_message(&m).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let msg = ControlMessage::Heartbeat {
+            sequence: 7,
+            timestamp_us: 9,
+        };
+        let mut rtts = Vec::new();
+        for _ in 0..50 {
+            let t = std::time::Instant::now();
+            client.send_message(&msg).await.unwrap();
+            assert_eq!(client.recv_message().await.unwrap(), msg);
+            rtts.push(t.elapsed());
+        }
+        drop(client);
+        let _ = echo.await;
+        rtts.sort();
+        let median = rtts[rtts.len() / 2];
+        // Stalled Nagle/delayed-ACK behaviour measured ~88 ms; healthy loopback is < 1 ms.
+        assert!(
+            median < std::time::Duration::from_millis(40),
+            "median control RTT too high: {median:?}"
+        );
+    }
 
     #[tokio::test]
     async fn test_control_channel_roundtrip() {

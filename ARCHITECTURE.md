@@ -103,10 +103,44 @@ For wireless freedom:
 | Port | Proto | Purpose |
 |------|-------|---------|
 | 48444 | TCP | Host control channel (clipboard, signaling). Also the `adb reverse` port: the Quest connects to `127.0.0.1:48444` over USB. |
-| 48442 | UDP | Low-latency input channel (Quest to host). |
+| 48442 | UDP | Low-latency input channel (Quest to host). In `Udp` mode the client sends input and a 100 ms keepalive here from an ephemeral local port; the host latches that peer and streams video to its IP on 48440. `adb reverse` cannot carry UDP, so the USB mode sends no input yet. |
 
-Status: the host has no video endpoint yet, and the daemon does not yet start the ADB bridge, so
-the reverse tunnel is not set up automatically. These are the agreed defaults only.
+Status: the host has no video endpoint yet. The daemon (`linux-quest-host daemon`, headless and
+`--tui`) starts the ADB bridge (`crates/host/src/adb_link.rs`) and keeps the reverse tunnel in place.
+
+- **USB tunnel management.** While a Quest is attached and authorized, the daemon runs
+  `adb reverse tcp:48444 tcp:48444` and re-applies it after a detach, flap or dropped rule. Tunnel
+  up/down events feed `LinkTracker::adb_event`, so a loopback control connection is reported as USB
+  only while the tunnel is up (loopback without a tunnel is reported as disconnected).
+- **When it cannot connect** the daemon never fails. It logs one message per change of situation
+  (not per poll) and keeps polling (every 2 s; every 15 s when `adb` itself is missing or failing):
+  `adb` not on PATH, adb server errors, no device, a device that is not a Quest, an unauthorized
+  device (accept the USB debugging prompt in the headset), or several Quests attached (it will not
+  guess; pass `--adb-serial <serial>`).
+- **Flags.** `--no-adb` disables the bridge (the daemon then never runs `adb`; a manually
+  created `adb reverse` still carries traffic, but nothing reports the tunnel as up, so loopback
+  connections show as disconnected).
+  `--adb-serial <serial>` picks one device and skips the Quest model check. There is no env var.
+- **Shutdown** (SIGINT/SIGTERM, or leaving the TUI) removes the reverse mapping on a best-effort
+  basis (3 s limit) and marks the tunnel down. After a crash the mapping can survive in the adb
+  server; the next start re-applies it, replacing the old one.
+
+#### What works over USB today
+
+`adb reverse` forwards **TCP only**; it cannot carry UDP. So over the USB tunnel:
+
+| Channel | Port | Over USB tunnel | Notes |
+|---------|------|-----------------|-------|
+| Control (clipboard, link detection) | TCP 48444 | Yes | The daemon's control listener accepts the tunneled connection and classifies it as USB. |
+| Input | UDP 48442 | **No** | The host's UDP input receiver never sees tunneled traffic. A client would have to reach it over the network (Wi-Fi, or USB tethering/RNDIS addressed by IP), not `127.0.0.1`. |
+| Video | none | **No** | The host has no video endpoint. The Android client's USB mode (`TransportMode::AdbReverseTcp`) connects to `127.0.0.1:48444` and only reads video `Packet`s from that TCP stream, but the control listener speaks `ControlMessage` frames, not video packets. |
+
+The Android client does not send input or control messages at all today (`crates/client` uses neither
+`InputChannel` nor `ControlChannel`), so over USB today the host can show "connected via USB" for a
+tunneled control connection, but no input and no video actually flow.
+Making USB useful needs, at minimum, input carried over TCP (for example `InputEvent` frames on the
+control connection, or a second reversed TCP port) and a TCP video endpoint on the host; both are
+protocol changes that are out of scope here.
 
 - Wi-Fi/LAN (manual entry and mDNS discovery): the host's control listener, TCP `48444`. Discovery advertises this port, along with the UDP input port `48442`. Manual entry defaults to `48444`.
 - USB/ADB: `adb reverse tcp:48444 tcp:48444`, the same control port, so the USB host address is `127.0.0.1:48444`.
