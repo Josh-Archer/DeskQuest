@@ -89,6 +89,11 @@ struct DaemonArgs {
     /// UDP port on the headset that video datagrams are sent to
     #[arg(long, default_value_t = linux_quest_host::video_sender::DEFAULT_VIDEO_PORT)]
     video_port: u16,
+
+    /// Send a synthetic test pattern when no real screen capture is available (for testing
+    /// encode, transport and decode on the headset)
+    #[arg(long, conflicts_with = "no_video")]
+    test_pattern: bool,
 }
 
 fn parse_encoder_backend(value: &str) -> Result<BackendPreference, String> {
@@ -340,6 +345,7 @@ async fn start_video(
     let options = linux_quest_host::video_sender::daemon::DaemonVideoOptions {
         video_port: args.video_port,
         encoder: args.encoder.unwrap_or_else(BackendPreference::from_env),
+        test_pattern: args.test_pattern,
     };
     match linux_quest_host::video_sender::daemon::start_daemon_video_sender(link, options).await {
         Ok(handle) => {
