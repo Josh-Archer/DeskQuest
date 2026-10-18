@@ -131,13 +131,14 @@ pub fn build_cylinder_layer<'a, G: Graphics>(
 }
 
 /// Builds an `XrCompositionLayerPassthroughFB` to blend virtual displays with the real-world environment.
+///
+/// The layer has no space: XR_FB_passthrough requires `space` to be `XR_NULL_HANDLE`, and Horizon OS
+/// rejects `xrEndFrame` otherwise ("passthrough layer must not specify a space").
 pub fn build_passthrough_layer<'a, G: Graphics>(
-    space: &'a Space,
     passthrough_layer: &'a openxr::PassthroughLayerFB,
 ) -> crate::openxr::passthrough::CompositionLayerPassthroughFB<'a, G> {
     crate::openxr::passthrough::CompositionLayerPassthroughFB::new()
         .flags(CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA)
-        .space(space)
         .layer_handle(passthrough_layer)
 }
 
