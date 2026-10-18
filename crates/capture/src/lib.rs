@@ -3,6 +3,7 @@ pub mod audio;
 pub mod audio_pipewire;
 pub mod dmabuf;
 pub mod pipewire;
+pub mod screencast;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -13,6 +14,7 @@ pub use audio::{AudioSampleFormat, AudioSource, AutoAudioSource, RawAudioFrame, 
 pub use audio_pipewire::PipeWireAudioSource;
 pub use dmabuf::DmaBufPlane;
 pub use pipewire::PipeWireCapture;
+pub use screencast::{CaptureStats, ScreenCastConfig, ScreenCastError};
 
 #[derive(Error, Debug)]
 pub enum CaptureError {
@@ -27,6 +29,12 @@ pub enum CaptureError {
 
     #[error("Backend unavailable: {0}")]
     BackendUnavailable(String),
+
+    /// Portal / PipeWire screen capture could not start (typed, e.g. user cancelled the
+    /// picker) or ended (session closed, node removed). After this error from
+    /// `capture_frame`, `init` may be called again to restart the capture.
+    #[error("Screen capture: {0}")]
+    ScreenCast(#[from] ScreenCastError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +50,26 @@ pub enum CaptureBackendType {
     DmaBuf,
     X11Shm,
     Synthetic,
+}
+
+/// The parameters of the stream a capture backend is actually delivering.
+///
+/// For real screen capture these come from the negotiated PipeWire format, not from the
+/// hints passed to the constructor, so a video sender should read them (after `init`) to
+/// configure the encoder, and again whenever the value changes (the compositor can
+/// re-negotiate on a mode change; every `RawFrame` also carries its own `width`/`height`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaptureInfo {
+    pub width: u32,
+    pub height: u32,
+    /// Negotiated (or maximum, for variable-rate sources) frames per second, rounded.
+    pub fps: u32,
+    /// Layout of the delivered frames.
+    pub format: PixelFormat,
+    /// True when frames arrive as DMA-BUFs (`RawFrame::dma_buf`), false for CPU memory.
+    pub dmabuf: bool,
+    /// DRM format modifier of the DMA-BUFs, when `dmabuf`.
+    pub modifier: Option<u64>,
 }
 
 /// A captured raw frame prior to video encoding.
@@ -73,6 +101,12 @@ pub trait DisplayCapture: Send + Sync {
     async fn init(&mut self) -> Result<(), CaptureError>;
     async fn capture_frame(&mut self) -> Result<RawFrame, CaptureError>;
     fn backend_type(&self) -> CaptureBackendType;
+
+    /// Size, rate and layout of the frames this capture delivers, once known (after a
+    /// successful `init`). Backends that cannot tell return `None`.
+    fn capture_info(&self) -> Option<CaptureInfo> {
+        None
+    }
 }
 
 /// Deterministic synthetic screen generator for integration tests and headless benchmarking.
@@ -135,6 +169,17 @@ impl DisplayCapture for SyntheticCapture {
     fn backend_type(&self) -> CaptureBackendType {
         CaptureBackendType::Synthetic
     }
+
+    fn capture_info(&self) -> Option<CaptureInfo> {
+        Some(CaptureInfo {
+            width: self.width,
+            height: self.height,
+            fps: self.fps,
+            format: PixelFormat::Bgra8,
+            dmabuf: false,
+            modifier: None,
+        })
+    }
 }
 
 /// Dynamically discovers and initializes the best available capture engine.
@@ -187,6 +232,10 @@ impl DisplayCapture for AutoCapture {
 
     fn backend_type(&self) -> CaptureBackendType {
         self.inner.backend_type()
+    }
+
+    fn capture_info(&self) -> Option<CaptureInfo> {
+        self.inner.capture_info()
     }
 }
 
@@ -269,6 +318,10 @@ mod tests {
         let frame = auto.capture_frame().await.expect("Capture frame failed");
         assert_eq!(frame.width, 1280);
         assert_eq!(frame.height, 720);
+        let info = auto.capture_info().expect("capture info after init");
+        assert_eq!((info.width, info.height), (1280, 720));
+        assert_eq!(info.fps, 60);
+        assert!(!info.dmabuf);
     }
 
     #[tokio::test]
