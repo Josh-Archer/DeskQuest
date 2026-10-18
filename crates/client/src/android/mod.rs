@@ -140,6 +140,44 @@ impl DropWarnLimiter {
     }
 }
 
+/// Reads an Android system property, `None` if unset or empty.
+#[cfg(target_os = "android")]
+fn system_property(name: &str) -> Option<String> {
+    let name = std::ffi::CString::new(name).ok()?;
+    let mut buf = [0 as std::ffi::c_char; 92]; // PROP_VALUE_MAX
+                                               // SAFETY: `buf` is PROP_VALUE_MAX bytes, the most __system_property_get writes.
+    let len = unsafe { libc::__system_property_get(name.as_ptr(), buf.as_mut_ptr()) };
+    if len <= 0 {
+        return None;
+    }
+    // SAFETY: the call NUL-terminates the value inside `buf`.
+    let value = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+    Some(value.to_string_lossy().into_owned())
+}
+
+/// The default config with the `debug.linuxquest.*` overrides applied (see
+/// [`ClientConfig::with_launch_overrides`]). Bad values are logged and ignored.
+#[cfg(target_os = "android")]
+fn launch_config() -> ClientConfig {
+    use crate::config::{HOST_PROPERTY, TRANSPORT_PROPERTY};
+    let host = system_property(HOST_PROPERTY);
+    let transport = system_property(TRANSPORT_PROPERTY);
+    match ClientConfig::default().with_launch_overrides(host.as_deref(), transport.as_deref()) {
+        Ok(config) => {
+            tracing::info!(
+                host = %config.host_addr,
+                transport = ?config.transport_mode,
+                "client transport configured"
+            );
+            config
+        }
+        Err(e) => {
+            tracing::warn!("ignoring launch override: {e}");
+            ClientConfig::default()
+        }
+    }
+}
+
 /// Native entry point for Android NativeActivity on Meta Quest.
 #[cfg(target_os = "android")]
 #[no_mangle]
@@ -156,7 +194,7 @@ pub fn android_main(app: AndroidApp) {
     // `android_main`, for OpenXR, MediaCodec and JNI users. Initialising it again here
     // trips the "exactly once" assertion in ndk-context and aborts the app at startup.
 
-    let config = ClientConfig::default();
+    let config = launch_config();
 
     // Background transport packet receiver (bounded channel: 512 packets, drops on overflow)
     let (packet_tx, packet_rx) =

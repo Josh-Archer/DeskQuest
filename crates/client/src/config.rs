@@ -172,7 +172,50 @@ impl Default for ClientConfig {
     }
 }
 
+/// Android system property naming the host: an IP (`192.168.1.20`) or `ip:port`.
+pub const HOST_PROPERTY: &str = "debug.linuxquest.host";
+/// Android system property choosing the transport: `udp` (Wi-Fi) or `usb` (ADB reverse TCP).
+pub const TRANSPORT_PROPERTY: &str = "debug.linuxquest.transport";
+
 impl ClientConfig {
+    /// Applies the launch-time overrides read from [`HOST_PROPERTY`] and [`TRANSPORT_PROPERTY`]
+    /// (`adb shell setprop debug.linuxquest.host 192.168.1.20`). Empty values are ignored.
+    ///
+    /// A host without a transport selects `Udp`, since the USB path always dials loopback.
+    /// A host given as a bare IP keeps the default control port.
+    pub fn with_launch_overrides(
+        mut self,
+        host: Option<&str>,
+        transport: Option<&str>,
+    ) -> Result<Self, String> {
+        let host = host.map(str::trim).filter(|s| !s.is_empty());
+        let transport = transport.map(str::trim).filter(|s| !s.is_empty());
+        if let Some(host) = host {
+            self.host_addr = match host.parse::<SocketAddr>() {
+                Ok(addr) => addr,
+                Err(_) => host
+                    .parse::<IpAddr>()
+                    .map(|ip| SocketAddr::new(ip, self.host_addr.port()))
+                    .map_err(|_| format!("{HOST_PROPERTY}={host:?} is not an IP or ip:port"))?,
+            };
+            if transport.is_none() {
+                self.transport_mode = TransportMode::Udp;
+            }
+        }
+        if let Some(transport) = transport {
+            self.transport_mode = match transport.to_ascii_lowercase().as_str() {
+                "udp" | "wifi" => TransportMode::Udp,
+                "usb" | "adb" | "tcp" => TransportMode::AdbReverseTcp,
+                other => {
+                    return Err(format!(
+                        "{TRANSPORT_PROPERTY}={other:?} is not one of udp, wifi, usb, adb, tcp"
+                    ))
+                }
+            };
+        }
+        Ok(self)
+    }
+
     /// Validates the configuration values.
     pub fn validate(&self) -> ClientResult<()> {
         if self.target_refresh_rate < 30.0 || self.target_refresh_rate > 144.0 {
@@ -280,5 +323,48 @@ mod tests {
             ..Default::default()
         };
         assert!(config_large_angle.validate().is_err());
+    }
+
+    #[test]
+    fn launch_overrides_none_keep_defaults() {
+        let cfg = ClientConfig::default()
+            .with_launch_overrides(None, Some(""))
+            .unwrap();
+        assert_eq!(cfg.transport_mode, TransportMode::AdbReverseTcp);
+        assert_eq!(cfg.host_addr, ClientConfig::default().host_addr);
+    }
+
+    #[test]
+    fn launch_override_bare_ip_selects_udp_and_keeps_port() {
+        let cfg = ClientConfig::default()
+            .with_launch_overrides(Some(" 192.168.211.20 "), None)
+            .unwrap();
+        assert_eq!(cfg.transport_mode, TransportMode::Udp);
+        assert_eq!(
+            cfg.host_addr,
+            SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(192, 168, 211, 20)),
+                DEFAULT_CONTROL_PORT
+            )
+        );
+    }
+
+    #[test]
+    fn launch_override_ip_port_and_explicit_transport() {
+        let cfg = ClientConfig::default()
+            .with_launch_overrides(Some("10.0.0.5:50000"), Some("USB"))
+            .unwrap();
+        assert_eq!(cfg.transport_mode, TransportMode::AdbReverseTcp);
+        assert_eq!(cfg.host_addr.port(), 50000);
+    }
+
+    #[test]
+    fn launch_override_rejects_bad_values() {
+        assert!(ClientConfig::default()
+            .with_launch_overrides(Some("not-an-ip"), None)
+            .is_err());
+        assert!(ClientConfig::default()
+            .with_launch_overrides(None, Some("carrier-pigeon"))
+            .is_err());
     }
 }
