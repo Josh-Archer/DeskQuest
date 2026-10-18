@@ -64,6 +64,14 @@ struct DaemonArgs {
     /// Do not advertise this daemon on the LAN via mDNS (Quest clients then need manual IP entry)
     #[arg(long)]
     no_advertise: bool,
+
+    /// Do not start the UDP video sender (it is on by default; ignored with --tui)
+    #[arg(long)]
+    no_video: bool,
+
+    /// UDP port on the headset that video datagrams are sent to
+    #[arg(long, default_value_t = linux_quest_host::video_sender::DEFAULT_VIDEO_PORT)]
+    video_port: u16,
 }
 
 #[derive(Args, Debug, Default)]
@@ -238,6 +246,36 @@ async fn start_stream_services(
     (control_port, input_port)
 }
 
+/// Starts the UDP video sender unless `--no-video`. When it cannot run (no real capture backend,
+/// no hardware encoder), logs exactly one line and returns `None`; the daemon keeps running.
+async fn start_video(
+    args: &DaemonArgs,
+    link: SharedLinkTracker,
+) -> Option<linux_quest_host::video_sender::VideoSenderHandle> {
+    if args.no_video {
+        info!("UDP video sender disabled by --no-video");
+        return None;
+    }
+    let options = linux_quest_host::video_sender::daemon::DaemonVideoOptions {
+        video_port: args.video_port,
+    };
+    match linux_quest_host::video_sender::daemon::start_daemon_video_sender(link, options).await {
+        Ok(handle) => {
+            info!(
+                port = args.video_port,
+                "UDP video sender ready; it sends to the headset once its input channel is live"
+            );
+            Some(handle)
+        }
+        Err(reason) => {
+            tracing::warn!(
+                "UDP video sender not started ({reason}); the daemon keeps running without video"
+            );
+            None
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
@@ -365,6 +403,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let (control_port, input_port) =
                     start_stream_services(&shutdown_tx, link.clone()).await;
 
+                let video = start_video(&daemon_args, link.clone()).await;
+
                 // Advertise only the ports that were really bound above.
                 let listening = match (control_port, input_port) {
                     (Some(control), Some(input)) => {
@@ -372,16 +412,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                     _ => None,
                 };
-                let advertiser = linux_quest_host::advertise::advertise_daemon(
+                let advertiser = linux_quest_host::advertise::advertise_daemon_with_video(
                     !daemon_args.no_advertise,
                     linux_quest_host::advertise::system_instance_name(),
                     listening,
+                    video.as_ref().map(|v| v.video_port()),
                 )
                 .await;
 
                 let served = run_ipc_server(host, link, shutdown_rx).await;
                 if let Some(advertiser) = advertiser {
                     advertiser.stop().await;
+                }
+                if let Some(video) = video {
+                    video.stop().await;
                 }
                 served?;
                 info!("Daemon stopped cleanly.");

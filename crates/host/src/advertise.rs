@@ -3,7 +3,9 @@
 //! The daemon publishes one DNS-SD service through a [`DiscoveryBackend`] once its network
 //! listeners are bound, and withdraws it on shutdown. Only ports that a listener really holds
 //! are advertised: the control and input ports come from the bound listeners, and the video
-//! port is omitted because the daemon has no video listener yet. Advertising is best effort:
+//! port is advertised only while the UDP video sender is actually running. It is the UDP port
+//! on the headset that video is sent to (the host has no video listener; it sends). Without a
+//! running sender the `video` key is omitted. Advertising is best effort:
 //! every failure is logged as a warning and the daemon keeps running without being discoverable.
 //!
 //! Real mDNS needs the `mdns` cargo feature. Without it, [`advertise_daemon`] logs once and
@@ -127,15 +129,25 @@ impl<B: DiscoveryBackend> HostAdvertiser<B> {
 }
 
 /// Builds the advertisement for this daemon from the ports its listeners hold. The video port is
-/// [`VIDEO_PORT_UNAVAILABLE`] because no video listener exists yet.
+/// [`VIDEO_PORT_UNAVAILABLE`]: no video sender is assumed to be running.
 pub fn daemon_advertisement(
     instance_name: impl Into<String>,
     listening: ListeningPorts,
 ) -> HostAdvertisement {
+    daemon_advertisement_with_video(instance_name, listening, None)
+}
+
+/// Like [`daemon_advertisement`], advertising `video_port` (the headset UDP port the running
+/// video sender targets) when it is `Some`.
+pub fn daemon_advertisement_with_video(
+    instance_name: impl Into<String>,
+    listening: ListeningPorts,
+    video_port: Option<u16>,
+) -> HostAdvertisement {
     HostAdvertisement {
         name: instance_name.into(),
         control_port: listening.control,
-        video_port: VIDEO_PORT_UNAVAILABLE,
+        video_port: video_port.unwrap_or(VIDEO_PORT_UNAVAILABLE),
         input_port: listening.input,
         codecs: ADVERTISED_CODECS.to_vec(),
     }
@@ -148,6 +160,16 @@ pub async fn advertise_daemon(
     enabled: bool,
     instance_name: impl Into<String>,
     listening: Option<ListeningPorts>,
+) -> Option<HostAdvertiser<DefaultDiscoveryBackend>> {
+    advertise_daemon_with_video(enabled, instance_name, listening, None).await
+}
+
+/// [`advertise_daemon`] that also advertises the video port when the video sender is running.
+pub async fn advertise_daemon_with_video(
+    enabled: bool,
+    instance_name: impl Into<String>,
+    listening: Option<ListeningPorts>,
+    video_port: Option<u16>,
 ) -> Option<HostAdvertiser<DefaultDiscoveryBackend>> {
     if !enabled {
         info!("LAN advertisement disabled by --no-advertise");
@@ -171,7 +193,11 @@ pub async fn advertise_daemon(
             return None;
         }
     };
-    HostAdvertiser::start(backend, &daemon_advertisement(instance_name, listening)).await
+    HostAdvertiser::start(
+        backend,
+        &daemon_advertisement_with_video(instance_name, listening, video_port),
+    )
+    .await
 }
 
 /// Turns a raw hostname into a DNS-SD instance name.
@@ -255,12 +281,23 @@ mod tests {
     }
 
     #[test]
+    fn daemon_advertisement_with_running_sender_includes_the_video_port() {
+        let ad = daemon_advertisement_with_video("den", LISTENING, Some(48440));
+        ad.validate().expect("publishable");
+        assert_eq!(ad.video_port, 48440);
+        assert_eq!(
+            ad.txt_properties().get("video").map(String::as_str),
+            Some("48440")
+        );
+    }
+
+    #[test]
     fn daemon_advertisement_omits_video_from_txt() {
         let ad = daemon_advertisement("den", LISTENING);
         let txt = ad.txt_properties();
         assert!(
             !txt.contains_key("video"),
-            "no video listener, so no video key"
+            "no running video sender, so no video key"
         );
         assert_eq!(txt.get("input").map(String::as_str), Some("48442"));
     }

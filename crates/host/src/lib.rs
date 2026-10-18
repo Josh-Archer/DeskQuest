@@ -19,6 +19,7 @@ pub mod link_status;
 pub mod multi_display;
 pub mod tray;
 pub mod tui;
+pub mod video_sender;
 
 pub use audio_pipeline::HostAudioPipeline;
 pub use clipboard_service::{HostClipboardService, HOST_CLIPBOARD_ORIGIN_ID};
