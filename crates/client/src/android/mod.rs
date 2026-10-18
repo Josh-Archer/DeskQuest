@@ -145,6 +145,7 @@ pub fn android_main(app: AndroidApp) {
                             continue;
                         }
                     };
+                    let _ = stream.set_nodelay(true);
                     let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
                     let mut stream = stream;
                     let mut read_buf = Vec::with_capacity(65536);
