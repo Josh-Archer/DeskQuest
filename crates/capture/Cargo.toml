@@ -14,11 +14,26 @@ async-trait.workspace = true
 tracing.workspace = true
 libloading.workspace = true
 libc.workspace = true
+# Sync primitives only: the latest-wins frame queue wakes `capture_frame().await`.
+tokio = { workspace = true }
+# Optional: xdg-desktop-portal ScreenCast client. zbus is already a workspace dependency
+# (linux-quest-display), so this adds no new crate to the dependency tree.
+zbus = { version = "5.19", default-features = false, features = ["tokio"], optional = true }
+# Optional: needed by the zvariant derive macros used for portal replies (already in the tree).
+serde = { workspace = true, optional = true }
+# Optional: PipeWire stream bindings for the screencast node. Needs libpipewire-0.3-dev
+# (and libclang for bindgen) at build time; not built by default.
+pipewire = { version = "0.10", features = ["v0_3_33"], optional = true }
 
 [features]
 default = []
 pipewire-audio = []
-pipewire = ["pipewire-audio"]
+# xdg-desktop-portal ScreenCast over D-Bus (restore tokens, session lifecycle).
+portal = ["dep:zbus", "dep:serde"]
+# Real screen capture: portal + a PipeWire video stream (DMA-BUF preferred, SHM fallback).
+pipewire-screencast = ["portal", "dep:pipewire"]
+pipewire = ["pipewire-audio", "pipewire-screencast"]
 
 [dev-dependencies]
 tokio.workspace = true
+tracing-subscriber.workspace = true
