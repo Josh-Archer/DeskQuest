@@ -674,24 +674,24 @@ struct ScriptedEncoderProbe {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fec_recovers_up_to_its_design_limit() {
     let _serial = SERIAL.lock().await;
-    // Drop the first two source datagrams of every block: exactly m = 2 losses per block.
+    // Drop the first five source datagrams of every block: exactly m = 5 losses per block.
     // Frame 1 is spared: the client's jitter buffer has no playout cursor until it has seen
     // a packet, so loss at the very start of a stream is outside the FEC contract.
     let (frames, probe, dropped, recovered, _) =
         run_through_relay(30, Duration::from_millis(15), RELAY_PLAYOUT_MS, |_, d| {
             let info = inspect(d);
-            info.frame_id.is_some_and(|f| f > 1) && info.fec_index < 2
+            info.frame_id.is_some_and(|f| f > 1) && info.fec_index < 5
         })
         .await;
 
-    assert_eq!(dropped, 58, "two datagrams of each of frames 2..=30");
+    assert_eq!(dropped, 5 * 29, "five datagrams of each of frames 2..=30");
     assert_eq!(frames.len(), 30, "m losses per block are fully recovered");
     let produced = probe.produced.lock();
     for (_, frame) in &frames {
         assert_eq!(frame.bitstream, produced[&frame.meta.frame_id], "bit-exact");
     }
     assert!(
-        recovered >= 58,
+        recovered >= 5 * 29,
         "FEC rebuilt the dropped datagrams: {recovered}"
     );
 }
@@ -729,17 +729,22 @@ async fn fec_recovery_with_the_client_default_playout_delay() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn frames_beyond_the_fec_limit_are_dropped_without_stalling_later_frames() {
     let _serial = SERIAL.lock().await;
-    // Frames 3, 6, 9, ... lose m + 1 = 3 datagrams of their block: unrecoverable.
+    // Frames 3, 6, 9, ... lose m + 1 = 6 sources of their block (m = 5 with the defaults):
+    // unrecoverable.
     let (frames, probe, dropped, _, lost) =
         run_through_relay(30, Duration::from_millis(15), RELAY_PLAYOUT_MS, |_, d| {
             let info = inspect(d);
             info.packet_type == PacketType::VideoFrameChunk
-                && info.fec_index < 3
+                && info.fec_index < 6
                 && info.frame_id.is_some_and(|f| f % 3 == 0)
         })
         .await;
 
-    assert_eq!(dropped, 30);
+    assert_eq!(
+        dropped,
+        10 * 6,
+        "six sources of each of the ten damaged frames"
+    );
     let ids: Vec<u64> = frames.iter().map(|(_, f)| f.meta.frame_id).collect();
     let expected: Vec<u64> = (1..=30).filter(|f| f % 3 != 0).collect();
     assert_eq!(
@@ -751,7 +756,7 @@ async fn frames_beyond_the_fec_limit_are_dropped_without_stalling_later_frames()
         assert_eq!(frame.bitstream, produced[&frame.meta.frame_id], "bit-exact");
     }
     assert!(
-        lost >= 30,
+        lost >= 60,
         "the client counted the unrecoverable datagrams: {lost}"
     );
 
@@ -770,7 +775,7 @@ async fn frames_beyond_the_fec_limit_are_dropped_without_stalling_later_frames()
 async fn random_loss_is_mostly_recovered_and_never_corrupts_a_frame() {
     let _serial = SERIAL.lock().await;
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-    // 3% independent loss: a block (22 datagrams) fails only with 3 or more losses, ~3%.
+    // 3% independent loss: a block (25 datagrams) fails only with 6 or more losses, ~0%.
     let (frames, probe, dropped, recovered, _) = run_through_relay(
         60,
         Duration::from_millis(15),
@@ -793,6 +798,75 @@ async fn random_loss_is_mostly_recovered_and_never_corrupts_a_frame() {
     for (_, frame) in &frames {
         assert_eq!(frame.bitstream, produced[&frame.meta.frame_id], "bit-exact");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Burst loss inside one frame, through the client's receiver on a simulated clock
+// ---------------------------------------------------------------------------------------------
+
+/// Feeds the datagrams of one frame to the client's `ClientReceiver` on a simulated clock.
+/// Datagram `i` arrives `gap * i` after the start and the receiver is polled every 50 us; lost
+/// datagrams never arrive. The clock is simulated, so the result does not depend on scheduler
+/// timing. Returns the frames the client delivered.
+fn receive_on_simulated_clock(
+    datagrams: &[Datagram],
+    gap: Duration,
+    lost: impl Fn(usize) -> bool,
+) -> Vec<AssembledFrame> {
+    let start = Instant::now();
+    let mut receiver = ClientReceiver::new(&ClientConfig::default());
+    let mut delivered = Vec::new();
+    let mut next = 0;
+    let mut t = Duration::ZERO;
+    let end = gap * datagrams.len() as u32 + Duration::from_millis(60);
+    while t <= end {
+        while next < datagrams.len() && gap * next as u32 <= t {
+            if !lost(next) {
+                let packet = Packet::from_bytes(&datagrams[next].bytes).unwrap();
+                receiver.ingest_packet(packet, start + gap * next as u32);
+            }
+            next += 1;
+        }
+        delivered.extend(receiver.pop_ready_frames(start + t).unwrap());
+        t += Duration::from_micros(50);
+    }
+    delivered
+}
+
+#[test]
+fn a_burst_of_m_datagrams_inside_one_block_is_recovered_bit_exact_and_m_plus_one_is_not() {
+    // 60 chunks of 1200 bytes: three blocks of 20 sources and 5 parity, 75 datagrams in all.
+    let bitstream = pattern(1, 60 * 1200);
+    let encoded = chunked(1, &bitstream, 1200, true, 60, 16_666, (640, 360));
+    let datagrams = Packetizer::new(0, 1200, FecConfig::default())
+        .packetize(&encoded, 1_000)
+        .unwrap();
+    assert_eq!(datagrams.len(), 75);
+    // The sender spreads a block over at most 2 ms (`MAX_BLOCK_SPAN`): 25 datagrams, 80 us apart.
+    let gap = Duration::from_micros(80);
+
+    // Five consecutive lost datagrams: the first block's first sources, and one in the middle
+    // of the second block. Both fall within the 5 parity of their block.
+    for first in [0usize, 35] {
+        let frames =
+            receive_on_simulated_clock(&datagrams, gap, |i| (first..first + 5).contains(&i));
+        assert_eq!(frames.len(), 1, "burst at {first}: frame delivered");
+        assert_eq!(
+            frames[0].bitstream, bitstream,
+            "burst at {first}: bit-exact"
+        );
+    }
+
+    // Six in a row exceed one block's parity: the frame is not delivered, and nothing is
+    // delivered wrongly.
+    let frames = receive_on_simulated_clock(&datagrams, gap, |i| (0..6).contains(&i));
+    assert!(
+        frames.is_empty(),
+        "six losses in one block are unrecoverable"
+    );
+
+    let frames = receive_on_simulated_clock(&datagrams, gap, |_| false);
+    assert_eq!(frames.len(), 1, "no loss: delivered");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1140,8 +1214,8 @@ async fn pacing_spreads_a_frames_datagrams_over_its_budget() {
     assert_eq!(paced.datagrams, unpaced.datagrams);
     assert_eq!(
         paced.datagrams,
-        160 + 8 * 2,
-        "160 sources + 8 blocks x 2 parity"
+        160 + 8 * 5,
+        "160 sources + 8 blocks x 5 parity"
     );
 
     let span = |t: &[Instant]| *t.last().unwrap() - *t.first().unwrap();
@@ -1167,7 +1241,7 @@ async fn pacing_spreads_a_frames_datagrams_over_its_budget() {
 #[tokio::test]
 async fn a_single_fec_block_is_never_paced_over_more_than_a_few_milliseconds() {
     let _serial = SERIAL.lock().await;
-    // One block (20 sources + 2 parity) at 60 fps would get an 8.3 ms budget, but the client
+    // One block (20 sources + 5 parity) at 60 fps would get an 8.3 ms budget, but the client
     // releases packets ~4 ms after arrival and learns the block's size from its parity packets,
     // so the block must leave within `MAX_BLOCK_SPAN` (2 ms).
     let raw = raw_frame(640, 360, Bytes::new(), 0);
@@ -1184,7 +1258,7 @@ async fn a_single_fec_block_is_never_paced_over_more_than_a_few_milliseconds() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(report.datagrams, 22);
+    assert_eq!(report.datagrams, 25);
     let times: Vec<Instant> = sent.lock().iter().map(|(t, _, _)| *t).collect();
     let span = *times.last().unwrap() - *times.first().unwrap();
     // The budget would be 8.3 ms; the block cap keeps it near 2 ms (pacing resolution is ~1 ms).
@@ -1219,8 +1293,8 @@ async fn socket_backpressure_drops_datagrams_instead_of_blocking_and_requests_an
         .unwrap();
     assert!(start.elapsed() < Duration::from_millis(500), "never blocks");
     assert_eq!(report.datagrams, 0);
-    assert_eq!(report.send_failures, 22);
-    assert_eq!(VideoSenderStats::get(&stats.send_would_block), 22);
+    assert_eq!(report.send_failures, 25);
+    assert_eq!(VideoSenderStats::get(&stats.send_would_block), 25);
     assert_eq!(key_requests.load(Ordering::Relaxed), 1);
 
     // A second failing frame right away does not ask again (inside the minimum interval).
