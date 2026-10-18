@@ -110,6 +110,10 @@ pub trait DisplayCapture: Send + Sync {
 }
 
 /// Deterministic synthetic screen generator for integration tests and headless benchmarking.
+///
+/// Renders standard 8 vertical colour bars (white, yellow, cyan, green, magenta, red, blue,
+/// black) plus a white 64x64 square that moves horizontally across the vertical middle, so a
+/// person wearing the headset can judge colour accuracy and see a frozen stream.
 pub struct SyntheticCapture {
     display_id: u16,
     width: u32,
@@ -158,10 +162,49 @@ impl DisplayCapture for SyntheticCapture {
         let stride = self.width * 4;
         let frame_size = (stride * self.height) as usize;
 
-        // Solid colour that cycles every 256 frames (BGRA). `repeat` is a block copy; a
-        // per-byte loop over a 1080p frame cost more than a frame interval in debug builds.
-        let offset = (self.frame_counter % 256) as u8;
-        let buffer = [255 - offset, 128, offset, 255].repeat(frame_size / 4);
+        // One BGRA row of 8 equal vertical bars (the last takes the remainder), built once and
+        // block-copied into every row. A per-byte loop over a 1080p frame cost more than a
+        // frame interval in debug builds.
+        const BARS_RGB: [[u8; 3]; 8] = [
+            [255, 255, 255], // white
+            [255, 255, 0],   // yellow
+            [0, 255, 255],   // cyan
+            [0, 255, 0],     // green
+            [255, 0, 255],   // magenta
+            [255, 0, 0],     // red
+            [0, 0, 255],     // blue
+            [0, 0, 0],       // black
+        ];
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let bar_width = width / BARS_RGB.len();
+        let mut row: Vec<u8> = Vec::with_capacity(width * 4);
+        for (i, [r, g, b]) in BARS_RGB.iter().enumerate() {
+            let pixels = if i + 1 == BARS_RGB.len() {
+                width - bar_width * i
+            } else {
+                bar_width
+            };
+            row.extend_from_slice(&[*b, *g, *r, 255].repeat(pixels));
+        }
+        let mut buffer: Vec<u8> = Vec::with_capacity(frame_size);
+        for _ in 0..height {
+            buffer.extend_from_slice(&row);
+        }
+
+        // Moving white square (clamped to the frame): proves the stream is not frozen.
+        let square_w = width.min(64);
+        let square_h = height.min(64);
+        let square_x = ((self.frame_counter * 8) % width.max(1) as u64) as usize;
+        let square_y = (height - square_h) / 2;
+        let x_end = (square_x + square_w).min(width);
+        if x_end > square_x {
+            let white = [255u8, 255, 255, 255].repeat(x_end - square_x);
+            for y in square_y..square_y + square_h {
+                let start = y * width * 4 + square_x * 4;
+                buffer[start..start + white.len()].copy_from_slice(&white);
+            }
+        }
 
         let interval_us = 1_000_000 / (self.fps as u64).max(1);
         let pts_us = self.frame_counter * interval_us;
@@ -270,6 +313,31 @@ mod tests {
             "{elapsed:?}"
         );
         assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn synthetic_capture_renders_colour_bars_and_square() {
+        // 64 wide gives 8 px bars; 128 tall leaves rows above the (centered) square.
+        let mut capture = SyntheticCapture::new(0, 64, 128, 1000);
+        capture.init().await.unwrap();
+        let frame = capture.capture_frame().await.unwrap();
+        assert_eq!(frame.stride, 64 * 4);
+        assert_eq!(frame.data.len(), 64 * 4 * 128);
+        let px = |x: usize, y: usize| {
+            let i = y * frame.stride as usize + x * 4;
+            [
+                frame.data[i],
+                frame.data[i + 1],
+                frame.data[i + 2],
+                frame.data[i + 3],
+            ]
+        };
+        assert_eq!(px(4, 0), [255, 255, 255, 255], "white bar");
+        assert_eq!(px(12, 0), [0, 255, 255, 255], "yellow bar in BGRA");
+        assert_eq!(px(60, 0), [0, 0, 0, 255], "black bar");
+        // Frame 1: square starts at x=8, rows 32..96; it overwrites the black bar at x=60.
+        assert_eq!(px(60, 64), [255, 255, 255, 255], "square pixel");
+        assert_eq!(px(60, 31), [0, 0, 0, 255], "just above the square");
     }
 
     #[tokio::test]
