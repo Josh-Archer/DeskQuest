@@ -40,6 +40,12 @@ pub fn enable_control_keepalive(stream: &TcpStream) -> std::io::Result<()> {
     socket2::SockRef::from(stream).set_tcp_keepalive(&ka)
 }
 
+/// Disables Nagle on the control socket. Control messages are small and sent one at a time,
+/// so Nagle plus the peer's delayed ACK can hold a reply back for tens of milliseconds.
+pub fn enable_control_nodelay(stream: &TcpStream) -> std::io::Result<()> {
+    stream.set_nodelay(true)
+}
+
 /// Host origin ID for clipboard synchronization.
 pub const HOST_CLIPBOARD_ORIGIN_ID: u64 = 1;
 
@@ -196,6 +202,9 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
                         if let Err(e) = enable_control_keepalive(&stream) {
                             tracing::warn!(error = ?e, "Failed to enable TCP keepalive on control socket");
                         }
+                        if let Err(e) = enable_control_nodelay(&stream) {
+                            tracing::warn!(error = ?e, "Failed to set TCP_NODELAY on control socket");
+                        }
                         if let Some(link) = &self.link {
                             link.lock().control_accepted(peer_addr, Instant::now());
                         }
@@ -336,6 +345,21 @@ mod tests {
                 CONTROL_KEEPALIVE_RETRIES
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_control_nodelay_is_enabled_on_accepted_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+
+        assert!(
+            !stream.nodelay().unwrap(),
+            "accepted sockets start with Nagle on"
+        );
+        enable_control_nodelay(&stream).unwrap();
+        assert!(stream.nodelay().unwrap());
     }
 
     #[test]
