@@ -5,6 +5,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use linux_quest_display::DisplayLayoutMode;
+use linux_quest_host::adb_link::{spawn_adb_supervisor, AdbSupervisorConfig};
 use linux_quest_host::link_status::{
     new_shared_link_tracker, SharedLinkTracker, DEFAULT_INPUT_LIVENESS,
 };
@@ -64,6 +65,15 @@ struct DaemonArgs {
     /// Do not advertise this daemon on the LAN via mDNS (Quest clients then need manual IP entry)
     #[arg(long)]
     no_advertise: bool,
+
+    /// Do not manage the USB `adb reverse` tunnel (USB connections then need a manual
+    /// `adb reverse tcp:48444 tcp:48444`, and are not recognised as USB until one exists)
+    #[arg(long)]
+    no_adb: bool,
+
+    /// Serial of the ADB device to use when several are attached (skips the Quest model check)
+    #[arg(long, value_name = "SERIAL", conflicts_with = "no_adb")]
+    adb_serial: Option<String>,
 }
 
 #[derive(Args, Debug, Default)]
@@ -238,6 +248,40 @@ async fn start_stream_services(
     (control_port, input_port)
 }
 
+/// Starts the ADB bridge supervisor unless disabled. It is best effort: a missing `adb` or
+/// device only produces log lines. Stops (and removes the reverse mapping) on `shutdown_tx`.
+fn start_adb_bridge(
+    args: &DaemonArgs,
+    shutdown_tx: &tokio::sync::broadcast::Sender<()>,
+    link: SharedLinkTracker,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if args.no_adb {
+        info!("ADB bridge disabled (--no-adb); not managing the USB reverse tunnel");
+        return None;
+    }
+    let runner = Arc::new(linux_quest_transport::SystemAdbRunner::default());
+    let config = AdbSupervisorConfig::new(args.adb_serial.clone());
+    Some(spawn_adb_supervisor(
+        runner,
+        config,
+        link,
+        shutdown_tx.subscribe(),
+    ))
+}
+
+/// Waits for the ADB supervisor to remove its reverse mapping, bounded so a hung `adb`
+/// cannot block daemon exit.
+async fn finish_adb_bridge(handle: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(handle) = handle {
+        if tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .is_err()
+        {
+            tracing::warn!("ADB bridge did not stop in time; leaving it");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
@@ -324,6 +368,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                 // The TUI run binds the listeners but does not advertise them.
                 let _ = start_stream_services(&shutdown_tx, link.clone()).await;
+                let adb_handle = start_adb_bridge(&daemon_args, &shutdown_tx, link.clone());
 
                 let host_clone = host.clone();
                 let link_clone = link.clone();
@@ -345,6 +390,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let _ = shutdown_tx_clone.send(());
                 shutdown_flag_clone.store(true, std::sync::atomic::Ordering::SeqCst);
                 let _ = ipc_handle.await;
+                finish_adb_bridge(adb_handle).await;
             } else {
                 info!(
                     backend = host.backend_name().await,
@@ -364,6 +410,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                 let (control_port, input_port) =
                     start_stream_services(&shutdown_tx, link.clone()).await;
+                let adb_handle = start_adb_bridge(&daemon_args, &shutdown_tx, link.clone());
 
                 // Advertise only the ports that were really bound above.
                 let listening = match (control_port, input_port) {
@@ -380,6 +427,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .await;
 
                 let served = run_ipc_server(host, link, shutdown_rx).await;
+                // The IPC server may have ended on its own; make sure the bridge stops too.
+                let _ = shutdown_tx.send(());
+                finish_adb_bridge(adb_handle).await;
                 if let Some(advertiser) = advertiser {
                     advertiser.stop().await;
                 }
