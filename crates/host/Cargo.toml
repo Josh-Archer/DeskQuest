@@ -40,6 +40,10 @@ default = []
 tray = ["dep:ksni"]
 # Real mDNS advertisement of the daemon. Off by default; passes through to linux-quest-transport.
 mdns = ["linux-quest-transport/mdns"]
+# Real screen capture (xdg-desktop-portal ScreenCast + PipeWire). Off by default because it
+# needs libpipewire-0.3-dev and libclang at build time; without it the daemon can only use the
+# synthetic test pattern. Passes through to linux-quest-capture's `pipewire` feature.
+pipewire-capture = ["linux-quest-capture/pipewire"]
 
 [dev-dependencies]
 linux-quest-client = { path = "../client" }

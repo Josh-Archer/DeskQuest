@@ -11,6 +11,22 @@ use android_activity::{AndroidApp, MainEvent, PollEvent};
 #[cfg(target_os = "android")]
 use self::lifecycle::{AppLifecycle, LifecycleEvent, NextAction, LOG_TAG};
 
+/// JNI reference to the running `NativeActivity`, set at the top of [`android_main`].
+///
+/// `ndk_context::android_context().context()` is the `Application` (android-activity stores
+/// that), but `XR_KHR_android_create_instance` needs the `Activity` that drives the session.
+/// Given the `Application`, Horizon OS never considers the activity ready and the session
+/// stays IDLE.
+#[cfg(target_os = "android")]
+static ACTIVITY: std::sync::atomic::AtomicPtr<std::ffi::c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// The `Activity` jobject for OpenXR instance creation, or null before `android_main` ran.
+#[cfg(target_os = "android")]
+pub(crate) fn activity_jobject() -> *mut std::ffi::c_void {
+    ACTIVITY.load(std::sync::atomic::Ordering::Acquire)
+}
+
 use std::net::{IpAddr, SocketAddr};
 
 use crate::config::{ClientConfig, TransportMode};
@@ -177,6 +193,44 @@ fn set_receive_buffer(socket: &std::net::UdpSocket, bytes: libc::c_int) {
     );
 }
 
+/// Reads an Android system property, `None` if unset or empty.
+#[cfg(target_os = "android")]
+fn system_property(name: &str) -> Option<String> {
+    let name = std::ffi::CString::new(name).ok()?;
+    let mut buf = [0 as std::ffi::c_char; 92]; // PROP_VALUE_MAX
+                                               // SAFETY: `buf` is PROP_VALUE_MAX bytes, the most __system_property_get writes.
+    let len = unsafe { libc::__system_property_get(name.as_ptr(), buf.as_mut_ptr()) };
+    if len <= 0 {
+        return None;
+    }
+    // SAFETY: the call NUL-terminates the value inside `buf`.
+    let value = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+    Some(value.to_string_lossy().into_owned())
+}
+
+/// The default config with the `debug.linuxquest.*` overrides applied (see
+/// [`ClientConfig::with_launch_overrides`]). Bad values are logged and ignored.
+#[cfg(target_os = "android")]
+fn launch_config() -> ClientConfig {
+    use crate::config::{HOST_PROPERTY, TRANSPORT_PROPERTY};
+    let host = system_property(HOST_PROPERTY);
+    let transport = system_property(TRANSPORT_PROPERTY);
+    match ClientConfig::default().with_launch_overrides(host.as_deref(), transport.as_deref()) {
+        Ok(config) => {
+            tracing::info!(
+                host = %config.host_addr,
+                transport = ?config.transport_mode,
+                "client transport configured"
+            );
+            config
+        }
+        Err(e) => {
+            tracing::warn!("ignoring launch override: {e}");
+            ClientConfig::default()
+        }
+    }
+}
+
 /// Native entry point for Android NativeActivity on Meta Quest.
 #[cfg(target_os = "android")]
 #[no_mangle]
@@ -187,12 +241,13 @@ pub fn android_main(app: AndroidApp) {
         .try_init();
 
     tracing::info!("linux-quest Quest client starting up on Android / Horizon OS");
+    ACTIVITY.store(app.activity_as_ptr(), std::sync::atomic::Ordering::Release);
 
     // android-activity initialises `ndk_context` (JavaVM + activity) before calling
     // `android_main`, for OpenXR, MediaCodec and JNI users. Initialising it again here
     // trips the "exactly once" assertion in ndk-context and aborts the app at startup.
 
-    let config = ClientConfig::default();
+    let config = launch_config();
 
     // Background transport packet receiver (bounded channel: 512 packets, drops on overflow)
     let (packet_tx, packet_rx) =
@@ -439,6 +494,10 @@ pub fn android_main(app: AndroidApp) {
                         }
                     }
                 }
+            }
+            NextAction::DiscardSession => {
+                runtime = None;
+                lifecycle.on_session_discarded();
             }
             NextAction::PollEvents => {
                 if let Some(rt) = runtime.as_mut() {

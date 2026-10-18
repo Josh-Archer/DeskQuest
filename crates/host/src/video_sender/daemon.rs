@@ -31,11 +31,15 @@ impl<C: DisplayCapture> CaptureFrameSource<C> {
     pub async fn open(mut capture: C, allow_synthetic: bool) -> Result<Self, CaptureError> {
         capture.init().await?;
         if !allow_synthetic && capture.backend_type() == CaptureBackendType::Synthetic {
-            return Err(CaptureError::BackendUnavailable(
-                "only the synthetic test-pattern capture is available; PipeWire screencast \
-                 capture does not yet negotiate a stream node"
-                    .into(),
-            ));
+            let hint = if cfg!(feature = "pipewire-capture") {
+                "PipeWire screencast capture was not usable (is the PipeWire socket in \
+                 $XDG_RUNTIME_DIR and libpipewire-0.3 loadable?)"
+            } else {
+                "this build has no real capture; rebuild with --features pipewire-capture"
+            };
+            return Err(CaptureError::BackendUnavailable(format!(
+                "only the synthetic test-pattern capture is available; {hint}"
+            )));
         }
         Ok(Self { capture })
     }
@@ -55,6 +59,11 @@ pub struct DaemonVideoOptions {
     pub video_port: u16,
     /// Encoder backend preference (`--encoder` / `LINUX_QUEST_VIDEO_ENCODER`).
     pub encoder: BackendPreference,
+    /// Stream the synthetic test pattern when no real screen capture is available
+    /// (`--test-pattern`), to exercise encode, transport and decode end to end.
+    pub test_pattern: bool,
+    /// Video bitrate in Mbit/s (`--bitrate`); the encoder gets `bitrate_mbps * 1000` kbps.
+    pub bitrate_mbps: u32,
 }
 
 /// Forwards [`VideoEncoder`] to a boxed encoder from [`create_encoder`].
@@ -85,6 +94,7 @@ impl VideoEncoder for BoxedEncoder {
 /// decodable bitstream.
 async fn open_planned_encoder(
     preference: BackendPreference,
+    bitrate_kbps: u32,
 ) -> Result<(BoxedEncoder, StreamPlan), String> {
     let probes = tokio::task::spawn_blocking(|| {
         CODEC_PREFERENCE
@@ -114,6 +124,7 @@ async fn open_planned_encoder(
 
     let config = EncoderConfig {
         codec: plan.codec,
+        bitrate_kbps,
         ..EncoderConfig::default()
     };
     let backend_only = match plan.backend {
@@ -140,8 +151,9 @@ pub async fn start_daemon_video_sender(
     let defaults = EncoderConfig::default();
     let capture = AutoCapture::new(0, defaults.width, defaults.height, defaults.fps);
 
-    let source = CaptureFrameSource::open(capture, false).await;
-    let encoder = open_planned_encoder(options.encoder).await;
+    let source = CaptureFrameSource::open(capture, options.test_pattern).await;
+    let bitrate_kbps = options.bitrate_mbps.saturating_mul(1000);
+    let encoder = open_planned_encoder(options.encoder, bitrate_kbps).await;
 
     let (source, (encoder, plan)) = match (source, encoder) {
         (Ok(source), Ok(encoder)) => (source, encoder),
@@ -157,7 +169,12 @@ pub async fn start_daemon_video_sender(
         }
     };
 
-    tracing::info!(backend = plan.backend.name(), codec = ?plan.codec, "UDP video sender encoder chosen");
+    tracing::info!(
+        backend = plan.backend.name(),
+        codec = ?plan.codec,
+        bitrate_mbps = options.bitrate_mbps,
+        "UDP video sender encoder chosen"
+    );
     let sink = UdpSink::new(DEFAULT_SEND_BUFFER_BYTES, super::Dscp::Af41)
         .map_err(|e| format!("UDP socket: {e}"))?;
     let config = VideoSenderConfig {
@@ -180,6 +197,8 @@ mod tests {
             .err()
             .expect("synthetic capture must be rejected");
         assert!(matches!(err, CaptureError::BackendUnavailable(_)));
+        #[cfg(not(feature = "pipewire-capture"))]
+        assert!(err.to_string().contains("--features pipewire-capture"));
 
         let mut source = CaptureFrameSource::open(SyntheticCapture::new(0, 64, 64, 60), true)
             .await
@@ -197,6 +216,8 @@ mod tests {
             DaemonVideoOptions {
                 video_port: 48440,
                 encoder: BackendPreference::Auto,
+                test_pattern: false,
+                bitrate_mbps: 30,
             },
             Arc::new(AtomicBool::new(false)),
         )
