@@ -108,7 +108,13 @@ impl OpenXrContext {
         #[cfg(not(target_os = "android"))]
         let platform_info = ();
 
-        // Load OpenXR entry
+        // Load OpenXR entry. Android links the Khronos loader statically (see Cargo.toml);
+        // other platforms load the system loader at runtime.
+        #[cfg(target_os = "android")]
+        let entry = Entry::linked(&platform_info).map_err(|e| {
+            ClientError::OpenXr(format!("Failed to initialise OpenXR loader: {e:?}"))
+        })?;
+        #[cfg(not(target_os = "android"))]
         let entry = unsafe {
             Entry::load(&platform_info)
                 .map_err(|e| ClientError::OpenXr(format!("Failed to load OpenXR loader: {e:?}")))?

@@ -12,7 +12,6 @@ crate-type = ["lib", "cdylib"]
 [dependencies]
 linux-quest-protocol = { path = "../protocol" }
 linux-quest-transport = { path = "../transport" }
-openxr = { version = "0.22", default-features = true }
 ash = "0.38"
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 bytes.workspace = true
@@ -33,7 +32,14 @@ default = []
 # Real mDNS browsing for LAN discovery. Off by default; passes through to linux-quest-transport.
 mdns = ["linux-quest-transport/mdns"]
 
+[target.'cfg(not(target_os = "android"))'.dependencies]
+openxr = { version = "0.22", default-features = true }
+
 [target.'cfg(target_os = "android")'.dependencies]
+# Link the Khronos loader into liblinux_quest_client.so (built from the OpenXR-SDK source that
+# openxr-sys ships, via cmake and the NDK). Horizon OS does not expose its own
+# libopenxr_loader.so to apps, and nothing else puts one in the APK.
+openxr = { version = "0.22", default-features = false, features = ["static"] }
 ndk = { version = "0.9", features = ["audio", "media", "nativewindow", "sync", "api-level-30"] }
 ndk-sys = "0.6"
 ndk-context = "0.1"
