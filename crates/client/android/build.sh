@@ -92,6 +92,9 @@ echo "Build Tools:      ${BUILD_TOOLS_DIR}"
 echo "Android Platform: ${ANDROID_JAR}"
 echo "========================================================"
 
+# cmake-built dependencies (OpenXR loader, Opus) for this target use the NDK toolchain wrapper.
+export CMAKE_TOOLCHAIN_FILE_aarch64_linux_android="${CMAKE_TOOLCHAIN_FILE_aarch64_linux_android:-${SCRIPT_DIR}/ndk-cmake-toolchain.cmake}"
+
 # Step 1: Compile native shared library with cargo-ndk
 echo "[1/6] Compiling native cdylib with cargo-ndk (arm64-v8a, API 30)..."
 cargo ndk -t arm64-v8a -P 30 build ${CARGO_PROFILE_FLAG} --locked --manifest-path "${CLIENT_DIR}/Cargo.toml"

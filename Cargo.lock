@@ -1493,6 +1493,7 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "febb5d50cee7b964b69d5b7a810ed9620fc64f41382ffefe05434754c7a48877"
 dependencies = [
+ "cmake",
  "libc",
 ]
 
