@@ -11,6 +11,22 @@ use android_activity::{AndroidApp, MainEvent, PollEvent};
 #[cfg(target_os = "android")]
 use self::lifecycle::{AppLifecycle, LifecycleEvent, NextAction, LOG_TAG};
 
+/// JNI reference to the running `NativeActivity`, set at the top of [`android_main`].
+///
+/// `ndk_context::android_context().context()` is the `Application` (android-activity stores
+/// that), but `XR_KHR_android_create_instance` needs the `Activity` that drives the session.
+/// Given the `Application`, Horizon OS never considers the activity ready and the session
+/// stays IDLE.
+#[cfg(target_os = "android")]
+static ACTIVITY: std::sync::atomic::AtomicPtr<std::ffi::c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// The `Activity` jobject for OpenXR instance creation, or null before `android_main` ran.
+#[cfg(target_os = "android")]
+pub(crate) fn activity_jobject() -> *mut std::ffi::c_void {
+    ACTIVITY.load(std::sync::atomic::Ordering::Acquire)
+}
+
 use std::net::{IpAddr, SocketAddr};
 
 use crate::config::{ClientConfig, TransportMode};
@@ -134,6 +150,7 @@ pub fn android_main(app: AndroidApp) {
         .try_init();
 
     tracing::info!("linux-quest Quest client starting up on Android / Horizon OS");
+    ACTIVITY.store(app.activity_as_ptr(), std::sync::atomic::Ordering::Release);
 
     // android-activity initialises `ndk_context` (JavaVM + activity) before calling
     // `android_main`, for OpenXR, MediaCodec and JNI users. Initialising it again here
