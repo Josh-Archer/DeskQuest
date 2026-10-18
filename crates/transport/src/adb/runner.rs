@@ -42,6 +42,31 @@ pub trait AdbCommandRunner: Send + Sync {
     async fn check_connection(&self, serial: Option<&str>) -> Result<bool, AdbError>;
 }
 
+/// Lets one runner be shared (for example by the bridge and by the daemon's shutdown cleanup).
+#[async_trait]
+impl<T: AdbCommandRunner + ?Sized> AdbCommandRunner for Arc<T> {
+    async fn list_devices(&self) -> Result<Vec<AdbDevice>, AdbError> {
+        (**self).list_devices().await
+    }
+    async fn reverse(
+        &self,
+        serial: Option<&str>,
+        remote_port: u16,
+        local_port: u16,
+    ) -> Result<(), AdbError> {
+        (**self).reverse(serial, remote_port, local_port).await
+    }
+    async fn reverse_remove(&self, serial: Option<&str>, remote_port: u16) -> Result<(), AdbError> {
+        (**self).reverse_remove(serial, remote_port).await
+    }
+    async fn reverse_list(&self, serial: Option<&str>) -> Result<Vec<AdbReverseRule>, AdbError> {
+        (**self).reverse_list(serial).await
+    }
+    async fn check_connection(&self, serial: Option<&str>) -> Result<bool, AdbError> {
+        (**self).check_connection(serial).await
+    }
+}
+
 /// Production ADB command runner executing `/usr/bin/adb` or `PATH` `adb` binary.
 pub struct SystemAdbRunner {
     adb_path: String,
@@ -176,6 +201,16 @@ struct MockState {
     devices: Vec<AdbDevice>,
     reverse_rules: HashMap<String, Vec<AdbReverseRule>>,
     fail_next: Option<String>,
+    binary_missing: bool,
+}
+
+fn missing_binary(state: &Mutex<MockState>) -> Option<AdbError> {
+    state.lock().binary_missing.then(|| {
+        AdbError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No such file or directory (os error 2)",
+        ))
+    })
 }
 
 #[derive(Clone, Default)]
@@ -200,6 +235,19 @@ impl MockAdbRunner {
         state.reverse_rules.remove(serial);
     }
 
+    /// Simulates `adb` not being installed: every command fails with `ErrorKind::NotFound`.
+    pub fn set_binary_missing(&self, missing: bool) {
+        self.state.lock().binary_missing = missing;
+    }
+
+    /// Changes the state of an attached device (e.g. to `Unauthorized`). No-op if absent.
+    pub fn set_device_state(&self, serial: &str, new_state: AdbDeviceState) {
+        let mut state = self.state.lock();
+        for d in state.devices.iter_mut().filter(|d| d.serial == serial) {
+            d.state = new_state.clone();
+        }
+    }
+
     pub fn set_fail_next(&self, error_msg: Option<String>) {
         self.state.lock().fail_next = error_msg;
     }
@@ -221,6 +269,9 @@ impl MockAdbRunner {
 #[async_trait]
 impl AdbCommandRunner for MockAdbRunner {
     async fn list_devices(&self) -> Result<Vec<AdbDevice>, AdbError> {
+        if let Some(err) = missing_binary(&self.state) {
+            return Err(err);
+        }
         let mut state = self.state.lock();
         if let Some(err) = state.fail_next.take() {
             return Err(AdbError::CommandFailed {
@@ -238,6 +289,9 @@ impl AdbCommandRunner for MockAdbRunner {
         remote_port: u16,
         local_port: u16,
     ) -> Result<(), AdbError> {
+        if let Some(err) = missing_binary(&self.state) {
+            return Err(err);
+        }
         let mut state = self.state.lock();
         if let Some(err) = state.fail_next.take() {
             return Err(AdbError::CommandFailed {
@@ -258,6 +312,9 @@ impl AdbCommandRunner for MockAdbRunner {
     }
 
     async fn reverse_remove(&self, serial: Option<&str>, remote_port: u16) -> Result<(), AdbError> {
+        if let Some(err) = missing_binary(&self.state) {
+            return Err(err);
+        }
         let mut state = self.state.lock();
         let key = serial.unwrap_or("default").to_string();
         if let Some(rules) = state.reverse_rules.get_mut(&key) {
@@ -267,12 +324,18 @@ impl AdbCommandRunner for MockAdbRunner {
     }
 
     async fn reverse_list(&self, serial: Option<&str>) -> Result<Vec<AdbReverseRule>, AdbError> {
+        if let Some(err) = missing_binary(&self.state) {
+            return Err(err);
+        }
         let state = self.state.lock();
         let key = serial.unwrap_or("default");
         Ok(state.reverse_rules.get(key).cloned().unwrap_or_default())
     }
 
     async fn check_connection(&self, serial: Option<&str>) -> Result<bool, AdbError> {
+        if let Some(err) = missing_binary(&self.state) {
+            return Err(err);
+        }
         let state = self.state.lock();
         if let Some(target_serial) = serial {
             Ok(state
