@@ -30,7 +30,7 @@ mod tests;
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -101,9 +101,12 @@ pub struct VideoSenderConfig {
     pub max_pacing_mbps: u32,
     /// Fallback frame rate if the encoder reports none.
     pub fallback_fps: u32,
-    /// Keyframes requested because the local socket refused datagrams are at least this far
-    /// apart, so a congested socket cannot trigger an IDR storm.
+    /// Keyframes requested because the local socket refused datagrams, or by the client, are
+    /// at least this far apart, so neither can trigger an IDR storm.
     pub min_keyframe_interval: Duration,
+    /// Set by the host input receiver when the client asks for a keyframe; the send loop
+    /// clears it and forces an IDR. `None` ignores client requests.
+    pub keyframe_requests: Option<Arc<AtomicBool>>,
 }
 
 impl Default for VideoSenderConfig {
@@ -117,6 +120,7 @@ impl Default for VideoSenderConfig {
             max_pacing_mbps: 800,
             fallback_fps: 60,
             min_keyframe_interval: Duration::from_millis(250),
+            keyframe_requests: None,
         }
     }
 }
@@ -192,6 +196,11 @@ pub enum KeyframeReason {
     Abandoned,
     /// The local socket refused datagrams. Rate limited, so congestion cannot cause IDR storms.
     SendFailure,
+    /// The client lost video and asked for one ([`InputEvent::KeyframeRequest`] on the input
+    /// channel). Rate limited like `SendFailure`.
+    ///
+    /// [`InputEvent::KeyframeRequest`]: linux_quest_protocol::InputEvent::KeyframeRequest
+    ClientRequest,
 }
 
 impl<E: VideoEncoder, K: DatagramSink> FramePipeline<E, K> {
@@ -224,7 +233,10 @@ impl<E: VideoEncoder, K: DatagramSink> FramePipeline<E, K> {
         if self.keyframe_pending {
             return;
         }
-        if reason == KeyframeReason::SendFailure {
+        if matches!(
+            reason,
+            KeyframeReason::SendFailure | KeyframeReason::ClientRequest
+        ) {
             if let Some(last) = self.last_keyframe_request {
                 if now.saturating_duration_since(last) < self.cfg.min_keyframe_interval {
                     return;
@@ -551,6 +563,15 @@ async fn send_loop<E, K, P>(
             active = Some(ip);
             // A new decoder needs an IDR to start from.
             pipeline.request_keyframe(now, KeyframeReason::NewPeer);
+        }
+        let client_asked = pipeline
+            .cfg
+            .keyframe_requests
+            .as_ref()
+            .is_some_and(|flag| flag.swap(false, Ordering::AcqRel));
+        if client_asked {
+            debug!("Client requested a keyframe");
+            pipeline.request_keyframe(now, KeyframeReason::ClientRequest);
         }
 
         let dest = SocketAddr::new(ip, video_port);

@@ -889,6 +889,78 @@ async fn follows_the_latched_peer_retargets_and_stops_when_silent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_keyframe_requests_force_an_idr_and_are_rate_limited() {
+    let _serial = SERIAL.lock().await;
+    let link = tracker_with_liveness(60_000);
+    let sink = RecordingSink::default();
+    let source = TestSource::new(100_000, Duration::from_millis(10), 64);
+    let encoder = ScriptedEncoder::new(vec![2400], 100);
+    let key_requests = encoder.key_requests.clone();
+    let keyframes = encoder.keyframes.clone();
+    let flag = Arc::new(AtomicBool::new(false));
+    let config = VideoSenderConfig {
+        pacing_fraction: 0.0,
+        keyframe_requests: Some(flag.clone()),
+        ..config_to(48441)
+    };
+    let handle = spawn_video_sender(source, encoder, sink, link.clone(), config);
+    let stats = handle.stats().clone();
+
+    // The peer latches and a few frames flow; the only IDR so far is the new decoder's.
+    link.lock()
+        .input_packet(peer("192.0.2.10:50000"), Instant::now());
+    assert!(
+        until_async(Duration::from_secs(5), || {
+            VideoSenderStats::get(&stats.frames_sent) >= 3
+        })
+        .await
+    );
+    assert_eq!(key_requests.load(Ordering::Relaxed), 1);
+    assert_eq!(VideoSenderStats::get(&stats.keyframes_requested), 1);
+
+    // Past the minimum interval since that IDR, a client request is honoured and consumed.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    flag.store(true, Ordering::Release);
+    assert!(
+        until_async(Duration::from_secs(5), || {
+            key_requests.load(Ordering::Relaxed) == 2
+        })
+        .await
+    );
+    assert!(!flag.load(Ordering::Acquire), "the sender clears the flag");
+    assert_eq!(VideoSenderStats::get(&stats.keyframes_requested), 2);
+    assert!(
+        until_async(Duration::from_secs(5), || keyframes.lock().len() == 2).await,
+        "the encoder emitted the IDR"
+    );
+
+    // Asking again straight away is consumed but does not force another IDR.
+    flag.store(true, Ordering::Release);
+    assert!(until_async(Duration::from_secs(5), || !flag.load(Ordering::Acquire)).await);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        key_requests.load(Ordering::Relaxed),
+        2,
+        "inside min_keyframe_interval: rate limited"
+    );
+    assert_eq!(keyframes.lock().len(), 2);
+
+    // Once the interval has passed, the next request goes through again.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    flag.store(true, Ordering::Release);
+    assert!(
+        until_async(Duration::from_secs(5), || {
+            key_requests.load(Ordering::Relaxed) == 3
+        })
+        .await
+    );
+    assert!(!flag.load(Ordering::Acquire));
+    assert_eq!(VideoSenderStats::get(&stats.keyframes_requested), 3);
+
+    handle.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn usb_tunnel_peer_gets_no_udp_video() {
     let _serial = SERIAL.lock().await;
     let link = tracker_with_liveness(5_000);

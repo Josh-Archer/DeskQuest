@@ -30,7 +30,7 @@ pub(crate) fn activity_jobject() -> *mut std::ffi::c_void {
 use std::net::{IpAddr, SocketAddr};
 
 use crate::config::{ClientConfig, TransportMode};
-use crate::input_sender::{input_sender_config, InputSenderThread, KeepaliveOnlySource};
+use crate::input_sender::{input_sender_config, InputSenderThread, KeyframeRequestSource};
 use crate::runtime::QuestClientRuntime;
 
 /// Source IPs that UDP video datagrams must come from, or `None` to accept any source.
@@ -87,7 +87,14 @@ pub fn udp_config_warning(config: &ClientConfig) -> Option<String> {
 /// sends no input (and no keepalive) at all. Sending real controller input is not mapped yet,
 /// so the source is keepalive-only: enough for the host to latch this headset and stream video
 /// to it. See `crate::input_sender` for the design.
-pub fn start_input_sender(config: &ClientConfig) -> Option<InputSenderThread> {
+/// Starts the UDP input/keepalive sender (Udp mode only). Returns it with the flag that, once
+/// raised (then [`crate::input_sender::InputSenderControl::notify`]), sends a keyframe request.
+pub fn start_input_sender(
+    config: &ClientConfig,
+) -> Option<(
+    InputSenderThread,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+)> {
     let Some(sender_config) = input_sender_config(config) else {
         match config.transport_mode {
             TransportMode::AdbReverseTcp => tracing::info!(
@@ -103,8 +110,10 @@ pub fn start_input_sender(config: &ClientConfig) -> Option<InputSenderThread> {
         return None;
     };
     tracing::info!(targets = ?sender_config.targets, "starting UDP input/keepalive sender");
-    match InputSenderThread::spawn(sender_config, Box::new(KeepaliveOnlySource)) {
-        Ok(sender) => Some(sender),
+    let source = KeyframeRequestSource::new();
+    let keyframe_flag = source.requester();
+    match InputSenderThread::spawn(sender_config, Box::new(source)) {
+        Ok(sender) => Some((sender, keyframe_flag)),
         Err(e) => {
             tracing::warn!(error = ?e, "failed to start UDP input sender");
             None
@@ -138,6 +147,50 @@ impl DropWarnLimiter {
         self.last_warned.insert(source, now);
         true
     }
+}
+
+/// Datagrams buffered between the receive thread and the render loop. 512 was ~54 ms of an
+/// 80 Mbit/s stream, less than one stalled render-loop iteration.
+#[cfg(target_os = "android")]
+const PACKET_CHANNEL_DEPTH: usize = 4096;
+
+/// Requested `SO_RCVBUF` for the UDP video socket (the kernel may cap it at `rmem_max`).
+#[cfg(target_os = "android")]
+const UDP_RECEIVE_BUFFER_BYTES: libc::c_int = 4 * 1024 * 1024;
+
+/// Best-effort `SO_RCVBUF`; logs the size the kernel actually granted.
+#[cfg(target_os = "android")]
+fn set_receive_buffer(socket: &std::net::UdpSocket, bytes: libc::c_int) {
+    use std::os::fd::AsRawFd;
+    let fd = socket.as_raw_fd();
+    // SAFETY: valid socket fd and a c_int option value of the right size.
+    let set = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &bytes as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    let mut granted: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: as above, with out-pointers to locals of the declared size.
+    unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &mut granted as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        );
+    }
+    tracing::info!(
+        requested = bytes,
+        granted,
+        ok = set == 0,
+        "UDP video socket receive buffer"
+    );
 }
 
 /// Reads an Android system property, `None` if unset or empty.
@@ -198,7 +251,7 @@ pub fn android_main(app: AndroidApp) {
 
     // Background transport packet receiver (bounded channel: 512 packets, drops on overflow)
     let (packet_tx, packet_rx) =
-        std::sync::mpsc::sync_channel::<linux_quest_protocol::packet::Packet>(512);
+        std::sync::mpsc::sync_channel::<linux_quest_protocol::packet::Packet>(PACKET_CHANNEL_DEPTH);
     let running_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let bg_running = running_flag.clone();
     let host_addr = config.host_addr;
@@ -210,9 +263,23 @@ pub fn android_main(app: AndroidApp) {
 
     // Input/keepalive sender (Udp mode only). The receiver below acks it for each accepted
     // host datagram so it stays on the host address that works.
-    let input_sender = start_input_sender(&config);
+    let (input_sender, keyframe_flag) = match start_input_sender(&config) {
+        Some((sender, flag)) => (Some(sender), Some(flag)),
+        None => (None, None),
+    };
     let ack_control: Option<crate::input_sender::InputSenderControl> =
         input_sender.as_ref().map(|s| s.control().clone());
+    // Raises the keyframe request on the input channel and sends it right away.
+    let requester_control = ack_control.clone();
+    let keyframe_requester = move || -> Option<Box<dyn Fn() + Send>> {
+        let flag = keyframe_flag.clone()?;
+        let control = requester_control.clone()?;
+        Some(Box::new(move || {
+            tracing::info!("video lost; requesting a keyframe from the host");
+            flag.store(true, std::sync::atomic::Ordering::Release);
+            control.notify();
+        }))
+    };
 
     let receiver_handle = std::thread::spawn(move || {
         match transport_mode {
@@ -306,6 +373,9 @@ pub fn android_main(app: AndroidApp) {
                         return;
                     }
                 };
+                // The default receive buffer holds ~10 ms of an 80 Mbit/s stream; any stall of
+                // this thread then drops datagrams in the kernel without a trace.
+                set_receive_buffer(&socket, UDP_RECEIVE_BUFFER_BYTES);
                 let _ = socket.set_read_timeout(Some(Duration::from_millis(100)));
                 let mut buf = [0u8; 65536];
                 let mut drop_warn = DropWarnLimiter::default();
@@ -402,7 +472,10 @@ pub fn android_main(app: AndroidApp) {
                 if std::time::Instant::now() >= next_create_attempt {
                     tracing::info!("{LOG_TAG}: window ready and resumed, creating OpenXR session");
                     match QuestClientRuntime::new(config.clone()) {
-                        Ok(rt) => {
+                        Ok(mut rt) => {
+                            if let Some(request) = keyframe_requester() {
+                                rt.set_keyframe_requester(request);
+                            }
                             runtime = Some(rt);
                             lifecycle.on_session_created();
                         }

@@ -1,5 +1,8 @@
 //! Real-hardware adapters and the daemon's start-up probe for the video sender.
 
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use linux_quest_capture::{
     AutoCapture, CaptureBackendType, CaptureError, DisplayCapture, RawFrame,
@@ -135,6 +138,7 @@ async fn open_planned_encoder(
 pub async fn start_daemon_video_sender(
     link: SharedLinkTracker,
     options: DaemonVideoOptions,
+    keyframe_requests: Arc<AtomicBool>,
 ) -> Result<VideoSenderHandle, String> {
     let defaults = EncoderConfig::default();
     let capture = AutoCapture::new(0, defaults.width, defaults.height, defaults.fps);
@@ -161,6 +165,7 @@ pub async fn start_daemon_video_sender(
         .map_err(|e| format!("UDP socket: {e}"))?;
     let config = VideoSenderConfig {
         video_port: options.video_port,
+        keyframe_requests: Some(keyframe_requests),
         ..VideoSenderConfig::default()
     };
     Ok(spawn_video_sender(source, encoder, sink, link, config))
@@ -197,6 +202,7 @@ mod tests {
                 encoder: BackendPreference::Auto,
                 test_pattern: false,
             },
+            Arc::new(AtomicBool::new(false)),
         )
         .await;
         // On a machine without a real capture backend and NVENC (CI, containers) this is an

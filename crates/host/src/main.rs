@@ -1,4 +1,5 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
@@ -256,6 +257,7 @@ async fn wait_for_shutdown_signal(mut term: tokio::signal::unix::Signal) {
 async fn start_stream_services(
     shutdown_tx: &tokio::sync::broadcast::Sender<()>,
     link: SharedLinkTracker,
+    keyframe_requests: Arc<AtomicBool>,
 ) -> (Option<u16>, Option<u16>) {
     let mut input_port = None;
     let mut control_port = None;
@@ -263,7 +265,9 @@ async fn start_stream_services(
         std::net::SocketAddr::from(([0, 0, 0, 0], linux_quest_transport::DEFAULT_INPUT_PORT));
     match HostInputReceiver::bind_auto(input_bind_addr).await {
         Ok(input_service) => {
-            let mut input_service = input_service.with_link_tracker(link.clone());
+            let mut input_service = input_service
+                .with_link_tracker(link.clone())
+                .with_keyframe_requests(keyframe_requests);
             input_port = input_service.local_addr().ok().map(|a| a.port());
             let running_flag = input_service.running_flag();
             let auto_injector = input_service.injector();
@@ -337,6 +341,7 @@ async fn start_stream_services(
 async fn start_video(
     args: &DaemonArgs,
     link: SharedLinkTracker,
+    keyframe_requests: Arc<AtomicBool>,
 ) -> Option<linux_quest_host::video_sender::VideoSenderHandle> {
     if args.no_video {
         info!("UDP video sender disabled by --no-video");
@@ -347,7 +352,13 @@ async fn start_video(
         encoder: args.encoder.unwrap_or_else(BackendPreference::from_env),
         test_pattern: args.test_pattern,
     };
-    match linux_quest_host::video_sender::daemon::start_daemon_video_sender(link, options).await {
+    match linux_quest_host::video_sender::daemon::start_daemon_video_sender(
+        link,
+        options,
+        keyframe_requests,
+    )
+    .await
+    {
         Ok(handle) => {
             info!(
                 port = args.video_port,
@@ -487,7 +498,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let shutdown_flag_clone = shutdown_flag.clone();
 
                 // The TUI run binds the listeners but does not advertise them.
-                let _ = start_stream_services(&shutdown_tx, link.clone()).await;
+                let _ = start_stream_services(
+                    &shutdown_tx,
+                    link.clone(),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await;
                 let adb_handle = start_adb_bridge(&daemon_args, &shutdown_tx, link.clone());
 
                 let host_clone = host.clone();
@@ -528,11 +544,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let _ = shutdown_tx_clone.send(());
                 });
 
+                // Client keyframe requests: set by the input receiver, consumed by the video sender.
+                let keyframe_requests = Arc::new(AtomicBool::new(false));
                 let (control_port, input_port) =
-                    start_stream_services(&shutdown_tx, link.clone()).await;
+                    start_stream_services(&shutdown_tx, link.clone(), keyframe_requests.clone())
+                        .await;
                 let adb_handle = start_adb_bridge(&daemon_args, &shutdown_tx, link.clone());
 
-                let video = start_video(&daemon_args, link.clone()).await;
+                let video = start_video(&daemon_args, link.clone(), keyframe_requests).await;
 
                 // Advertise only the ports that were really bound above.
                 let listening = match (control_port, input_port) {

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use linux_quest_input::InputInjector;
+use linux_quest_protocol::InputEvent;
 use linux_quest_transport::{InputChannelReceiver, TransportError};
 
 use crate::link_status::SharedLinkTracker;
@@ -18,6 +19,7 @@ pub struct HostInputReceiver<I: InputInjector> {
     injector: Arc<Mutex<I>>,
     running: Arc<AtomicBool>,
     link: Option<SharedLinkTracker>,
+    keyframe_requests: Option<Arc<AtomicBool>>,
 }
 
 impl<I: InputInjector> HostInputReceiver<I> {
@@ -27,7 +29,15 @@ impl<I: InputInjector> HostInputReceiver<I> {
             injector,
             running: Arc::new(AtomicBool::new(false)),
             link: None,
+            keyframe_requests: None,
         }
+    }
+
+    /// Sets `flag` when the client sends [`InputEvent::KeyframeRequest`] (it lost video); the
+    /// video sender clears it and forces an IDR. Without this the request is dropped.
+    pub fn with_keyframe_requests(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.keyframe_requests = Some(flag);
+        self
     }
 
     /// Reports each received packet's sender to the shared link tracker.
@@ -54,6 +64,14 @@ impl<I: InputInjector> HostInputReceiver<I> {
         let events = self.receiver.recv_events().await?;
         if let (Some(link), Some(peer)) = (&self.link, self.receiver.remote_addr()) {
             link.lock().input_packet(peer, std::time::Instant::now());
+        }
+        let (keyframe_requests, events): (Vec<_>, Vec<_>) = events
+            .into_iter()
+            .partition(|e| matches!(e, InputEvent::KeyframeRequest));
+        if !keyframe_requests.is_empty() {
+            if let Some(flag) = &self.keyframe_requests {
+                flag.store(true, Ordering::Release);
+            }
         }
         let count = events.len();
         if count > 0 {
@@ -189,6 +207,60 @@ mod tests {
 
         let count = host_receiver.step().await.unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_host_input_receiver_keyframe_request_sets_flag_and_is_not_injected() {
+        let s_sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let s_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let addr_sender = s_sender.local_addr().unwrap();
+        let addr_receiver = s_receiver.local_addr().unwrap();
+
+        let mut sender = InputChannelSender::new(s_sender, Some(addr_receiver), 4);
+        let receiver = InputChannelReceiver::new(s_receiver, Some(addr_sender), true);
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let injector = Arc::new(Mutex::new(MockInputInjector::new()));
+        let mut host_receiver =
+            HostInputReceiver::new(receiver, injector.clone()).with_keyframe_requests(flag.clone());
+
+        let normal = InputEvent::MouseMoveRelative { dx: 3, dy: 4 };
+        sender
+            .send_events(vec![InputEvent::KeyframeRequest, normal.clone()], 100_000)
+            .await
+            .unwrap();
+
+        let count = host_receiver.step().await.unwrap();
+        assert_eq!(count, 1);
+        assert!(flag.load(Ordering::Acquire));
+
+        let binding = injector.lock().unwrap();
+        assert_eq!(binding.received_events, vec![normal]);
+    }
+
+    #[tokio::test]
+    async fn test_host_input_receiver_keyframe_request_without_flag_is_dropped() {
+        let s_sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let s_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let addr_sender = s_sender.local_addr().unwrap();
+        let addr_receiver = s_receiver.local_addr().unwrap();
+
+        let mut sender = InputChannelSender::new(s_sender, Some(addr_receiver), 4);
+        let receiver = InputChannelReceiver::new(s_receiver, Some(addr_sender), true);
+
+        let injector = Arc::new(Mutex::new(MockInputInjector::new()));
+        let mut host_receiver = HostInputReceiver::new(receiver, injector.clone());
+
+        sender
+            .send_events(vec![InputEvent::KeyframeRequest], 100_000)
+            .await
+            .unwrap();
+
+        let count = host_receiver.step().await.unwrap();
+        assert_eq!(count, 0);
+        assert!(injector.lock().unwrap().received_events.is_empty());
     }
 
     #[tokio::test]

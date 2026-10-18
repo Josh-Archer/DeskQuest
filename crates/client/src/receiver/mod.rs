@@ -1,5 +1,7 @@
 //! Streaming receiver integrating jitter buffer, FEC recovery, and frame reassembly.
 
+pub mod loss_recovery;
+
 use std::time::{Duration, Instant};
 
 use linux_quest_protocol::packet::Packet;
@@ -17,6 +19,7 @@ pub struct ClientReceiver {
     jitter_buffer: AdaptiveJitterBuffer,
     reassembler: FrameReassembler,
     packets_received: u64,
+    stream_restarts_seen: u64,
 }
 
 impl ClientReceiver {
@@ -34,6 +37,7 @@ impl ClientReceiver {
             jitter_buffer: AdaptiveJitterBuffer::new(jb_config),
             reassembler: FrameReassembler::new(16),
             packets_received: 0,
+            stream_restarts_seen: 0,
         }
     }
 
@@ -41,6 +45,12 @@ impl ClientReceiver {
     pub fn ingest_packet(&mut self, packet: Packet, now: Instant) {
         self.packets_received += 1;
         self.jitter_buffer.ingest_packet(packet, now);
+        let restarts = self.jitter_buffer.stats().stream_restarts;
+        if restarts != self.stream_restarts_seen {
+            // The host restarted its stream: half-built frames belong to the old one.
+            self.stream_restarts_seen = restarts;
+            self.reassembler = FrameReassembler::new(16);
+        }
     }
 
     /// Pops all video frames whose jitter delay has elapsed at timestamp `now`.
