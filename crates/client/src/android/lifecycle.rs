@@ -37,6 +37,10 @@ pub enum NextAction {
     Wait,
     /// Window exists and the activity is resumed: create the runtime and OpenXR session.
     CreateSession,
+    /// A session was created but the window went away before it ever started running: drop it and create a fresh one once both are back. On Horizon OS the boundary
+    /// (Guardian) dialog takes the window right after launch, and a session created in that
+    /// first window stays IDLE forever.
+    DiscardSession,
     /// Session exists but is not running (or the app is paused): only drain OpenXR events so
     /// READY/STOPPING/EXITING are handled.
     PollEvents,
@@ -115,6 +119,17 @@ impl AppLifecycle {
         );
     }
 
+    /// Records that the not-yet-running session was dropped (see [`NextAction::DiscardSession`]).
+    pub fn on_session_discarded(&mut self) {
+        self.session_created = false;
+        self.session_running = false;
+        self.swapchains_created = false;
+        tracing::info!(
+            tag = LOG_TAG,
+            "{LOG_TAG}: discarded OpenXR session that never started (window lost)"
+        );
+    }
+
     /// Records that the runtime and OpenXR session were created successfully.
     pub fn on_session_created(&mut self) {
         self.session_created = true;
@@ -162,6 +177,9 @@ impl AppLifecycle {
             };
         }
         if !self.session_running {
+            if !self.swapchains_created && !self.window_ready {
+                return NextAction::DiscardSession;
+            }
             return NextAction::PollEvents;
         }
         if !self.swapchains_created {
@@ -255,6 +273,32 @@ mod tests {
         s.on_swapchains_created();
         s.on_event(Destroy);
         assert_eq!(s.decide_next_action(), NextAction::Exit);
+    }
+
+    #[test]
+    fn session_that_never_started_is_discarded_when_window_goes_away() {
+        let mut s = run(&[InitWindow, Resume]);
+        s.on_session_created();
+        assert_eq!(s.decide_next_action(), NextAction::PollEvents);
+        s.on_event(Pause);
+        s.on_event(TermWindow);
+        assert_eq!(s.decide_next_action(), NextAction::DiscardSession);
+        s.on_session_discarded();
+        assert_eq!(s.decide_next_action(), NextAction::Wait);
+        s.on_event(Resume);
+        s.on_event(InitWindow);
+        assert_eq!(s.decide_next_action(), NextAction::CreateSession);
+    }
+
+    #[test]
+    fn running_session_is_not_discarded_on_pause() {
+        let mut s = run(&[InitWindow, Resume]);
+        s.on_session_created();
+        s.on_session_running(true);
+        s.on_swapchains_created();
+        s.on_event(Pause);
+        s.on_event(TermWindow);
+        assert_eq!(s.decide_next_action(), NextAction::PollEvents);
     }
 
     #[test]

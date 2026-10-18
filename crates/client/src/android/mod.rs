@@ -367,6 +367,10 @@ pub fn android_main(app: AndroidApp) {
                     }
                 }
             }
+            NextAction::DiscardSession => {
+                runtime = None;
+                lifecycle.on_session_discarded();
+            }
             NextAction::PollEvents => {
                 if let Some(rt) = runtime.as_mut() {
                     if let Err(e) = rt.poll_events() {
