@@ -55,6 +55,9 @@ pub struct DaemonVideoOptions {
     pub video_port: u16,
     /// Encoder backend preference (`--encoder` / `LINUX_QUEST_VIDEO_ENCODER`).
     pub encoder: BackendPreference,
+    /// Stream the synthetic test pattern when no real screen capture is available
+    /// (`--test-pattern`), to exercise encode, transport and decode end to end.
+    pub test_pattern: bool,
 }
 
 /// Forwards [`VideoEncoder`] to a boxed encoder from [`create_encoder`].
@@ -140,7 +143,7 @@ pub async fn start_daemon_video_sender(
     let defaults = EncoderConfig::default();
     let capture = AutoCapture::new(0, defaults.width, defaults.height, defaults.fps);
 
-    let source = CaptureFrameSource::open(capture, false).await;
+    let source = CaptureFrameSource::open(capture, options.test_pattern).await;
     let encoder = open_planned_encoder(options.encoder).await;
 
     let (source, (encoder, plan)) = match (source, encoder) {
@@ -197,6 +200,7 @@ mod tests {
             DaemonVideoOptions {
                 video_port: 48440,
                 encoder: BackendPreference::Auto,
+                test_pattern: false,
             },
             Arc::new(AtomicBool::new(false)),
         )

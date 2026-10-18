@@ -115,7 +115,14 @@ impl OpenXrContext {
         #[cfg(target_os = "android")]
         let platform_info = {
             let ctx = ndk_context::android_context();
-            unsafe { openxr::AndroidPlatformInfo::new(ctx.vm(), ctx.context()) }
+            // OpenXR needs the Activity here, not the Application that ndk_context holds.
+            let activity = crate::android::activity_jobject();
+            let activity = if activity.is_null() {
+                ctx.context()
+            } else {
+                activity
+            };
+            unsafe { openxr::AndroidPlatformInfo::new(ctx.vm(), activity) }
         };
         #[cfg(not(target_os = "android"))]
         let platform_info = ();
@@ -563,13 +570,15 @@ impl OpenXrContext {
                 create_flags: openxr::sys::SwapchainCreateFlags::EMPTY,
                 usage_flags: openxr::sys::SwapchainUsageFlags::COLOR_ATTACHMENT
                     | openxr::sys::SwapchainUsageFlags::SAMPLED,
-                format: swapchain_format as i64,
-                sample_count: 1,
+                // The Android Surface (MediaCodec output) owns the image format and layout;
+                // Horizon OS rejects Vulkan values here ("info format validation failure").
+                format: 0,
+                sample_count: 0,
                 width: config.stream_width,
                 height: config.stream_height,
-                face_count: 1,
-                array_size: 1,
-                mip_count: 1,
+                face_count: 0,
+                array_size: 0,
+                mip_count: 0,
             };
             let mut raw_swapchain = openxr::sys::Swapchain::NULL;
             let mut surface: openxr::sys::platform::jobject = std::ptr::null_mut();
@@ -1061,7 +1070,7 @@ impl OpenXrContext {
             let blend_mode = self.passthrough.blend_mode();
             let pt_layer = if self.passthrough.is_enabled() {
                 self.passthrough.passthrough_layer().map(|layer_handle| {
-                    crate::openxr::layers::build_passthrough_layer(space, layer_handle)
+                    crate::openxr::layers::build_passthrough_layer(layer_handle)
                 })
             } else {
                 None

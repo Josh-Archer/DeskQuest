@@ -116,6 +116,8 @@ pub struct SyntheticCapture {
     height: u32,
     fps: u32,
     frame_counter: u64,
+    /// When the next frame is due; frames are paced to `fps` like a real capture.
+    next_due: Option<tokio::time::Instant>,
 }
 
 impl SyntheticCapture {
@@ -126,6 +128,7 @@ impl SyntheticCapture {
             height,
             fps,
             frame_counter: 0,
+            next_due: None,
         }
     }
 }
@@ -137,19 +140,28 @@ impl DisplayCapture for SyntheticCapture {
     }
 
     async fn capture_frame(&mut self) -> Result<RawFrame, CaptureError> {
+        // Pace to `fps`. Without an await this returned instantly in a loop, pinning a tokio
+        // worker at 100% and starving tasks queued on it (the video sender never ran).
+        let interval = std::time::Duration::from_micros(1_000_000 / (self.fps as u64).max(1));
+        let now = tokio::time::Instant::now();
+        let due = self.next_due.unwrap_or(now);
+        if due > now {
+            tokio::time::sleep_until(due).await;
+        } else {
+            // Running late: still give other tasks on this worker a turn.
+            tokio::task::yield_now().await;
+        }
+        // A late caller is not owed a burst of catch-up frames.
+        self.next_due = Some(due.max(now) + interval);
+
         self.frame_counter += 1;
         let stride = self.width * 4;
         let frame_size = (stride * self.height) as usize;
 
-        // Generate lightweight animated gradient
-        let mut buffer = vec![0u8; frame_size];
+        // Solid colour that cycles every 256 frames (BGRA). `repeat` is a block copy; a
+        // per-byte loop over a 1080p frame cost more than a frame interval in debug builds.
         let offset = (self.frame_counter % 256) as u8;
-        for i in (0..frame_size).step_by(4) {
-            buffer[i] = 255 - offset; // B
-            buffer[i + 1] = 128; // G
-            buffer[i + 2] = offset; // R
-            buffer[i + 3] = 255; // A
-        }
+        let buffer = [255 - offset, 128, offset, 255].repeat(frame_size / 4);
 
         let interval_us = 1_000_000 / (self.fps as u64).max(1);
         let pts_us = self.frame_counter * interval_us;
@@ -242,6 +254,23 @@ impl DisplayCapture for AutoCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn synthetic_capture_is_paced_to_fps() {
+        let mut capture = SyntheticCapture::new(0, 16, 16, 100);
+        capture.init().await.unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..5 {
+            capture.capture_frame().await.unwrap();
+        }
+        // First frame is immediate, the next four wait ~10 ms each.
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(40),
+            "{elapsed:?}"
+        );
+        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+    }
 
     #[tokio::test]
     async fn test_synthetic_capture_frame() {
