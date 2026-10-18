@@ -210,6 +210,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_host_input_receiver_keyframe_request_sets_flag_and_is_not_injected() {
+        let s_sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let s_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let addr_sender = s_sender.local_addr().unwrap();
+        let addr_receiver = s_receiver.local_addr().unwrap();
+
+        let mut sender = InputChannelSender::new(s_sender, Some(addr_receiver), 4);
+        let receiver = InputChannelReceiver::new(s_receiver, Some(addr_sender), true);
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let injector = Arc::new(Mutex::new(MockInputInjector::new()));
+        let mut host_receiver =
+            HostInputReceiver::new(receiver, injector.clone()).with_keyframe_requests(flag.clone());
+
+        let normal = InputEvent::MouseMoveRelative { dx: 3, dy: 4 };
+        sender
+            .send_events(vec![InputEvent::KeyframeRequest, normal.clone()], 100_000)
+            .await
+            .unwrap();
+
+        let count = host_receiver.step().await.unwrap();
+        assert_eq!(count, 1);
+        assert!(flag.load(Ordering::Acquire));
+
+        let binding = injector.lock().unwrap();
+        assert_eq!(binding.received_events, vec![normal]);
+    }
+
+    #[tokio::test]
+    async fn test_host_input_receiver_keyframe_request_without_flag_is_dropped() {
+        let s_sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let s_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let addr_sender = s_sender.local_addr().unwrap();
+        let addr_receiver = s_receiver.local_addr().unwrap();
+
+        let mut sender = InputChannelSender::new(s_sender, Some(addr_receiver), 4);
+        let receiver = InputChannelReceiver::new(s_receiver, Some(addr_sender), true);
+
+        let injector = Arc::new(Mutex::new(MockInputInjector::new()));
+        let mut host_receiver = HostInputReceiver::new(receiver, injector.clone());
+
+        sender
+            .send_events(vec![InputEvent::KeyframeRequest], 100_000)
+            .await
+            .unwrap();
+
+        let count = host_receiver.step().await.unwrap();
+        assert_eq!(count, 0);
+        assert!(injector.lock().unwrap().received_events.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_host_input_receiver_bind_auto() {
         let host_receiver = HostInputReceiver::bind_auto("127.0.0.1:0".parse().unwrap())
             .await
