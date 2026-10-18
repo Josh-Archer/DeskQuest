@@ -72,7 +72,11 @@ impl Default for AudioSinkConfig {
 }
 
 /// Common abstraction for hardware and simulated audio output sinks.
-pub trait AudioSink: Send + Sync {
+///
+/// Intentionally not `Send + Sync`: `AAudioSink` wraps raw NDK stream handles that are not
+/// thread-safe in Rust's type system, and every method is called through `&mut self`/`&self`
+/// by a single owner.
+pub trait AudioSink {
     /// Initializes and opens the audio sink with the given configuration.
     fn open(&mut self, config: AudioSinkConfig) -> Result<(), AudioSinkError>;
 
@@ -288,7 +292,7 @@ impl AudioSink for AAudioSink {
             .format(AudioFormat::PCM_Float)
             .sample_rate(config.sample_rate as i32)
             .channel_count(config.channels as i32)
-            .buffer_capacity_frames(config.buffer_capacity_frames as i32)
+            .buffer_capacity_in_frames(config.buffer_capacity_frames as i32)
             .usage(AudioUsage::Game)
             .content_type(AudioContentType::Music);
 
