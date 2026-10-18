@@ -9,6 +9,7 @@ use android_activity::{AndroidApp, MainEvent, PollEvent};
 use std::net::{IpAddr, SocketAddr};
 
 use crate::config::{ClientConfig, TransportMode};
+use crate::input_sender::{input_sender_config, InputSenderThread, KeepaliveOnlySource};
 use crate::runtime::QuestClientRuntime;
 
 /// Source IPs that UDP video datagrams must come from, or `None` to accept any source.
@@ -57,6 +58,37 @@ pub fn udp_config_warning(config: &ClientConfig) -> Option<String> {
             )
         },
     )
+}
+
+/// Starts the UDP input/keepalive sender for `config`, or returns `None` when none should run.
+///
+/// Only `Udp` mode sends: `adb reverse` forwards TCP only, so in `AdbReverseTcp` mode the client
+/// sends no input (and no keepalive) at all. Sending real controller input is not mapped yet,
+/// so the source is keepalive-only: enough for the host to latch this headset and stream video
+/// to it. See `crate::input_sender` for the design.
+pub fn start_input_sender(config: &ClientConfig) -> Option<InputSenderThread> {
+    let Some(sender_config) = input_sender_config(config) else {
+        match config.transport_mode {
+            TransportMode::AdbReverseTcp => tracing::info!(
+                "input sender not started: adb reverse carries TCP only, so no UDP input is sent \
+                 in USB mode"
+            ),
+            TransportMode::Udp => tracing::warn!(
+                host = %config.host_addr,
+                "input sender not started: no usable host address; the host cannot learn this \
+                 headset's address, so it will send no video"
+            ),
+        }
+        return None;
+    };
+    tracing::info!(targets = ?sender_config.targets, "starting UDP input/keepalive sender");
+    match InputSenderThread::spawn(sender_config, Box::new(KeepaliveOnlySource)) {
+        Ok(sender) => Some(sender),
+        Err(e) => {
+            tracing::warn!(error = ?e, "failed to start UDP input sender");
+            None
+        }
+    }
 }
 
 /// Longest gap between repeated drop warnings for one source.
@@ -126,6 +158,12 @@ pub fn android_main(app: AndroidApp) {
     if let Some(message) = udp_config_warning(&config) {
         tracing::warn!("{message}");
     }
+
+    // Input/keepalive sender (Udp mode only). The receiver below acks it for each accepted
+    // host datagram so it stays on the host address that works.
+    let input_sender = start_input_sender(&config);
+    let ack_control: Option<crate::input_sender::InputSenderControl> =
+        input_sender.as_ref().map(|s| s.control().clone());
 
     let receiver_handle = std::thread::spawn(move || {
         match transport_mode {
@@ -238,6 +276,9 @@ pub fn android_main(app: AndroidApp) {
                             }
                             match linux_quest_protocol::packet::Packet::from_bytes(&buf[..len]) {
                                 Ok(packet) => {
+                                    if let Some(control) = &ack_control {
+                                        control.ack();
+                                    }
                                     let _ = packet_tx.try_send(packet);
                                 }
                                 Err(e) => {
@@ -307,6 +348,9 @@ pub fn android_main(app: AndroidApp) {
 
     running_flag.store(false, std::sync::atomic::Ordering::Relaxed);
     let _ = receiver_handle.join();
+    if let Some(sender) = input_sender {
+        sender.stop();
+    }
 
     unsafe {
         ndk_context::release_android_context();

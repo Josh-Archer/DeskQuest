@@ -12,6 +12,7 @@ pub mod error;
 pub mod graphics;
 pub mod hud;
 pub mod input;
+pub mod input_sender;
 pub mod openxr;
 pub mod receiver;
 pub mod runtime;

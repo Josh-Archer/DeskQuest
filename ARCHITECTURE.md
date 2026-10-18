@@ -103,7 +103,7 @@ For wireless freedom:
 | Port | Proto | Purpose |
 |------|-------|---------|
 | 48444 | TCP | Host control channel (clipboard, signaling). Also the `adb reverse` port: the Quest connects to `127.0.0.1:48444` over USB. |
-| 48442 | UDP | Low-latency input channel (Quest to host). |
+| 48442 | UDP | Low-latency input channel (Quest to host). In `Udp` mode the client sends input and a 100 ms keepalive here from an ephemeral local port; the host latches that peer and streams video to its IP on 48440. `adb reverse` cannot carry UDP, so the USB mode sends no input yet. |
 
 Status: the host has no video endpoint yet, and the daemon does not yet start the ADB bridge, so
 the reverse tunnel is not set up automatically. These are the agreed defaults only.

@@ -4,7 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
 
-use linux_quest_transport::DEFAULT_CONTROL_PORT;
+use linux_quest_transport::{DEFAULT_CONTROL_PORT, DEFAULT_INPUT_PORT};
 
 use crate::error::{ClientError, ClientResult};
 
@@ -54,6 +54,10 @@ pub enum DisplayMode {
     CurvedCylinder,
 }
 
+fn default_input_port() -> u16 {
+    DEFAULT_INPUT_PORT
+}
+
 /// Configuration settings for the Quest streaming client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
@@ -77,6 +81,11 @@ pub struct ClientConfig {
     /// unless set by discovery.
     #[serde(default)]
     pub extra_host_ips: Vec<IpAddr>,
+
+    /// Host UDP port for the low-latency input and keepalive datagrams (`Udp` mode only;
+    /// `adb reverse` cannot carry UDP, so `AdbReverseTcp` sends no input). Default `48442`.
+    #[serde(default = "default_input_port")]
+    pub input_port: u16,
 
     /// Transport mode (UDP or ADB Reverse TCP).
     pub transport_mode: TransportMode,
@@ -138,6 +147,7 @@ impl Default for ClientConfig {
                 DEFAULT_CONTROL_PORT,
             ),
             extra_host_ips: Vec::new(),
+            input_port: DEFAULT_INPUT_PORT,
             transport_mode: TransportMode::AdbReverseTcp,
             codec: ClientVideoCodec::Av1,
             display_mode: DisplayMode::CurvedCylinder,
@@ -213,6 +223,10 @@ impl ClientConfig {
                 "Invalid jitter buffer max depth: {} (expected 16-4096)",
                 self.jitter_buffer_max_depth
             )));
+        }
+
+        if self.input_port == 0 {
+            return Err(ClientError::Config("input port must be non-zero".into()));
         }
 
         if self.stream_width == 0 || self.stream_height == 0 {
