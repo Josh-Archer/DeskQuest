@@ -40,6 +40,13 @@ pub trait AdbCommandRunner: Send + Sync {
     async fn reverse_remove(&self, serial: Option<&str>, remote_port: u16) -> Result<(), AdbError>;
     async fn reverse_list(&self, serial: Option<&str>) -> Result<Vec<AdbReverseRule>, AdbError>;
     async fn check_connection(&self, serial: Option<&str>) -> Result<bool, AdbError>;
+
+    /// The device's hardware serial (`ro.serialno`). The same headset attached over USB and over
+    /// wireless debugging shows up as two ADB entries with different serials but the same
+    /// hardware serial. `Ok(None)` means it cannot be determined (the default).
+    async fn hardware_serial(&self, _serial: &str) -> Result<Option<String>, AdbError> {
+        Ok(None)
+    }
 }
 
 /// Lets one runner be shared (for example by the bridge and by the daemon's shutdown cleanup).
@@ -64,6 +71,9 @@ impl<T: AdbCommandRunner + ?Sized> AdbCommandRunner for Arc<T> {
     }
     async fn check_connection(&self, serial: Option<&str>) -> Result<bool, AdbError> {
         (**self).check_connection(serial).await
+    }
+    async fn hardware_serial(&self, serial: &str) -> Result<Option<String>, AdbError> {
+        (**self).hardware_serial(serial).await
     }
 }
 
@@ -193,6 +203,17 @@ impl AdbCommandRunner for SystemAdbRunner {
             Ok(devices.iter().any(|d| d.state == AdbDeviceState::Device))
         }
     }
+
+    async fn hardware_serial(&self, serial: &str) -> Result<Option<String>, AdbError> {
+        let output = self
+            .run_cmd(self.build_cmd(Some(serial), &["shell", "getprop", "ro.serialno"]))
+            .await?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok((!value.is_empty()).then_some(value))
+    }
 }
 
 /// In-memory mock ADB runner for deterministic CI testing without physical hardware.
@@ -202,6 +223,7 @@ struct MockState {
     reverse_rules: HashMap<String, Vec<AdbReverseRule>>,
     fail_next: Option<String>,
     binary_missing: bool,
+    hardware_serials: HashMap<String, String>,
 }
 
 fn missing_binary(state: &Mutex<MockState>) -> Option<AdbError> {
@@ -246,6 +268,14 @@ impl MockAdbRunner {
         for d in state.devices.iter_mut().filter(|d| d.serial == serial) {
             d.state = new_state.clone();
         }
+    }
+
+    /// Sets what `getprop ro.serialno` returns for `serial`.
+    pub fn set_hardware_serial(&self, serial: &str, hardware_serial: &str) {
+        self.state
+            .lock()
+            .hardware_serials
+            .insert(serial.to_string(), hardware_serial.to_string());
     }
 
     pub fn set_fail_next(&self, error_msg: Option<String>) {
@@ -348,6 +378,13 @@ impl AdbCommandRunner for MockAdbRunner {
                 .iter()
                 .any(|d| d.state == AdbDeviceState::Device))
         }
+    }
+
+    async fn hardware_serial(&self, serial: &str) -> Result<Option<String>, AdbError> {
+        if let Some(err) = missing_binary(&self.state) {
+            return Err(err);
+        }
+        Ok(self.state.lock().hardware_serials.get(serial).cloned())
     }
 }
 
