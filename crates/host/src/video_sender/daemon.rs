@@ -55,6 +55,8 @@ pub struct DaemonVideoOptions {
     /// Stream the synthetic test pattern when no real screen capture is available
     /// (`--test-pattern`), to exercise encode, transport and decode end to end.
     pub test_pattern: bool,
+    /// Video bitrate in Mbit/s (`--bitrate`); the encoder gets `bitrate_mbps * 1000` kbps.
+    pub bitrate_mbps: u32,
 }
 
 /// Forwards [`VideoEncoder`] to a boxed encoder from [`create_encoder`].
@@ -85,6 +87,7 @@ impl VideoEncoder for BoxedEncoder {
 /// decodable bitstream.
 async fn open_planned_encoder(
     preference: BackendPreference,
+    bitrate_kbps: u32,
 ) -> Result<(BoxedEncoder, StreamPlan), String> {
     let probes = tokio::task::spawn_blocking(|| {
         CODEC_PREFERENCE
@@ -114,6 +117,7 @@ async fn open_planned_encoder(
 
     let config = EncoderConfig {
         codec: plan.codec,
+        bitrate_kbps,
         ..EncoderConfig::default()
     };
     let backend_only = match plan.backend {
@@ -140,7 +144,8 @@ pub async fn start_daemon_video_sender(
     let capture = AutoCapture::new(0, defaults.width, defaults.height, defaults.fps);
 
     let source = CaptureFrameSource::open(capture, options.test_pattern).await;
-    let encoder = open_planned_encoder(options.encoder).await;
+    let bitrate_kbps = options.bitrate_mbps.saturating_mul(1000);
+    let encoder = open_planned_encoder(options.encoder, bitrate_kbps).await;
 
     let (source, (encoder, plan)) = match (source, encoder) {
         (Ok(source), Ok(encoder)) => (source, encoder),
@@ -156,7 +161,12 @@ pub async fn start_daemon_video_sender(
         }
     };
 
-    tracing::info!(backend = plan.backend.name(), codec = ?plan.codec, "UDP video sender encoder chosen");
+    tracing::info!(
+        backend = plan.backend.name(),
+        codec = ?plan.codec,
+        bitrate_mbps = options.bitrate_mbps,
+        "UDP video sender encoder chosen"
+    );
     let sink = UdpSink::new(DEFAULT_SEND_BUFFER_BYTES, super::Dscp::Af41)
         .map_err(|e| format!("UDP socket: {e}"))?;
     let config = VideoSenderConfig {
@@ -196,6 +206,7 @@ mod tests {
                 video_port: 48440,
                 encoder: BackendPreference::Auto,
                 test_pattern: false,
+                bitrate_mbps: 30,
             },
         )
         .await;
