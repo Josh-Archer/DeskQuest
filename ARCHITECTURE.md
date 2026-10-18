@@ -103,9 +103,16 @@ For wireless freedom:
 | Port | Proto | Purpose |
 |------|-------|---------|
 | 48444 | TCP | Host control channel (clipboard, signaling). Also the `adb reverse` port: the Quest connects to `127.0.0.1:48444` over USB. |
+| 48440 | UDP | Video, host to headset. The host sends to `<headset IP>:48440`; the client binds it. |
 | 48442 | UDP | Low-latency input channel (Quest to host). In `Udp` mode the client sends input and a 100 ms keepalive here from an ephemeral local port; the host latches that peer and streams video to its IP on 48440. `adb reverse` cannot carry UDP, so the USB mode sends no input yet. |
 
-Status: the host has no video endpoint yet. The daemon (`linux-quest-host daemon`, headless and
+Status: the headless daemon contains a UDP video sender (`crates/host/src/video_sender/`, disable with
+`--no-video`, destination port `--video-port`, default 48440). It is **unverified on real
+hardware and does not start on most machines today**: it needs a real screen-capture backend,
+and `PipeWireCapture` does not yet negotiate a screencast stream, so the daemon logs one line
+("UDP video sender not started (...)") and keeps running without video. It also needs a working
+hardware encoder (NVENC or VA-API). The synthetic test pattern and the mock encoder are never
+streamed to a headset implicitly. The video sender is not started under `--tui`. The daemon (`linux-quest-host daemon`, headless and
 `--tui`) starts the ADB bridge (`crates/host/src/adb_link.rs`) and keeps the reverse tunnel in place.
 
 - **USB tunnel management.** While a Quest is attached and authorized, the daemon runs
@@ -133,7 +140,7 @@ Status: the host has no video endpoint yet. The daemon (`linux-quest-host daemon
 |---------|------|-----------------|-------|
 | Control (clipboard, link detection) | TCP 48444 | Yes | The daemon's control listener accepts the tunneled connection and classifies it as USB. |
 | Input | UDP 48442 | **No** | The host's UDP input receiver never sees tunneled traffic. A client would have to reach it over the network (Wi-Fi, or USB tethering/RNDIS addressed by IP), not `127.0.0.1`. |
-| Video | none | **No** | The host has no video endpoint. The Android client's USB mode (`TransportMode::AdbReverseTcp`) connects to `127.0.0.1:48444` and only reads video `Packet`s from that TCP stream, but the control listener speaks `ControlMessage` frames, not video packets. |
+| Video | none | **No** | The UDP video sender never sends to a loopback (USB) peer: `adb reverse` carries no UDP. The Android client's USB mode (`TransportMode::AdbReverseTcp`) connects to `127.0.0.1:48444` and only reads video `Packet`s from that TCP stream, but the control listener speaks `ControlMessage` frames, not video packets. |
 
 The Android client does not send input or control messages at all today (`crates/client` uses neither
 `InputChannel` nor `ControlChannel`), so over USB today the host can show "connected via USB" for a
@@ -148,7 +155,14 @@ protocol changes that are out of scope here.
   - In `Udp` mode the default `host_addr` is `127.0.0.1`, so **all LAN video is dropped until discovery or manual entry sets the host address**. The client logs a warning at startup in that state, and a rate-limited warning for the first dropped datagram from each source. `0.0.0.0` disables the filter.
   - Discovery picks the host's LAN address (private ranges ahead of the Docker bridge `172.17/16`) as `host_addr` and keeps the host's other discovered addresses, so the filter accepts video from any of them. Addresses are compared in canonical form (IPv4-mapped IPv6 equals IPv4).
 - Discovery duty cycle: while disconnected the client browses for 2 s every 15 s, holding the Android multicast lock for about 13% of the time. Hosts stay listed for 45 s after they last answered.
-- The daemon has no video listener yet, so no video port is advertised.
+- Video sender behaviour (when it is running): it sends only while the link tracker has a live
+  network peer (input or control activity within 5 s, not the loopback ADB tunnel), to that peer's
+  IP on 48440, follows the peer if its address changes (with an IDR), and stops when the link has
+  been silent for 5 s. There is no handshake and no retransmission: loss is handled by
+  Reed-Solomon FEC (default 10% parity per block of up to 20 packets), datagrams are paced over at
+  most half a frame interval, DSCP AF41 is set best effort, and at most one frame waits for the
+  encoder. mDNS advertises the `video` port (48440) only while the sender is actually running;
+  otherwise the `video` key is omitted.
 
 ---
 

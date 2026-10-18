@@ -81,6 +81,14 @@ struct DaemonArgs {
     /// Serial of the ADB device to use when several are attached (skips the Quest model check)
     #[arg(long, value_name = "SERIAL", conflicts_with = "no_adb")]
     adb_serial: Option<String>,
+
+    /// Do not start the UDP video sender (it is on by default; ignored with --tui)
+    #[arg(long)]
+    no_video: bool,
+
+    /// UDP port on the headset that video datagrams are sent to
+    #[arg(long, default_value_t = linux_quest_host::video_sender::DEFAULT_VIDEO_PORT)]
+    video_port: u16,
 }
 
 fn parse_encoder_backend(value: &str) -> Result<BackendPreference, String> {
@@ -319,6 +327,37 @@ async fn start_stream_services(
     (control_port, input_port)
 }
 
+/// Starts the UDP video sender unless `--no-video`. When it cannot run (no real capture backend,
+/// no hardware encoder), logs exactly one line and returns `None`; the daemon keeps running.
+async fn start_video(
+    args: &DaemonArgs,
+    link: SharedLinkTracker,
+) -> Option<linux_quest_host::video_sender::VideoSenderHandle> {
+    if args.no_video {
+        info!("UDP video sender disabled by --no-video");
+        return None;
+    }
+    let options = linux_quest_host::video_sender::daemon::DaemonVideoOptions {
+        video_port: args.video_port,
+        encoder: args.encoder.unwrap_or_else(BackendPreference::from_env),
+    };
+    match linux_quest_host::video_sender::daemon::start_daemon_video_sender(link, options).await {
+        Ok(handle) => {
+            info!(
+                port = args.video_port,
+                "UDP video sender ready; it sends to the headset once its input channel is live"
+            );
+            Some(handle)
+        }
+        Err(reason) => {
+            tracing::warn!(
+                "UDP video sender not started ({reason}); the daemon keeps running without video"
+            );
+            None
+        }
+    }
+}
+
 /// Starts the ADB bridge supervisor unless disabled. It is best effort: a missing `adb` or
 /// device only produces log lines. Stops (and removes the reverse mapping) on `shutdown_tx`.
 fn start_adb_bridge(
@@ -487,6 +526,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     start_stream_services(&shutdown_tx, link.clone()).await;
                 let adb_handle = start_adb_bridge(&daemon_args, &shutdown_tx, link.clone());
 
+                let video = start_video(&daemon_args, link.clone()).await;
+
                 // Advertise only the ports that were really bound above.
                 let listening = match (control_port, input_port) {
                     (Some(control), Some(input)) => {
@@ -494,10 +535,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                     _ => None,
                 };
-                let advertiser = linux_quest_host::advertise::advertise_daemon(
+                let advertiser = linux_quest_host::advertise::advertise_daemon_with_video(
                     !daemon_args.no_advertise,
                     linux_quest_host::advertise::system_instance_name(),
                     listening,
+                    video.as_ref().map(|v| v.video_port()),
                 )
                 .await;
 
@@ -507,6 +549,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 finish_adb_bridge(adb_handle).await;
                 if let Some(advertiser) = advertiser {
                     advertiser.stop().await;
+                }
+                if let Some(video) = video {
+                    video.stop().await;
                 }
                 served?;
                 info!("Daemon stopped cleanly.");

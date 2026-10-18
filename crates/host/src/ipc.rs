@@ -174,8 +174,9 @@ pub fn daemon_uptime_secs() -> u64 {
 /// Builds the dashboard snapshot from the live virtual monitors and the derived link state.
 ///
 /// `client.mode` comes only from `link`. `streaming` is true only when a client is connected
-/// AND at least one virtual display exists. The host has no video endpoint yet, so this means
-/// "link up with something to stream", not that frames are flowing.
+/// AND at least one virtual display exists. This means "link up with something to stream", not
+/// that frames are flowing: UDP video starts only when the capture and encoder backends could
+/// be opened, and never over the USB (ADB reverse) path.
 ///
 /// The wire layout of [`DashboardSnapshot`] is fixed (tray and TUI depend on it). Metrics the
 /// host does not measure yet (bitrate, fps, latency breakdowns, RTT, packet counters, audio

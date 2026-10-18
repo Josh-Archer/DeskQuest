@@ -161,6 +161,27 @@ impl LinkTracker {
     }
 }
 
+impl LinkTracker {
+    /// IP address UDP video should be sent to at `now`, or `None` when video must not flow.
+    ///
+    /// Video flows only to a peer that is reached over the network (not the loopback ADB
+    /// tunnel, which carries no UDP) and whose last activity, control or input keepalive, is
+    /// within the liveness timeout. When the headset goes silent this returns `None` after
+    /// [`DEFAULT_INPUT_LIVENESS`] (or whatever liveness the tracker was built with); a new input
+    /// source address is picked up on the next call, so the sender follows a re-latch.
+    pub fn video_peer(&self, now: Instant) -> Option<IpAddr> {
+        let status = self.status(now);
+        if !status.connected || status.transport != Some(LinkTransport::Wifi) {
+            return None;
+        }
+        let seen = status.last_seen?;
+        if now.saturating_duration_since(seen) >= self.liveness {
+            return None;
+        }
+        status.peer.map(|peer| peer.ip().to_canonical())
+    }
+}
+
 fn classify(peer: SocketAddr, adb_reverse_established: bool) -> Option<LinkTransport> {
     if is_loopback(peer.ip()) {
         adb_reverse_established.then_some(LinkTransport::UsbAdb)
@@ -378,5 +399,38 @@ mod tests {
 
         assert_eq!(status, LinkStatus::default());
         assert_eq!(status.connection_mode(), ClientConnectionMode::Disconnected);
+    }
+
+    #[test]
+    fn video_peer_is_the_live_network_peer() {
+        let now = Instant::now();
+        let mut t = LinkTracker::new(LIVENESS);
+        assert_eq!(t.video_peer(now), None, "no events, no video");
+
+        t.input_packet(addr("192.168.1.20:50000"), now);
+        assert_eq!(t.video_peer(now), Some("192.168.1.20".parse().unwrap()));
+
+        // Silence past the liveness timeout stops video.
+        assert_eq!(t.video_peer(now + LIVENESS), None);
+        assert!(t.video_peer(now + Duration::from_secs(4)).is_some());
+
+        // A new sender address is followed.
+        let later = now + Duration::from_secs(6);
+        t.input_packet(addr("192.168.1.31:40000"), later);
+        assert_eq!(t.video_peer(later), Some("192.168.1.31".parse().unwrap()));
+    }
+
+    #[test]
+    fn video_peer_ignores_the_usb_tunnel_and_folds_mapped_addresses() {
+        let now = Instant::now();
+        assert_eq!(
+            usb_tracker(now).video_peer(now),
+            None,
+            "the ADB reverse tunnel carries no UDP video"
+        );
+
+        let mut t = LinkTracker::new(LIVENESS);
+        t.control_accepted(addr("[::ffff:192.168.1.20]:50000"), now);
+        assert_eq!(t.video_peer(now), Some("192.168.1.20".parse().unwrap()));
     }
 }
