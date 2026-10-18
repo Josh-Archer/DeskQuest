@@ -138,6 +138,10 @@ struct Supervisor<R: AdbCommandRunner> {
     config: AdbSupervisorConfig,
     link: SharedLinkTracker,
     problem: Option<Problem>,
+    /// Serial the bridge is currently restricted to when it was picked automatically.
+    bridge_target: Option<String>,
+    /// `ro.serialno` per ADB serial, so the lookup runs once per attached entry.
+    hardware_serials: std::collections::HashMap<String, String>,
 }
 
 impl<R: AdbCommandRunner + Clone> Supervisor<R> {
@@ -148,6 +152,8 @@ impl<R: AdbCommandRunner + Clone> Supervisor<R> {
             config,
             link,
             problem: None,
+            bridge_target: None,
+            hardware_serials: std::collections::HashMap::new(),
         }
     }
 
@@ -174,6 +180,58 @@ impl<R: AdbCommandRunner + Clone> Supervisor<R> {
         serial_ok && quest_ok
     }
 
+    /// One headset attached over USB and over wireless debugging appears as two ADB entries.
+    /// Entries that report the same hardware serial are collapsed to one, preferring the wired
+    /// one. Entries whose hardware serial cannot be read are kept as they are, so the supervisor
+    /// still never guesses between devices it cannot tell apart.
+    async fn collapse_same_headset(&mut self, ready: Vec<AdbDevice>) -> Vec<AdbDevice> {
+        if ready.len() < 2 {
+            return ready;
+        }
+        let mut kept: Vec<(Option<String>, AdbDevice)> = Vec::new();
+        for dev in ready {
+            let hardware = self.hardware_serial(&dev.serial).await;
+            let same = hardware
+                .as_ref()
+                .and_then(|h| kept.iter().position(|(k, _)| k.as_ref() == Some(h)));
+            match same {
+                Some(i) => {
+                    if is_network_serial(&kept[i].1.serial) && !is_network_serial(&dev.serial) {
+                        kept[i] = (hardware, dev);
+                    }
+                }
+                None => kept.push((hardware, dev)),
+            }
+        }
+        kept.into_iter().map(|(_, d)| d).collect()
+    }
+
+    async fn hardware_serial(&mut self, serial: &str) -> Option<String> {
+        if let Some(h) = self.hardware_serials.get(serial) {
+            return Some(h.clone());
+        }
+        match self.runner.hardware_serial(serial).await {
+            Ok(Some(h)) => {
+                self.hardware_serials.insert(serial.to_string(), h.clone());
+                Some(h)
+            }
+            _ => None,
+        }
+    }
+
+    /// Restricts the bridge to `serial` unless the user pinned one with `--adb-serial`.
+    fn retarget(&mut self, serial: &str) {
+        if self.config.bridge.target_serial.is_some()
+            || self.bridge_target.as_deref() == Some(serial)
+        {
+            return;
+        }
+        let mut cfg = self.config.bridge.clone();
+        cfg.target_serial = Some(serial.to_string());
+        self.bridge = AdbBridge::new(self.runner.clone(), cfg);
+        self.bridge_target = Some(serial.to_string());
+    }
+
     /// One iteration. Returns how long to wait before the next one.
     async fn step(&mut self) -> Duration {
         let poll = self.config.bridge.poll_interval;
@@ -189,12 +247,17 @@ impl<R: AdbCommandRunner + Clone> Supervisor<R> {
                     return retry;
                 }
             };
-            let ready: Vec<&AdbDevice> = devices
+            let ready: Vec<AdbDevice> = devices
                 .iter()
                 .filter(|d| d.state == AdbDeviceState::Device && self.is_candidate(d))
+                .cloned()
                 .collect();
+            let ready = self.collapse_same_headset(ready).await;
             let problem = match ready.len() {
-                1 => None,
+                1 => {
+                    self.retarget(&ready[0].serial);
+                    None
+                }
                 0 => Some(diagnose_no_ready(&devices, |d| self.is_candidate(d))),
                 _ => Some(Problem::MultipleDevices(
                     ready.iter().map(|d| d.serial.clone()).collect(),
@@ -271,6 +334,12 @@ impl<R: AdbCommandRunner + Clone> Supervisor<R> {
                 .adb_event(&AdbBridgeEvent::DeviceDisconnected(serial));
         }
     }
+}
+
+/// True for ADB entries that are network transports (`192.168.1.5:5555`, or an mDNS name
+/// like `adb-XXXX-YYYY._adb-tls-connect._tcp`) rather than a USB serial.
+fn is_network_serial(serial: &str) -> bool {
+    serial.contains(':') || serial.contains("._adb-tls-")
 }
 
 fn diagnose_no_ready(devices: &[AdbDevice], is_candidate: impl Fn(&AdbDevice) -> bool) -> Problem {
@@ -480,6 +549,73 @@ mod tests {
         h.runner.set_device_state("Q1", AdbDeviceState::Device);
         settle().await;
         assert!(usb_up(&h.link));
+
+        let _ = h.tx.send(());
+        h.task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn same_headset_over_usb_and_wifi_prefers_usb() {
+        let h = start();
+        h.runner.add_device(quest("192.168.1.50:5555"));
+        h.runner.add_device(quest("2G0YC1ZF9H039X"));
+        h.runner
+            .set_hardware_serial("192.168.1.50:5555", "2G0YC1ZF9H039X");
+        h.runner
+            .set_hardware_serial("2G0YC1ZF9H039X", "2G0YC1ZF9H039X");
+        settle().await;
+        assert_eq!(h.runner.get_rules("2G0YC1ZF9H039X").len(), 1);
+        assert!(h.runner.get_rules("192.168.1.50:5555").is_empty());
+        assert!(usb_up(&h.link));
+
+        let _ = h.tx.send(());
+        h.task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wifi_entry_is_used_when_usb_goes_away() {
+        let h = start();
+        h.runner.add_device(quest("192.168.1.50:5555"));
+        h.runner.add_device(quest("USB1"));
+        h.runner.set_hardware_serial("192.168.1.50:5555", "HW1");
+        h.runner.set_hardware_serial("USB1", "HW1");
+        settle().await;
+        assert_eq!(h.runner.get_rules("USB1").len(), 1);
+
+        h.runner.remove_device("USB1");
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        settle().await;
+        assert_eq!(h.runner.get_rules("192.168.1.50:5555").len(), 1);
+
+        let _ = h.tx.send(());
+        h.task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn different_headsets_with_known_serials_are_still_not_guessed() {
+        let h = start();
+        h.runner.add_device(quest("Q1"));
+        h.runner.add_device(quest("Q2"));
+        h.runner.set_hardware_serial("Q1", "HW1");
+        h.runner.set_hardware_serial("Q2", "HW2");
+        settle().await;
+        assert!(h.runner.get_rules("Q1").is_empty());
+        assert!(h.runner.get_rules("Q2").is_empty());
+        assert!(!usb_up(&h.link));
+
+        let _ = h.tx.send(());
+        h.task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unreadable_hardware_serial_is_not_collapsed() {
+        // No hardware serial can be read for either entry, so they cannot be told apart.
+        let h = start();
+        h.runner.add_device(quest("192.168.1.50:5555"));
+        h.runner.add_device(quest("USB1"));
+        settle().await;
+        assert!(h.runner.get_rules("USB1").is_empty());
+        assert!(h.runner.get_rules("192.168.1.50:5555").is_empty());
 
         let _ = h.tx.send(());
         h.task.await.unwrap();
