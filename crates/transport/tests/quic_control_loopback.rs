@@ -12,8 +12,8 @@ use linux_quest_protocol::{
 };
 use linux_quest_transport::quic::{QUIC_KEEP_ALIVE_INTERVAL, QUIC_MAX_IDLE_TIMEOUT};
 use linux_quest_transport::{
-    ControlChannel, ControlError, ControlMessage, Fingerprint, HostIdentity, QuicControlServer,
-    QuicControlSession,
+    AuthorizedClients, ClientIdentity, ControlChannel, ControlError, ControlMessage, Fingerprint,
+    HostIdentity, QuicControlServer, QuicControlSession,
 };
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -25,16 +25,21 @@ struct Harness {
     server: QuicControlServer,
     fingerprint: Fingerprint,
     addr: SocketAddr,
+    client: ClientIdentity,
 }
 
 fn harness() -> Harness {
     let identity = HostIdentity::generate().unwrap();
-    let server = QuicControlServer::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+    let client = ClientIdentity::generate().unwrap();
+    let authorized: AuthorizedClients = [client.fingerprint()].into_iter().collect();
+    let server =
+        QuicControlServer::bind("127.0.0.1:0".parse().unwrap(), &identity, authorized).unwrap();
     let addr = server.local_addr().unwrap();
     Harness {
         server,
         fingerprint: identity.fingerprint(),
         addr,
+        client,
     }
 }
 
@@ -45,7 +50,7 @@ async fn open_session(
     first: &ControlMessage,
 ) -> (QuicControlSession, QuicControlSession) {
     let dial = async {
-        let mut client = QuicControlSession::connect(h.addr, h.fingerprint)
+        let mut client = QuicControlSession::connect(h.addr, h.fingerprint, &h.client)
             .await
             .expect("connect should succeed with the pinned fingerprint");
         client.control.send_message(first).await.unwrap();
@@ -150,7 +155,7 @@ async fn connect_rejects_certificate_that_does_not_match_pin() {
     let wrong_pin = Fingerprint::of_der(b"not the host certificate");
     let (dial, _accept) = tokio::time::timeout(TEST_TIMEOUT, async {
         tokio::join!(
-            QuicControlSession::connect(h.addr, wrong_pin),
+            QuicControlSession::connect(h.addr, wrong_pin, &h.client),
             h.server.accept()
         )
     })

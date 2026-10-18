@@ -5,6 +5,9 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use linux_quest_display::DisplayLayoutMode;
+use linux_quest_encoder::{probe_backends, BackendPreference};
+use linux_quest_host::adb_link::{spawn_adb_supervisor, AdbSupervisorConfig};
+use linux_quest_host::codec_select::{plan_stream, CLIENT_DECODE_CODECS, CODEC_PREFERENCE};
 use linux_quest_host::link_status::{
     new_shared_link_tracker, SharedLinkTracker, DEFAULT_INPUT_LIVENESS,
 };
@@ -61,9 +64,23 @@ struct DaemonArgs {
     #[arg(long)]
     tui: bool,
 
+    /// Video encoder backend: auto (NVENC, then VA-API), nvenc, vaapi or mock.
+    /// Overrides LINUX_QUEST_VIDEO_ENCODER when given.
+    #[arg(long, value_name = "BACKEND", value_parser = parse_encoder_backend)]
+    encoder: Option<BackendPreference>,
+
     /// Do not advertise this daemon on the LAN via mDNS (Quest clients then need manual IP entry)
     #[arg(long)]
     no_advertise: bool,
+
+    /// Do not manage the USB `adb reverse` tunnel (USB connections then need a manual
+    /// `adb reverse tcp:48444 tcp:48444`, and are not recognised as USB until one exists)
+    #[arg(long)]
+    no_adb: bool,
+
+    /// Serial of the ADB device to use when several are attached (skips the Quest model check)
+    #[arg(long, value_name = "SERIAL", conflicts_with = "no_adb")]
+    adb_serial: Option<String>,
 
     /// Do not start the UDP video sender (it is on by default; ignored with --tui)
     #[arg(long)]
@@ -72,6 +89,10 @@ struct DaemonArgs {
     /// UDP port on the headset that video datagrams are sent to
     #[arg(long, default_value_t = linux_quest_host::video_sender::DEFAULT_VIDEO_PORT)]
     video_port: u16,
+}
+
+fn parse_encoder_backend(value: &str) -> Result<BackendPreference, String> {
+    value.parse()
 }
 
 #[derive(Args, Debug, Default)]
@@ -151,6 +172,66 @@ impl From<CliLayoutMode> for DisplayLayoutMode {
             CliLayoutMode::Vertical => DisplayLayoutMode::Vertical,
             CliLayoutMode::Grid => DisplayLayoutMode::Grid,
         }
+    }
+}
+
+/// Logs which backend and codec a stream would use with `preference`, given what each
+/// backend reports for each codec. Probing talks to libva and NVENC, so it runs on a
+/// blocking thread. The plan is not yet applied to a stream (see `codec_select`).
+async fn log_stream_plan(preference: BackendPreference) {
+    let probes = match tokio::task::spawn_blocking(|| {
+        CODEC_PREFERENCE
+            .iter()
+            .map(|&codec| (codec, probe_backends(codec)))
+            .collect::<Vec<_>>()
+    })
+    .await
+    {
+        Ok(probes) => probes,
+        Err(e) => {
+            // A panic in a probe (libva and NVENC are loaded and called from here)
+            // must not look like "no encoder found".
+            tracing::error!(
+                "video encoder capability probing failed ({}): {e}. No stream plan was made",
+                if e.is_panic() { "panic" } else { "cancelled" }
+            );
+            return;
+        }
+    };
+    for (codec, results) in &probes {
+        for p in results {
+            info!(
+                "encoder probe {:?} for {:?}: {} ({})",
+                p.kind.name(),
+                codec,
+                if p.available {
+                    "available"
+                } else {
+                    "unavailable"
+                },
+                p.reason
+            );
+        }
+    }
+    let plan = plan_stream(preference, CLIENT_DECODE_CODECS, |backend, codec| {
+        probes.iter().any(|(c, results)| {
+            *c == codec && results.iter().any(|p| p.kind == backend && p.available)
+        })
+    });
+    match plan {
+        Some(plan) => info!(
+            "video stream plan: encoder {} with {:?} (preference {:?})",
+            plan.backend.name(),
+            plan.codec,
+            preference
+        ),
+        None => tracing::warn!(
+            "no hardware video encoder can serve the Quest client (preference {:?}). This plan \
+             is informational only: the daemon does not start a stream from it yet, and the \
+             encoder used by the streaming pipeline (AutoVideoEncoder) falls back to the \
+             software mock, which produces no real video",
+            preference
+        ),
     }
 }
 
@@ -258,6 +339,7 @@ async fn start_video(
     }
     let options = linux_quest_host::video_sender::daemon::DaemonVideoOptions {
         video_port: args.video_port,
+        encoder: args.encoder.unwrap_or_else(BackendPreference::from_env),
     };
     match linux_quest_host::video_sender::daemon::start_daemon_video_sender(link, options).await {
         Ok(handle) => {
@@ -272,6 +354,40 @@ async fn start_video(
                 "UDP video sender not started ({reason}); the daemon keeps running without video"
             );
             None
+        }
+    }
+}
+
+/// Starts the ADB bridge supervisor unless disabled. It is best effort: a missing `adb` or
+/// device only produces log lines. Stops (and removes the reverse mapping) on `shutdown_tx`.
+fn start_adb_bridge(
+    args: &DaemonArgs,
+    shutdown_tx: &tokio::sync::broadcast::Sender<()>,
+    link: SharedLinkTracker,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if args.no_adb {
+        info!("ADB bridge disabled (--no-adb); not managing the USB reverse tunnel");
+        return None;
+    }
+    let runner = Arc::new(linux_quest_transport::SystemAdbRunner::default());
+    let config = AdbSupervisorConfig::new(args.adb_serial.clone());
+    Some(spawn_adb_supervisor(
+        runner,
+        config,
+        link,
+        shutdown_tx.subscribe(),
+    ))
+}
+
+/// Waits for the ADB supervisor to remove its reverse mapping, bounded so a hung `adb`
+/// cannot block daemon exit.
+async fn finish_adb_bridge(handle: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(handle) = handle {
+        if tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .is_err()
+        {
+            tracing::warn!("ADB bridge did not stop in time; leaving it");
         }
     }
 }
@@ -350,6 +466,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
         Commands::Daemon(daemon_args) => {
+            let preference = daemon_args
+                .encoder
+                .unwrap_or_else(BackendPreference::from_env);
+            log_stream_plan(preference).await;
             let host = Arc::new(MultiDisplayHost::create_auto().await?);
             let run_tui = daemon_args.tui || cli.tui;
             let link = new_shared_link_tracker(DEFAULT_INPUT_LIVENESS);
@@ -362,6 +482,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                 // The TUI run binds the listeners but does not advertise them.
                 let _ = start_stream_services(&shutdown_tx, link.clone()).await;
+                let adb_handle = start_adb_bridge(&daemon_args, &shutdown_tx, link.clone());
 
                 let host_clone = host.clone();
                 let link_clone = link.clone();
@@ -383,6 +504,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let _ = shutdown_tx_clone.send(());
                 shutdown_flag_clone.store(true, std::sync::atomic::Ordering::SeqCst);
                 let _ = ipc_handle.await;
+                finish_adb_bridge(adb_handle).await;
             } else {
                 info!(
                     backend = host.backend_name().await,
@@ -402,6 +524,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                 let (control_port, input_port) =
                     start_stream_services(&shutdown_tx, link.clone()).await;
+                let adb_handle = start_adb_bridge(&daemon_args, &shutdown_tx, link.clone());
 
                 let video = start_video(&daemon_args, link.clone()).await;
 
@@ -421,6 +544,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .await;
 
                 let served = run_ipc_server(host, link, shutdown_rx).await;
+                // The IPC server may have ended on its own; make sure the bridge stops too.
+                let _ = shutdown_tx.send(());
+                finish_adb_bridge(adb_handle).await;
                 if let Some(advertiser) = advertiser {
                     advertiser.stop().await;
                 }

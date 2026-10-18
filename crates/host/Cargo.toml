@@ -43,6 +43,7 @@ mdns = ["linux-quest-transport/mdns"]
 
 [dev-dependencies]
 linux-quest-client = { path = "../client" }
+tokio = { workspace = true, features = ["test-util"] }
 
 # Linux packaging metadata. Run from the workspace root:
 #   cargo build --release -p linux-quest-host

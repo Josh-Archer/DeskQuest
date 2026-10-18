@@ -10,9 +10,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 
+pub mod adb_link;
 pub mod advertise;
 pub mod audio_pipeline;
 pub mod clipboard_service;
+pub mod codec_select;
 pub mod input_receiver;
 pub mod ipc;
 pub mod link_status;
