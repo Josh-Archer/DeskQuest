@@ -20,6 +20,7 @@ async fn test_full_pipeline_multi_frame_streaming_and_reassembly() {
         bitrate_kbps: 50_000,
         intra_refresh_period: 5,
         max_chunk_size: 1024,
+        colour: linux_quest_encoder::ColourConfig::default(),
     });
 
     let (ep_host, mut ep_client) = LoopbackEndpoint::create_pair();
@@ -35,6 +36,7 @@ async fn test_full_pipeline_multi_frame_streaming_and_reassembly() {
             bitrate_kbps: 50_000,
             intra_refresh_period: 5,
             max_chunk_size: 1024,
+            colour: linux_quest_encoder::ColourConfig::default(),
         })
         .await
         .expect("Session init failed");
@@ -164,6 +166,7 @@ async fn test_auto_hardware_pipeline_stream() {
         bitrate_kbps: 100_000,
         intra_refresh_period: 30,
         max_chunk_size: 1400,
+        colour: linux_quest_encoder::ColourConfig::default(),
     };
     let encoder = linux_quest_encoder::AutoVideoEncoder::new(encoder_config.clone());
     let (ep_host, mut ep_client) = LoopbackEndpoint::create_pair();
@@ -216,6 +219,7 @@ async fn test_display_config_packet_lifecycle() {
         bitrate_kbps: 50_000,
         intra_refresh_period: 5,
         max_chunk_size: 1024,
+        colour: linux_quest_encoder::ColourConfig::default(),
     };
     let encoder = MockVideoEncoder::new(encoder_cfg);
     let (ep_host, mut ep_client) = LoopbackEndpoint::create_pair();

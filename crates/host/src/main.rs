@@ -5,7 +5,9 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use linux_quest_display::DisplayLayoutMode;
+use linux_quest_encoder::{probe_backends, BackendPreference};
 use linux_quest_host::adb_link::{spawn_adb_supervisor, AdbSupervisorConfig};
+use linux_quest_host::codec_select::{plan_stream, CLIENT_DECODE_CODECS, CODEC_PREFERENCE};
 use linux_quest_host::link_status::{
     new_shared_link_tracker, SharedLinkTracker, DEFAULT_INPUT_LIVENESS,
 };
@@ -62,6 +64,11 @@ struct DaemonArgs {
     #[arg(long)]
     tui: bool,
 
+    /// Video encoder backend: auto (NVENC, then VA-API), nvenc, vaapi or mock.
+    /// Overrides LINUX_QUEST_VIDEO_ENCODER when given.
+    #[arg(long, value_name = "BACKEND", value_parser = parse_encoder_backend)]
+    encoder: Option<BackendPreference>,
+
     /// Do not advertise this daemon on the LAN via mDNS (Quest clients then need manual IP entry)
     #[arg(long)]
     no_advertise: bool,
@@ -74,6 +81,10 @@ struct DaemonArgs {
     /// Serial of the ADB device to use when several are attached (skips the Quest model check)
     #[arg(long, value_name = "SERIAL", conflicts_with = "no_adb")]
     adb_serial: Option<String>,
+}
+
+fn parse_encoder_backend(value: &str) -> Result<BackendPreference, String> {
+    value.parse()
 }
 
 #[derive(Args, Debug, Default)]
@@ -153,6 +164,66 @@ impl From<CliLayoutMode> for DisplayLayoutMode {
             CliLayoutMode::Vertical => DisplayLayoutMode::Vertical,
             CliLayoutMode::Grid => DisplayLayoutMode::Grid,
         }
+    }
+}
+
+/// Logs which backend and codec a stream would use with `preference`, given what each
+/// backend reports for each codec. Probing talks to libva and NVENC, so it runs on a
+/// blocking thread. The plan is not yet applied to a stream (see `codec_select`).
+async fn log_stream_plan(preference: BackendPreference) {
+    let probes = match tokio::task::spawn_blocking(|| {
+        CODEC_PREFERENCE
+            .iter()
+            .map(|&codec| (codec, probe_backends(codec)))
+            .collect::<Vec<_>>()
+    })
+    .await
+    {
+        Ok(probes) => probes,
+        Err(e) => {
+            // A panic in a probe (libva and NVENC are loaded and called from here)
+            // must not look like "no encoder found".
+            tracing::error!(
+                "video encoder capability probing failed ({}): {e}. No stream plan was made",
+                if e.is_panic() { "panic" } else { "cancelled" }
+            );
+            return;
+        }
+    };
+    for (codec, results) in &probes {
+        for p in results {
+            info!(
+                "encoder probe {:?} for {:?}: {} ({})",
+                p.kind.name(),
+                codec,
+                if p.available {
+                    "available"
+                } else {
+                    "unavailable"
+                },
+                p.reason
+            );
+        }
+    }
+    let plan = plan_stream(preference, CLIENT_DECODE_CODECS, |backend, codec| {
+        probes.iter().any(|(c, results)| {
+            *c == codec && results.iter().any(|p| p.kind == backend && p.available)
+        })
+    });
+    match plan {
+        Some(plan) => info!(
+            "video stream plan: encoder {} with {:?} (preference {:?})",
+            plan.backend.name(),
+            plan.codec,
+            preference
+        ),
+        None => tracing::warn!(
+            "no hardware video encoder can serve the Quest client (preference {:?}). This plan \
+             is informational only: the daemon does not start a stream from it yet, and the \
+             encoder used by the streaming pipeline (AutoVideoEncoder) falls back to the \
+             software mock, which produces no real video",
+            preference
+        ),
     }
 }
 
@@ -356,6 +427,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
         Commands::Daemon(daemon_args) => {
+            let preference = daemon_args
+                .encoder
+                .unwrap_or_else(BackendPreference::from_env);
+            log_stream_plan(preference).await;
             let host = Arc::new(MultiDisplayHost::create_auto().await?);
             let run_tui = daemon_args.tui || cli.tui;
             let link = new_shared_link_tracker(DEFAULT_INPUT_LIVENESS);

@@ -387,23 +387,34 @@ impl NvencEncoder {
         self.initialized = false;
     }
 
+    /// Checks whether the NVENC runtime is loadable and new enough, reporting why not.
+    pub fn probe() -> Result<(), String> {
+        unsafe {
+            let lib = Library::new("libnvidia-encode.so.1")
+                .or_else(|_| Library::new("libnvidia-encode.so"))
+                .map_err(|e| format!("libnvidia-encode not loadable: {e}"))?;
+            let get_max_ver = lib
+                .get::<NvEncodeApiGetMaxSupportedVersionFn>(b"NvEncodeAPIGetMaxSupportedVersion\0")
+                .map_err(|e| format!("NvEncodeAPIGetMaxSupportedVersion missing: {e}"))?;
+            let mut max_version = 0u32;
+            let status = get_max_ver(&mut max_version);
+            if status != NV_ENC_SUCCESS {
+                return Err(format!(
+                    "NvEncodeAPIGetMaxSupportedVersion failed: {status}"
+                ));
+            }
+            if max_version < ((12 << 4) | 1) {
+                return Err(format!(
+                    "driver NVENC API {max_version:#x} is older than required 12.1"
+                ));
+            }
+            Ok(())
+        }
+    }
+
     /// Checks if NVIDIA NVENC library is dynamically loadable and can report supported version.
     pub fn is_available() -> bool {
-        unsafe {
-            if let Ok(lib) = Library::new("libnvidia-encode.so.1")
-                .or_else(|_| Library::new("libnvidia-encode.so"))
-            {
-                if let Ok(get_max_ver) = lib.get::<NvEncodeApiGetMaxSupportedVersionFn>(
-                    b"NvEncodeAPIGetMaxSupportedVersion\0",
-                ) {
-                    let mut max_version = 0u32;
-                    if get_max_ver(&mut max_version) == NV_ENC_SUCCESS {
-                        return max_version >= ((12 << 4) | 1);
-                    }
-                }
-            }
-            false
-        }
+        Self::probe().is_ok()
     }
 
     pub fn codec_guid(&self) -> NvEncGuid {
@@ -976,6 +987,7 @@ mod tests {
             bitrate_kbps: 60_000,
             intra_refresh_period: 60,
             max_chunk_size: 1400,
+            colour: crate::ColourConfig::default(),
         });
 
         encoder
@@ -987,6 +999,7 @@ mod tests {
                 bitrate_kbps: 60_000,
                 intra_refresh_period: 60,
                 max_chunk_size: 1400,
+                colour: crate::ColourConfig::default(),
             })
             .await
             .expect("Hardware NVENC AV1 init failed on available device");
@@ -1123,6 +1136,7 @@ mod tests {
             bitrate_kbps: 60_000,
             intra_refresh_period: 60,
             max_chunk_size: 1400,
+            colour: crate::ColourConfig::default(),
         });
 
         hevc_encoder
@@ -1134,6 +1148,7 @@ mod tests {
                 bitrate_kbps: 60_000,
                 intra_refresh_period: 60,
                 max_chunk_size: 1400,
+                colour: crate::ColourConfig::default(),
             })
             .await
             .expect("HEVC hardware NVENC init must succeed with status 0");
