@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use linux_quest_input::InputInjector;
+use linux_quest_protocol::InputEvent;
 use linux_quest_transport::{InputChannelReceiver, TransportError};
 
 use crate::link_status::SharedLinkTracker;
@@ -18,6 +19,7 @@ pub struct HostInputReceiver<I: InputInjector> {
     injector: Arc<Mutex<I>>,
     running: Arc<AtomicBool>,
     link: Option<SharedLinkTracker>,
+    keyframe_requests: Option<Arc<AtomicBool>>,
 }
 
 impl<I: InputInjector> HostInputReceiver<I> {
@@ -27,7 +29,15 @@ impl<I: InputInjector> HostInputReceiver<I> {
             injector,
             running: Arc::new(AtomicBool::new(false)),
             link: None,
+            keyframe_requests: None,
         }
+    }
+
+    /// Sets `flag` when the client sends [`InputEvent::KeyframeRequest`] (it lost video); the
+    /// video sender clears it and forces an IDR. Without this the request is dropped.
+    pub fn with_keyframe_requests(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.keyframe_requests = Some(flag);
+        self
     }
 
     /// Reports each received packet's sender to the shared link tracker.
@@ -54,6 +64,14 @@ impl<I: InputInjector> HostInputReceiver<I> {
         let events = self.receiver.recv_events().await?;
         if let (Some(link), Some(peer)) = (&self.link, self.receiver.remote_addr()) {
             link.lock().input_packet(peer, std::time::Instant::now());
+        }
+        let (keyframe_requests, events): (Vec<_>, Vec<_>) = events
+            .into_iter()
+            .partition(|e| matches!(e, InputEvent::KeyframeRequest));
+        if !keyframe_requests.is_empty() {
+            if let Some(flag) = &self.keyframe_requests {
+                flag.store(true, Ordering::Release);
+            }
         }
         let count = events.len();
         if count > 0 {

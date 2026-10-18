@@ -108,6 +108,38 @@ impl InputSource for KeepaliveOnlySource {
     }
 }
 
+/// An [`InputSource`] that only emits keepalives, plus [`InputEvent::KeyframeRequest`] each
+/// time [`KeyframeRequestSource::requester`]'s flag is raised (then call
+/// [`InputSenderControl::notify`] so it goes out at once).
+#[derive(Debug, Default, Clone)]
+pub struct KeyframeRequestSource {
+    pending: std::sync::Arc<AtomicBool>,
+}
+
+impl KeyframeRequestSource {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The flag to raise when a keyframe is needed.
+    pub fn requester(&self) -> std::sync::Arc<AtomicBool> {
+        self.pending.clone()
+    }
+}
+
+impl InputSource for KeyframeRequestSource {
+    fn poll(&mut self) -> Vec<InputEvent> {
+        if self.pending.swap(false, Ordering::AcqRel) {
+            vec![InputEvent::KeyframeRequest]
+        } else {
+            Vec::new()
+        }
+    }
+    fn needs_polling(&self) -> bool {
+        false
+    }
+}
+
 /// Sender tuning. [`InputSenderConfig::new`] gives the production defaults.
 #[derive(Debug, Clone)]
 pub struct InputSenderConfig {

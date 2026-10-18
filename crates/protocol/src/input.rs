@@ -187,6 +187,10 @@ pub enum InputEvent {
         mime_type: String,
         content: Vec<u8>,
     },
+    /// The client lost video (a frame gap, or the decoder refused a frame) and needs an IDR.
+    /// Travels on the input channel because that is the only client-to-host path in UDP mode.
+    /// Not an input event for the injector: the host input receiver hands it to the video sender.
+    KeyframeRequest,
 }
 
 impl InputEvent {
@@ -236,6 +240,9 @@ impl InputEvent {
                 dst.put_slice(mime_bytes);
                 dst.put_u32(content.len() as u32);
                 dst.put_slice(content);
+            }
+            InputEvent::KeyframeRequest => {
+                dst.put_u8(8);
             }
         }
     }
@@ -356,6 +363,7 @@ impl InputEvent {
                 src.advance(content_len);
                 Ok(InputEvent::ClipboardSync { mime_type, content })
             }
+            8 => Ok(InputEvent::KeyframeRequest),
             other => Err(ProtocolError::DeserializationError(format!(
                 "Invalid event tag: {other}"
             ))),
@@ -564,6 +572,7 @@ mod tests {
                 mime_type: "text/plain".into(),
                 content: b"clipboard text content".to_vec(),
             },
+            InputEvent::KeyframeRequest,
         ];
 
         for ev in &events {

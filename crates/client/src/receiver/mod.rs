@@ -1,5 +1,7 @@
 //! Streaming receiver integrating jitter buffer, FEC recovery, and frame reassembly.
 
+pub mod loss_recovery;
+
 use std::time::{Duration, Instant};
 
 use linux_quest_protocol::packet::Packet;

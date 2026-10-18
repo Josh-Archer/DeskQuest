@@ -34,6 +34,8 @@ pub struct QuestClientRuntime {
     gesture_detector: HandGestureDetector,
     is_running: bool,
     swapchains_ready: bool,
+    loss_recovery: crate::receiver::loss_recovery::LossRecovery,
+    keyframe_requester: Option<Box<dyn Fn() + Send>>,
 }
 
 impl QuestClientRuntime {
@@ -120,7 +122,20 @@ impl QuestClientRuntime {
             gesture_detector,
             is_running: true,
             swapchains_ready,
+            loss_recovery: crate::receiver::loss_recovery::LossRecovery::new(),
+            keyframe_requester: None,
         })
+    }
+
+    /// Called (rate limited) whenever video is lost and a keyframe is needed. On Android this
+    /// sends [`linux_quest_protocol::InputEvent::KeyframeRequest`] on the UDP input channel.
+    pub fn set_keyframe_requester(&mut self, request: Box<dyn Fn() + Send>) {
+        self.keyframe_requester = Some(request);
+    }
+
+    /// Loss-recovery state between the reassembler and the decoder.
+    pub fn loss_recovery(&self) -> &crate::receiver::loss_recovery::LossRecovery {
+        &self.loss_recovery
     }
 
     fn build_decoder(
@@ -157,6 +172,8 @@ impl QuestClientRuntime {
         }
         self.openxr_context.create_swapchains(&self.config)?;
         self.decoder = Self::build_decoder(&self.config, &self.openxr_context)?;
+        // A fresh decoder can only start from a keyframe.
+        self.loss_recovery = crate::receiver::loss_recovery::LossRecovery::new();
         self.swapchains_ready = true;
         Ok(())
     }
@@ -269,7 +286,15 @@ impl QuestClientRuntime {
         };
 
         if let Ok(ready_frames) = self.receiver.pop_ready_frames(playout_instant) {
+            use crate::receiver::loss_recovery::Admit;
             for frame in ready_frames {
+                if self
+                    .loss_recovery
+                    .admit(frame.meta.frame_id, frame.meta.is_keyframe)
+                    == Admit::Skip
+                {
+                    continue;
+                }
                 if let Err(e) = self.decoder.queue_input_buffer(
                     &frame.bitstream,
                     frame.meta.pts_us,
@@ -278,9 +303,15 @@ impl QuestClientRuntime {
                     tracing::warn!(
                         error = ?e,
                         frame_id = frame.meta.frame_id,
-                        "Failed to queue video frame into decoder"
+                        "Failed to queue video frame into decoder; waiting for a keyframe"
                     );
+                    self.loss_recovery.decoder_refused();
                 }
+            }
+        }
+        if self.loss_recovery.take_request(playout_instant) {
+            if let Some(request) = &self.keyframe_requester {
+                request();
             }
         }
 
