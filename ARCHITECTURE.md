@@ -44,6 +44,20 @@ Traditional screen-recording tools read pixel data back to CPU system memory (`g
 [Network Socket / ADB Pipe]
 ```
 
+### Screen Capture on Wayland / GNOME / KDE (`crates/capture`, feature `pipewire-screencast`)
+
+The compositor framebuffer is obtained through the **xdg-desktop-portal ScreenCast** interface, never by reading the screen directly:
+
+1. `CreateSession` -> `SelectSources` (monitors only, single selection, cursor *embedded* in the frames so the encoder sees plain pictures, `persist_mode = 2`) -> `Start` (the compositor shows its monitor picker) -> `OpenPipeWireRemote` yields a PipeWire socket fd and a node id.
+2. The portal `restore_token` is stored at `$XDG_STATE_HOME/linux-quest/screencast-restore-token` (`0600`, directories `0700`, atomic write). Later runs send it back and the picker is skipped; a token the portal rejects is deleted and the flow retried once with a fresh prompt.
+3. A dedicated thread runs the PipeWire main loop on that fd and offers formats BGRx / BGRA / RGBx / RGBA / NV12: DMA-BUF variants (with the importable DRM modifiers, linear by default) first, plain memory (memfd/memptr) as the fallback. The frame size and rate are read from the *negotiated* format, and a compositor-initiated format change re-negotiates and updates `CaptureInfo`.
+4. Frames go through a bounded, latest-wins queue to `DisplayCapture::capture_frame`. DMA-BUF frames carry duplicated plane fds and no CPU copy (`RawFrame::dma_buf`); memory frames are copied once into `RawFrame::data`. Buffers with no new content (empty chunk, corrupted header, empty damage list) are skipped and counted.
+5. A closed portal session, a removed node or a stream error ends the capture with a typed `CaptureError::ScreenCast(..)`; calling `init` again restarts it.
+
+`DisplayCapture::capture_info()` returns the real `{width, height, fps, format, dmabuf, modifier}`. A video sender should read it after `init` and build the `EncoderConfig` from it rather than from defaults.
+
+**Which monitor is captured is the user's choice in the portal picker.** The portal has no API to request a specific output, so the virtual monitor created by the display crate (EVDI / X11 / Mutter virtual output) must be picked once in the dialog (the restore token then remembers it). An unattended, prompt-free route needs compositor-specific APIs, which are not implemented: Mutter's `org.gnome.Mutter.ScreenCast` / `RemoteDesktop`, wlroots' `wlr-screencopy` / `ext-image-copy-capture-v1`, or KWin's own screen-cast interfaces.
+
 ### Video Codec Selection
 1. **AV1 (Primary):**
    - Supported natively by modern host GPUs (NVIDIA RTX 40/50 series, Intel Arc, AMD RDNA3) and decoded in hardware by the Meta Quest 3's Snapdragon XR2 Gen 2 processor.

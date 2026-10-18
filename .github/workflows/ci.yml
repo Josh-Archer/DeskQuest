@@ -69,5 +69,13 @@ jobs:
           cargo clippy -p linux-quest-host --all-targets --features tray -- -D warnings
           cargo test -p linux-quest-host --features tray --lib tray
 
+      - name: Lint and test PipeWire screen capture feature
+        # Builds the pipewire crate against the distro libpipewire (bindgen needs libclang).
+        # The default build above needs none of this; only this feature does.
+        run: |
+          sudo apt-get install --no-install-recommends -y pkg-config libpipewire-0.3-dev libclang-dev
+          cargo clippy -p linux-quest-capture --all-targets --features pipewire-screencast -- -D warnings
+          cargo test -p linux-quest-capture --features pipewire-screencast --lib
+
       - name: Verify workspace documentation builds cleanly
         run: cargo doc --workspace --no-deps
