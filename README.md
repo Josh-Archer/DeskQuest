@@ -175,6 +175,14 @@ When `/dev/uinput` is unavailable or permissions are not yet configured, the hos
 - **Loop-Free Synchronization:** Origin tracking and monotonic versions resolve race conditions via deterministic last-writer ordering while suppressing echo loops.
 - **Large Text Chunking:** Safe slicing on UTF-8 character boundaries for payloads up to 4 MiB carried over the reliable control channel.
 
+## 🔒 QUIC Control Channel
+
+The transport crate has an optional QUIC control channel (`linux-quest-transport/quic`). It carries the existing framed control messages, including handshakes, heartbeat/telemetry and chunked clipboard data, over one reliable bidirectional stream. QUIC is opt-in so default workspace builds do not add QUIC/TLS dependencies; it requires no system libraries.
+
+The host and client authenticate each other with TLS 1.3 certificates pinned by SHA-256 fingerprint. The application must provision and persist the host/client identities and exchange fingerprints over a trusted channel; this transport crate does not provide pairing or a trust store. Do not accept an authentication failure as a reason to downgrade. `ControlClientSession::connect_with_tcp_fallback` falls back to the existing TCP control channel only for connection failures and supports reconnecting the selected transport. The caller must run both the `QuicControlServer` and existing TCP listener for fallback. The host daemon and Quest client still select TCP directly until identity provisioning and pairing are wired into their configuration.
+
+Run the QUIC loopback coverage with `cargo test -p linux-quest-transport --features quic --test quic_control_loopback`. The ignored release benchmark compares sequential loopback heartbeat round trips with QUIC and TCP; it measures framing/transport overhead on one machine, not Wi-Fi or headset latency. One release run on the development host measured TCP p50/p99 at 5.6/6.5 µs and QUIC at 14.1/21.8 µs (5,000 warmed samples each). This shows about 8.5 µs additional median loopback RTT for QUIC; network conditions and TLS setup will change real-session results. Run it with `cargo test -p linux-quest-transport --release --features quic --test quic_control_loopback -- --ignored --nocapture quic_vs_tcp`.
+
 ---
 
 ## 🗺️ Roadmap & Milestones
@@ -183,7 +191,7 @@ The project is structured into 7 core phases. Status reflects what is merged on 
 
 - [x] **Phase 1:** Foundation & Architecture (Cargo workspace, zero-copy binary protocol, telemetry, CI)
 - [~] **Phase 2:** Linux Capture & Hardware Encoding Engine (PipeWire DMA-BUF capture, NVENC AV1/HEVC with intra-refresh and reference picture invalidation done; VA-API backend for AMD/Intel implemented as an unverified scaffold (HEVC and H.264 encode, rolling intra refresh, RGB-to-NV12 via VPP; AV1 and crate-written HEVC parameter sets are off unless opted in with `LINUX_QUEST_VAAPI_AV1=1` / `LINUX_QUEST_VAAPI_PACKED_HEADERS=1`), never run on a GPU, see `crates/encoder/src/vaapi.rs`; select with `LINUX_QUEST_VIDEO_ENCODER=nvenc|vaapi|mock` or `linux-quest-host daemon --encoder auto|nvenc|vaapi|mock`)
-- [~] **Phase 3:** Low-Latency Network & USB Transport (paced UDP, Reed-Solomon/XOR FEC, ADB reverse tunnel done; QUIC control channel and mDNS/SSDP LAN discovery pending)
+- [~] **Phase 3:** Low-Latency Network & USB Transport (paced UDP, Reed-Solomon/XOR FEC, ADB reverse tunnel and optional QUIC control channel done; mDNS/SSDP LAN discovery pending; QUIC identity pairing is not yet wired into the host/client application configuration)
 - [x] **Phase 4:** Meta Quest OpenXR Client & Hardware Decoder (AMediaCodec, Vulkan, Composition Layers)
 - [~] **Phase 5:** Virtual Multi-Monitor Management on Linux (wlroots, Mutter and X11 backends with dynamic EDID done; EVDI kernel dummy-driver fallback implemented but never run against real EVDI, see #31)
 - [x] **Phase 6:** Spatial Workspace, Passthrough & Input Redirection (6DoF screens, passthrough, controller/hand manipulation, uinput injection, clipboard sync)

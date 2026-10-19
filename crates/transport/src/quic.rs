@@ -74,7 +74,7 @@
 //! - Reconnect is explicit. When the control channel returns [`ControlError::ConnectionClosed`],
 //!   call [`QuicControlSession::reconnect`] to dial the same address with the same pin again.
 
-use crate::control::{ControlChannel, ControlError};
+use crate::control::{ControlChannel, ControlError, ControlMessage};
 use parking_lot::RwLock;
 use quinn::rustls;
 use quinn::rustls::client::danger::{
@@ -94,6 +94,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::TcpStream;
 
 /// ALPN protocol identifier for the control channel.
 pub const QUIC_ALPN: &[u8] = b"linux-quest-control/1";
@@ -171,6 +173,13 @@ pub enum QuicError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("QUIC connection failed ({quic}); TCP fallback failed: {tcp}")]
+    TcpFallback {
+        quic: String,
+        #[source]
+        tcp: std::io::Error,
+    },
 
     #[error("Control channel error: {0}")]
     Control(#[from] ControlError),
@@ -638,9 +647,9 @@ fn map_connection_error(err: quinn::ConnectionError, server_side: bool) -> QuicE
         return QuicError::Connection(err);
     }
     let alert = code - 0x100;
-    // access_denied, bad/unknown/unsupported certificate, decrypt_error (bad CertificateVerify
-    // signature) and certificate_required (no certificate sent).
-    if !matches!(alert, 49 | 42 | 46 | 43 | 51 | 116) {
+    // access_denied, bad/unknown/unsupported certificate (including unknown_ca), decrypt_error
+    // (bad CertificateVerify signature) and certificate_required (no certificate sent).
+    if !matches!(alert, 49 | 42 | 46 | 48 | 43 | 51 | 116) {
         return QuicError::Connection(err);
     }
     let what = if server_side {
@@ -668,6 +677,102 @@ pub struct QuicControlSession {
     dial: Option<Dial>,
     /// Fingerprint of the authenticated client certificate. Set on the host side only.
     client_fingerprint: Option<Fingerprint>,
+}
+
+/// Client control session that prefers pinned QUIC and can use the legacy TCP control channel.
+///
+/// TCP fallback is attempted for connection failures only. Certificate, pin, and identity errors
+/// are returned directly so a failed authentication cannot silently downgrade to plaintext TCP.
+pub enum ControlClientSession {
+    Quic(Box<QuicControlSession>),
+    Tcp {
+        remote: SocketAddr,
+        control: ControlChannel<OwnedReadHalf, OwnedWriteHalf>,
+    },
+}
+
+impl ControlClientSession {
+    /// Connects over pinned QUIC, falling back to the existing TCP control channel when QUIC is
+    /// unavailable. The host must expose both listeners for fallback to work.
+    pub async fn connect_with_tcp_fallback(
+        quic_remote: SocketAddr,
+        tcp_remote: SocketAddr,
+        expected: Fingerprint,
+        identity: &ClientIdentity,
+    ) -> Result<Self, QuicError> {
+        match QuicControlSession::connect(quic_remote, expected, identity).await {
+            Ok(session) => Ok(Self::Quic(Box::new(session))),
+            Err(err) if is_authentication_error(&err) => Err(err),
+            Err(quic_error) => {
+                let stream =
+                    TcpStream::connect(tcp_remote)
+                        .await
+                        .map_err(|tcp| QuicError::TcpFallback {
+                            quic: quic_error.to_string(),
+                            tcp,
+                        })?;
+                stream.set_nodelay(true)?;
+                let (reader, writer) = stream.into_split();
+                Ok(Self::Tcp {
+                    remote: tcp_remote,
+                    control: ControlChannel::new(reader, writer),
+                })
+            }
+        }
+    }
+
+    /// Sends one message using the selected control transport.
+    pub async fn send_message(&mut self, message: &ControlMessage) -> Result<(), ControlError> {
+        match self {
+            Self::Quic(session) => session.control.send_message(message).await,
+            Self::Tcp { control, .. } => control.send_message(message).await,
+        }
+    }
+
+    /// Receives one message using the selected control transport.
+    pub async fn recv_message(&mut self) -> Result<ControlMessage, ControlError> {
+        match self {
+            Self::Quic(session) => session.control.recv_message().await,
+            Self::Tcp { control, .. } => control.recv_message().await,
+        }
+    }
+
+    /// True when this session is using QUIC rather than the TCP fallback.
+    pub fn is_quic(&self) -> bool {
+        matches!(self, Self::Quic(_))
+    }
+
+    /// Reconnects the selected transport. QUIC preserves its pin and client identity.
+    pub async fn reconnect(&mut self) -> Result<(), QuicError> {
+        match self {
+            Self::Quic(session) => session.reconnect().await,
+            Self::Tcp { remote, control } => {
+                let stream = TcpStream::connect(*remote).await?;
+                stream.set_nodelay(true)?;
+                let (reader, writer) = stream.into_split();
+                *control = ControlChannel::new(reader, writer);
+                Ok(())
+            }
+        }
+    }
+}
+
+fn is_authentication_error(error: &QuicError) -> bool {
+    match error {
+        QuicError::Tls(_)
+        | QuicError::Unauthorized(_)
+        | QuicError::InvalidFingerprint(_)
+        | QuicError::InvalidIdentity(_)
+        | QuicError::Certificate(_)
+        | QuicError::Config(_) => true,
+        QuicError::Connection(quinn::ConnectionError::TransportError(te)) => {
+            (0x100..0x200).contains(&u64::from(te.code))
+        }
+        QuicError::Connection(quinn::ConnectionError::ConnectionClosed(close)) => {
+            (0x100..0x200).contains(&u64::from(close.error_code))
+        }
+        _ => false,
+    }
 }
 
 impl QuicControlSession {

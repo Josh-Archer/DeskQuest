@@ -39,8 +39,8 @@ pub use jitter_buffer::{AdaptiveJitterBuffer, JitterBufferConfig, JitterBufferSt
 pub use pacing::PacketPacer;
 #[cfg(feature = "quic")]
 pub use quic::{
-    AuthorizedClients, ClientIdentity, Fingerprint, HostIdentity, QuicControl, QuicControlServer,
-    QuicControlSession, QuicError,
+    AuthorizedClients, ClientIdentity, ControlClientSession, Fingerprint, HostIdentity,
+    QuicControl, QuicControlServer, QuicControlSession, QuicError,
 };
 pub use tcp::TcpEndpoint;
 pub use udp::{PacedUdpEndpoint, DEFAULT_UDP_MTU};
