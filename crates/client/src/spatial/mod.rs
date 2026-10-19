@@ -8,7 +8,7 @@ pub mod pose;
 pub mod ray;
 pub mod transform;
 
-pub use grab::{GrabSession, GrabStateMachine, InteractionEvent, InteractionState};
+pub use grab::{GrabSession, GrabStateMachine, InteractionEvent, InteractionState, TwoHandScale};
 pub use interaction::{
     ControllerInputState, HandGestureDetector, HandGestureState, HandJoint, HandJointData,
     HandTrackingData, Handedness, InteractionInput, InteractionSource,
