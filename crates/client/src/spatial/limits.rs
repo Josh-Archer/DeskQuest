@@ -57,6 +57,9 @@ pub const MIN_SCREEN_HEIGHT_M: f32 = 0.1;
 /// Maximum physical screen height in meters (3.0m).
 pub const MAX_SCREEN_HEIGHT_M: f32 = 3.0;
 
+/// Minimum distance in meters between two grabbing hands or controllers before a two-handed scale starts (5 cm).
+pub const MIN_TWO_HAND_SEPARATION_M: f32 = 0.05;
+
 /// Minimum aspect ratio (0.25).
 pub const MIN_ASPECT_RATIO: f32 = 0.25;
 
@@ -113,4 +116,32 @@ pub fn clamp_aspect_ratio(aspect: f32) -> f32 {
 /// Clamps height to [MIN_HEIGHT_M, MAX_HEIGHT_M].
 pub fn clamp_height(y: f32) -> f32 {
     y.clamp(MIN_HEIGHT_M, MAX_HEIGHT_M)
+}
+
+/// Clamps a uniform scale factor so that a scaled flat quad stays within the width and height limits.
+///
+/// `width` and `height` are the size the factor is applied to. Returns 1.0 if no valid range exists.
+pub fn clamp_uniform_scale(factor: f32, width: f32, height: f32) -> f32 {
+    let lo = (MIN_SCREEN_WIDTH_M / width).max(MIN_SCREEN_HEIGHT_M / height);
+    let hi = (MAX_SCREEN_WIDTH_M / width).min(MAX_SCREEN_HEIGHT_M / height);
+    clamp_factor_to(factor, lo, hi)
+}
+
+/// Clamps a uniform scale factor so that a scaled curved cylinder radius stays within its limits.
+///
+/// Returns 1.0 if the base radius is outside the limits (no valid range exists).
+pub fn clamp_radius_scale(factor: f32, curve_radius: f32) -> f32 {
+    clamp_factor_to(
+        factor,
+        MIN_CURVE_RADIUS_M / curve_radius,
+        MAX_CURVE_RADIUS_M / curve_radius,
+    )
+}
+
+fn clamp_factor_to(factor: f32, lo: f32, hi: f32) -> f32 {
+    if lo.is_finite() && hi.is_finite() && lo <= hi {
+        factor.clamp(lo, hi)
+    } else {
+        1.0
+    }
 }

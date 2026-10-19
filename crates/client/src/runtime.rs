@@ -296,7 +296,23 @@ impl QuestClientRuntime {
         };
 
         if let Some(input) = selected_input {
-            if let Some(event) = self.step_interaction(&input, dt_seconds) {
+            // The other hand or controller joins a grab in progress for two-handed scaling
+            let secondary_input = match self.interaction_state_machine.state() {
+                InteractionState::Grabbing(session) => candidate_inputs
+                    .iter()
+                    .filter_map(|opt| opt.as_ref())
+                    .find(|inp| {
+                        inp.is_grabbing
+                            && inp.grab_pose.is_some()
+                            && inp.source != session.source
+                            && inp.source.handedness() != session.source.handedness()
+                    })
+                    .copied(),
+                _ => None,
+            };
+            if let Some(event) =
+                self.step_interaction_two(&input, secondary_input.as_ref(), dt_seconds)
+            {
                 log_interaction_event(&event);
             }
         }
@@ -635,10 +651,21 @@ impl QuestClientRuntime {
         input: &InteractionInput,
         dt_seconds: f32,
     ) -> Option<InteractionEvent> {
+        self.step_interaction_two(input, None, dt_seconds)
+    }
+
+    /// Like `step_interaction`, with an optional grabbing input from the other hand or controller
+    /// that enables two-handed scaling of the screen during an active grab.
+    pub fn step_interaction_two(
+        &mut self,
+        input: &InteractionInput,
+        secondary: Option<&InteractionInput>,
+        dt_seconds: f32,
+    ) -> Option<InteractionEvent> {
         let screens = vec![(0, &self.screen_transform)];
         let event = self
             .interaction_state_machine
-            .update(input, screens, dt_seconds);
+            .update_two(input, secondary, screens, dt_seconds);
 
         if let Some(ref ev) = event {
             match ev {

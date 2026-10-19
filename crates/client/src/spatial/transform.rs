@@ -222,6 +222,28 @@ impl ScreenTransform {
         self.quad_size = clamp_screen_size(width, height);
     }
 
+    /// Uniformly scales the screen relative to `base` by `factor`, preserving aspect ratio.
+    ///
+    /// Scales the size used by the active display mode: the flat quad width and height, or the
+    /// curved cylinder radius (which scales the arc width and height at a fixed central angle).
+    /// The factor is clamped to the size limits. Returns the factor actually applied.
+    pub fn set_uniform_scale_from(&mut self, base: &ScreenTransform, factor: f32) -> f32 {
+        let applied = match base.display_mode {
+            DisplayMode::FlatQuad => {
+                let applied = clamp_uniform_scale(factor, base.quad_size.0, base.quad_size.1);
+                self.quad_size = (base.quad_size.0 * applied, base.quad_size.1 * applied);
+                applied
+            }
+            DisplayMode::CurvedCylinder => {
+                let applied = clamp_radius_scale(factor, base.curve_radius);
+                self.curve_radius = base.curve_radius * applied;
+                applied
+            }
+        };
+        self.clamp();
+        applied
+    }
+
     /// Sets the cylinder aspect ratio, clamped to comfortable ranges.
     pub fn set_aspect_ratio(&mut self, aspect: f32) {
         self.aspect_ratio = clamp_aspect_ratio(aspect);
