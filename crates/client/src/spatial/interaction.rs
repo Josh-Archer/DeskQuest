@@ -488,6 +488,40 @@ mod tests {
     }
 
     #[test]
+    fn test_pinch_jitter_around_start_threshold_does_not_flicker() {
+        let mut detector = HandGestureDetector::new();
+        let mut data = HandTrackingData {
+            is_active: true,
+            ..Default::default()
+        };
+        data.joint_mut(HandJoint::ThumbTip).position = Vec3::new(0.0, 0.0, 0.0);
+
+        // Fingers open at 26 mm: not pinched yet
+        data.joint_mut(HandJoint::IndexTip).position = Vec3::new(0.026, 0.0, 0.0);
+        assert!(!detector.update(Handedness::Right, &data).is_pinching);
+
+        // Crossing below the 25 mm start threshold pinches once
+        data.joint_mut(HandJoint::IndexTip).position = Vec3::new(0.024, 0.0, 0.0);
+        assert!(detector.update(Handedness::Right, &data).is_pinching);
+
+        // Distance jitters around the start threshold, between 22 mm and 31 mm:
+        // the 40 mm release threshold keeps the pinch on for every sample
+        for mm in [
+            0.026, 0.024, 0.027, 0.023, 0.025, 0.031, 0.022, 0.029, 0.024, 0.026,
+        ] {
+            data.joint_mut(HandJoint::IndexTip).position = Vec3::new(mm, 0.0, 0.0);
+            assert!(
+                detector.update(Handedness::Right, &data).is_pinching,
+                "pinch flickered off at {mm} m"
+            );
+        }
+
+        // Only opening past the 40 mm release threshold ends the pinch
+        data.joint_mut(HandJoint::IndexTip).position = Vec3::new(0.041, 0.0, 0.0);
+        assert!(!detector.update(Handedness::Right, &data).is_pinching);
+    }
+
+    #[test]
     fn test_unified_interaction_input_conversion() {
         let ctrl_state = ControllerInputState {
             aim_pose: Some(ScreenPose::IDENTITY),
