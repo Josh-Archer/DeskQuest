@@ -12,8 +12,8 @@ use linux_quest_protocol::{
 };
 use linux_quest_transport::quic::{QUIC_KEEP_ALIVE_INTERVAL, QUIC_MAX_IDLE_TIMEOUT};
 use linux_quest_transport::{
-    AuthorizedClients, ClientIdentity, ControlChannel, ControlError, ControlMessage, Fingerprint,
-    HostIdentity, QuicControlServer, QuicControlSession,
+    AuthorizedClients, ClientIdentity, ControlChannel, ControlClientSession, ControlError,
+    ControlMessage, Fingerprint, HostIdentity, QuicControlServer, QuicControlSession,
 };
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -175,6 +175,37 @@ async fn connect_rejects_certificate_that_does_not_match_pin() {
 }
 
 #[tokio::test]
+async fn tcp_fallback_does_not_bypass_a_quic_pin_failure() {
+    let h = harness();
+    let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tcp_addr = tcp_listener.local_addr().unwrap();
+    let wrong_pin = Fingerprint::of_der(b"not the host certificate");
+
+    let (dial, _accept) = tokio::time::timeout(TEST_TIMEOUT, async {
+        tokio::join!(
+            ControlClientSession::connect_with_tcp_fallback(h.addr, tcp_addr, wrong_pin, &h.client),
+            h.server.accept()
+        )
+    })
+    .await
+    .expect("pin failure should be surfaced promptly");
+    let err = match dial {
+        Ok(_) => panic!("a wrong pin must fail rather than fall back"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("pinned fingerprint"),
+        "expected a pinned fingerprint failure, got: {err}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), tcp_listener.accept())
+            .await
+            .is_err(),
+        "authentication failure must not fall back to TCP"
+    );
+}
+
+#[tokio::test]
 async fn reconnect_after_host_drops_session() {
     let h = harness();
     let (mut client, server) = open_session(&h, &heartbeat(1)).await;
@@ -208,6 +239,38 @@ async fn reconnect_after_host_drops_session() {
     assert_eq!(server2.control.recv_message().await.unwrap(), heartbeat(2));
     server2.control.send_message(&heartbeat(3)).await.unwrap();
     assert_eq!(client.control.recv_message().await.unwrap(), heartbeat(3));
+}
+
+#[tokio::test]
+async fn tcp_fallback_round_trip_when_quic_is_unavailable() {
+    let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tcp_addr = tcp_listener.local_addr().unwrap();
+    let quic_addr = std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let identity = ClientIdentity::generate().unwrap();
+    let host_identity = HostIdentity::generate().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = tcp_listener.accept().await.unwrap();
+        let (reader, writer) = stream.into_split();
+        let mut control = ControlChannel::new(reader, writer);
+        assert_eq!(control.recv_message().await.unwrap(), heartbeat(29));
+        control.send_message(&heartbeat(30)).await.unwrap();
+    });
+
+    let mut client = ControlClientSession::connect_with_tcp_fallback(
+        quic_addr,
+        tcp_addr,
+        host_identity.fingerprint(),
+        &identity,
+    )
+    .await
+    .expect("unavailable QUIC should use the legacy TCP control listener");
+    assert!(!client.is_quic());
+    client.send_message(&heartbeat(29)).await.unwrap();
+    assert_eq!(client.recv_message().await.unwrap(), heartbeat(30));
+    server.await.unwrap();
 }
 
 #[tokio::test]
@@ -317,8 +380,8 @@ fn summarize(name: &str, mut samples: Vec<Duration>) {
     );
 }
 
-/// TCP control channel as `ControlChannel::create_connected_pair` builds it (Nagle enabled),
-/// which matches the host's accept path today.
+/// TCP control channel as `ControlChannel::create_connected_pair` builds it, with TCP_NODELAY on,
+/// which matches the host's accepted control sockets today.
 async fn tcp_pair_as_shipped() -> (
     ControlChannel<tokio::net::tcp::OwnedReadHalf, tokio::net::tcp::OwnedWriteHalf>,
     ControlChannel<tokio::net::tcp::OwnedReadHalf, tokio::net::tcp::OwnedWriteHalf>,
@@ -326,7 +389,7 @@ async fn tcp_pair_as_shipped() -> (
     ControlChannel::create_connected_pair().await.unwrap()
 }
 
-/// Same TCP channel with `TCP_NODELAY` set on both ends, to separate Nagle stalls from transport cost.
+/// Direct TCP pair with `TCP_NODELAY` set on both ends, as a socket setup sanity comparator.
 async fn tcp_pair_nodelay() -> (
     ControlChannel<tokio::net::tcp::OwnedReadHalf, tokio::net::tcp::OwnedWriteHalf>,
     ControlChannel<tokio::net::tcp::OwnedReadHalf, tokio::net::tcp::OwnedWriteHalf>,
@@ -372,5 +435,5 @@ async fn quic_vs_tcp_control_round_trip_latency() {
     summarize("tcp*", tcp_shipped);
     summarize("tcp-nd", tcp_nodelay);
     summarize("quic", quic);
-    println!("* tcp = ControlChannel::create_connected_pair as shipped (Nagle on); tcp-nd = TCP_NODELAY on both ends");
+    println!("* tcp = ControlChannel::create_connected_pair (TCP_NODELAY on); tcp-nd = direct TCP pair with TCP_NODELAY on both ends");
 }
