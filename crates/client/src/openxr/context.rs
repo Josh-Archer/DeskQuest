@@ -30,6 +30,77 @@ use crate::openxr::refresh_rate::RefreshRateManager;
 use crate::spatial::interaction::{HandTrackingData, Handedness};
 use crate::spatial::ScreenTransform;
 
+/// A small RGBA swapchain for one overlay texture (ray, cursor or border).
+struct OverlaySwapchain {
+    swapchain: Swapchain<Vulkan>,
+    images: Vec<vk::Image>,
+    size: (u32, u32),
+}
+
+impl OverlaySwapchain {
+    fn create(session: &Session<Vulkan>, format: u32, size: (u32, u32)) -> ClientResult<Self> {
+        let info = SwapchainCreateInfo {
+            create_flags: SwapchainCreateFlags::EMPTY,
+            usage_flags: SwapchainUsageFlags::COLOR_ATTACHMENT
+                | SwapchainUsageFlags::SAMPLED
+                | SwapchainUsageFlags::TRANSFER_DST,
+            format,
+            sample_count: 1,
+            width: size.0,
+            height: size.1,
+            face_count: 1,
+            array_size: 1,
+            mip_count: 1,
+        };
+        let swapchain = session.create_swapchain(&info).map_err(|e| {
+            ClientError::OpenXr(format!("Failed to create overlay swapchain: {e:?}"))
+        })?;
+        let images = swapchain
+            .enumerate_images()
+            .map(|imgs| {
+                imgs.into_iter()
+                    .map(|raw| vk::Image::from_raw(raw as _))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Self {
+            swapchain,
+            images,
+            size,
+        })
+    }
+
+    /// Uploads `rgba` into the next image. False if the image could not be filled this frame.
+    fn upload(&mut self, vulkan: &VulkanContext, rgba: &[u8]) -> bool {
+        let Ok(idx) = self.swapchain.acquire_image() else {
+            return false;
+        };
+        let waited = self
+            .swapchain
+            .wait_image(openxr::Duration::INFINITE)
+            .is_ok();
+        let uploaded = waited
+            && self.images.get(idx as usize).is_some_and(|&img| {
+                vulkan
+                    .upload_rgba_to_image(img, self.size.0, self.size.1, rgba)
+                    .is_ok()
+            });
+        let released = self.swapchain.release_image().is_ok();
+        uploaded && released
+    }
+}
+
+/// Swapchains and cached textures for pointers and the screen border.
+struct OverlaySwapchains {
+    ray: OverlaySwapchain,
+    cursor: OverlaySwapchain,
+    border: OverlaySwapchain,
+    ray_rgba: Vec<u8>,
+    cursor_rgba: Vec<u8>,
+    /// Border texture and the screen share (`inner`) it was drawn for.
+    border_rgba: Option<((f32, f32), Vec<u8>)>,
+}
+
 /// OpenXR application runtime context managing instance, session, and swapchains.
 pub struct OpenXrContext {
     instance: Option<Instance>,
@@ -42,6 +113,7 @@ pub struct OpenXrContext {
     desktop_swapchain: Option<Swapchain<Vulkan>>,
     hud_swapchain: Option<Swapchain<Vulkan>>,
     hud_images: Vec<vk::Image>,
+    overlay_swapchains: Option<OverlaySwapchains>,
     #[cfg(target_os = "android")]
     surface_window: Option<ndk::native_window::NativeWindow>,
     #[cfg(target_os = "android")]
@@ -82,6 +154,7 @@ impl OpenXrContext {
             desktop_swapchain: None,
             hud_swapchain: None,
             hud_images: Vec::new(),
+            overlay_swapchains: None,
             #[cfg(target_os = "android")]
             surface_window: None,
             #[cfg(target_os = "android")]
@@ -501,6 +574,7 @@ impl OpenXrContext {
             desktop_swapchain: None,
             hud_swapchain: None,
             hud_images: Vec::new(),
+            overlay_swapchains: None,
             #[cfg(target_os = "android")]
             surface_window: None,
             #[cfg(target_os = "android")]
@@ -698,6 +772,22 @@ impl OpenXrContext {
         }
         self.hud_swapchain = Some(hud_swapchain);
         self.hud_images = hud_images;
+        // Pointers and border are optional: without them the desktop still works.
+        let overlay = (|| -> ClientResult<OverlaySwapchains> {
+            use crate::openxr::overlay::*;
+            Ok(OverlaySwapchains {
+                ray: OverlaySwapchain::create(&session, swapchain_format, RAY_TEXTURE)?,
+                cursor: OverlaySwapchain::create(&session, swapchain_format, CURSOR_TEXTURE)?,
+                border: OverlaySwapchain::create(&session, swapchain_format, BORDER_TEXTURE)?,
+                ray_rgba: ray_rgba(),
+                cursor_rgba: cursor_rgba(),
+                border_rgba: None,
+            })
+        })();
+        match overlay {
+            Ok(o) => self.overlay_swapchains = Some(o),
+            Err(e) => tracing::warn!(error = ?e, "pointer and border overlays unavailable"),
+        }
         self.swapchains_created = true;
         Ok(())
     }
@@ -980,6 +1070,7 @@ impl OpenXrContext {
         config: &ClientConfig,
         vulkan_context: &VulkanContext,
         hud_rgba: Option<&[u8]>,
+        overlay: &crate::openxr::overlay::OverlayScene,
     ) -> ClientResult<()> {
         if self.is_simulated {
             return Ok(());
@@ -1076,9 +1167,130 @@ impl OpenXrContext {
                 None
             };
 
-            let mut layers: Vec<&CompositionLayerBase<'_, Vulkan>> = Vec::with_capacity(3);
+            // Pointers and border: upload what is drawn this frame, then build its layers.
+            use crate::openxr::overlay::{
+                cursor_pose, ray_quad_pose, BORDER_MARGIN_M, BORDER_TEXTURE, CURSOR_SIZE_M,
+                CURSOR_TEXTURE, RAY_TEXTURE, RAY_WIDTH_M,
+            };
+            let mut border_cfg = desktop_cfg.clone();
+            let border_inner = if desktop_cfg.mode == crate::config::DisplayMode::CurvedCylinder {
+                let r = desktop_cfg.cylinder_radius.max(0.1);
+                let w = r * desktop_cfg.cylinder_central_angle;
+                let h = w / desktop_cfg.cylinder_aspect_ratio.max(0.1);
+                let (bw, bh) = (w + 2.0 * BORDER_MARGIN_M, h + 2.0 * BORDER_MARGIN_M);
+                border_cfg.cylinder_central_angle = bw / r;
+                border_cfg.cylinder_aspect_ratio = bw / bh;
+                (w / bw, h / bh)
+            } else {
+                let (w, h) = desktop_cfg.quad_size;
+                let (bw, bh) = (w + 2.0 * BORDER_MARGIN_M, h + 2.0 * BORDER_MARGIN_M);
+                border_cfg.quad_size = (bw, bh);
+                (w / bw, h / bh)
+            };
+            let (mut rays_ok, mut cursor_ok, mut border_ok) = (false, false, false);
+            if let Some(o) = &mut self.overlay_swapchains {
+                if !overlay.pointers.is_empty() {
+                    rays_ok = o.ray.upload(vulkan_context, &o.ray_rgba);
+                    if overlay.pointers.iter().any(|p| p.hit) {
+                        cursor_ok = o.cursor.upload(vulkan_context, &o.cursor_rgba);
+                    }
+                }
+                if overlay.border {
+                    let stale = o.border_rgba.as_ref().is_none_or(|(inner, _)| {
+                        (inner.0 - border_inner.0).abs() > 0.005
+                            || (inner.1 - border_inner.1).abs() > 0.005
+                    });
+                    if stale {
+                        o.border_rgba = Some((
+                            border_inner,
+                            crate::openxr::overlay::border_rgba(border_inner),
+                        ));
+                    }
+                    if let Some((_, rgba)) = &o.border_rgba {
+                        border_ok = o.border.upload(vulkan_context, rgba);
+                    }
+                }
+            }
+            let eye = self
+                .view_space
+                .as_ref()
+                .and_then(|v| v.locate(space, display_time).ok())
+                .filter(|l| {
+                    l.location_flags
+                        .contains(openxr::SpaceLocationFlags::POSITION_VALID)
+                })
+                .map(|l| crate::spatial::Vec3::from(l.pose.position))
+                .unwrap_or(crate::spatial::Vec3::new(0.0, 1.6, 0.0));
+            let ov = self.overlay_swapchains.as_ref();
+            let mut pointer_layers = Vec::new();
+            if let Some(o) = ov.filter(|_| rays_ok) {
+                for p in &overlay.pointers {
+                    pointer_layers.push(crate::openxr::layers::build_overlay_quad(
+                        space,
+                        &o.ray.swapchain,
+                        RAY_TEXTURE,
+                        openxr::Posef::from(ray_quad_pose(p, eye)),
+                        (RAY_WIDTH_M, p.length.max(0.01)),
+                    ));
+                }
+            }
+            if let Some(o) = ov.filter(|_| cursor_ok) {
+                for p in overlay.pointers.iter().filter(|p| p.hit) {
+                    pointer_layers.push(crate::openxr::layers::build_overlay_quad(
+                        space,
+                        &o.cursor.swapchain,
+                        CURSOR_TEXTURE,
+                        openxr::Posef::from(cursor_pose(p)),
+                        (CURSOR_SIZE_M, CURSOR_SIZE_M),
+                    ));
+                }
+            }
+            let border_quad = ov.filter(|_| {
+                border_ok && desktop_cfg.mode != crate::config::DisplayMode::CurvedCylinder
+            });
+            let border_quad = border_quad.map(|o| {
+                let mut raw = crate::openxr::layers::build_quad_layer(
+                    space,
+                    &o.border.swapchain,
+                    BORDER_TEXTURE.0,
+                    BORDER_TEXTURE.1,
+                    &border_cfg,
+                )
+                .into_raw();
+                raw.layer_flags = openxr::sys::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA;
+                unsafe { openxr::CompositionLayerQuad::from_raw(raw) }
+            });
+            let border_cyl = ov
+                .filter(|_| {
+                    border_ok
+                        && self.supports_cylinder
+                        && desktop_cfg.mode == crate::config::DisplayMode::CurvedCylinder
+                })
+                .map(|o| {
+                    let mut raw = crate::openxr::layers::build_cylinder_layer(
+                        space,
+                        &o.border.swapchain,
+                        BORDER_TEXTURE.0,
+                        BORDER_TEXTURE.1,
+                        &border_cfg,
+                    )
+                    .into_raw();
+                    raw.layer_flags =
+                        openxr::sys::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA;
+                    unsafe { openxr::CompositionLayerCylinderKHR::from_raw(raw) }
+                });
+
+            let mut layers: Vec<&CompositionLayerBase<'_, Vulkan>> =
+                Vec::with_capacity(4 + pointer_layers.len());
             if let Some(ref pt) = pt_layer {
                 layers.push(pt);
+            }
+            // Drawn before the desktop, so the screen covers the border's inner area.
+            if let Some(ref b) = border_quad {
+                layers.push(b);
+            }
+            if let Some(ref b) = border_cyl {
+                layers.push(b);
             }
 
             if self.supports_cylinder
@@ -1100,6 +1312,9 @@ impl OpenXrContext {
                 };
 
                 layers.push(&cyl_layer);
+                for l in &pointer_layers {
+                    layers.push(l);
+                }
                 if let Some(ref hud) = hud_layer {
                     layers.push(hud);
                 }
@@ -1123,6 +1338,9 @@ impl OpenXrContext {
                 };
 
                 layers.push(&quad_layer);
+                for l in &pointer_layers {
+                    layers.push(l);
+                }
                 if let Some(ref hud) = hud_layer {
                     layers.push(hud);
                 }
@@ -1246,7 +1464,13 @@ mod tests {
 
         let vk_ctx = VulkanContext::new_simulated();
         assert!(ctx
-            .render_and_present_layers(Time::from_nanos(1), &config, &vk_ctx, None)
+            .render_and_present_layers(
+                Time::from_nanos(1),
+                &config,
+                &vk_ctx,
+                None,
+                &Default::default()
+            )
             .is_ok());
 
         // Test passthrough in simulated context

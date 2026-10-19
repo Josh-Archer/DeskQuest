@@ -35,6 +35,7 @@ pub struct QuestClientRuntime {
     is_running: bool,
     swapchains_ready: bool,
     loss_recovery: crate::receiver::loss_recovery::LossRecovery,
+    overlay_scene: crate::openxr::overlay::OverlayScene,
     keyframe_requester: Option<Box<dyn Fn() + Send>>,
 }
 
@@ -123,6 +124,7 @@ impl QuestClientRuntime {
             is_running: true,
             swapchains_ready,
             loss_recovery: crate::receiver::loss_recovery::LossRecovery::new(),
+            overlay_scene: Default::default(),
             keyframe_requester: None,
         })
     }
@@ -258,19 +260,67 @@ impl QuestClientRuntime {
                 .map(|g| InteractionInput::from_hand(Handedness::Left, g)),
         ];
 
-        let selected_input = if let Some(src) = active_source {
-            candidate_inputs
-                .iter()
-                .filter_map(|opt| opt.as_ref())
-                .find(|inp| inp.source == src)
+        // One pointer per hand: the controller when it has a pose, else the tracked hand. A
+        // controller state exists even with no controller held, so inputs without a ray are
+        // ignored (otherwise the right controller would always win and hands never could).
+        let pointing: Vec<InteractionInput> = [
+            (&candidate_inputs[0], &candidate_inputs[1]),
+            (&candidate_inputs[2], &candidate_inputs[3]),
+        ]
+        .into_iter()
+        .filter_map(|(ctrl, hand)| {
+            ctrl.as_ref()
+                .filter(|i| i.aim_ray.is_some())
+                .or(hand.as_ref().filter(|i| i.aim_ray.is_some()))
                 .cloned()
-        } else {
-            candidate_inputs.into_iter().flatten().next()
+        })
+        .collect();
+        let hits: Vec<Option<crate::spatial::RayHit>> = pointing
+            .iter()
+            .map(|i| {
+                i.aim_ray
+                    .as_ref()
+                    .and_then(|r| self.screen_transform.intersect_ray(r))
+            })
+            .collect();
+
+        let selected_input = match active_source {
+            // A grab or hover in progress keeps its source.
+            Some(src) => pointing.iter().find(|inp| inp.source == src).cloned(),
+            None => pointing
+                .iter()
+                .zip(&hits)
+                .find(|(_, hit)| hit.is_some())
+                .map(|(i, _)| *i)
+                .or_else(|| pointing.first().cloned()),
         };
 
         if let Some(input) = selected_input {
-            let _ = self.step_interaction(&input, dt_seconds);
+            if let Some(event) = self.step_interaction(&input, dt_seconds) {
+                log_interaction_event(&event);
+            }
         }
+
+        let interaction_state = self.interaction_state_machine.state();
+        self.overlay_scene = crate::openxr::overlay::OverlayScene {
+            pointers: pointing
+                .iter()
+                .zip(&hits)
+                .filter_map(|(i, hit)| {
+                    let ray = i.aim_ray.as_ref()?;
+                    Some(crate::openxr::overlay::PointerVisual {
+                        origin: ray.origin,
+                        direction: ray.direction,
+                        length: hit
+                            .as_ref()
+                            .map_or(crate::openxr::overlay::RAY_MISS_LENGTH_M, |h| h.distance),
+                        hit: hit.is_some(),
+                    })
+                })
+                .collect(),
+            border: !matches!(interaction_state, InteractionState::Idle),
+            border_active: matches!(interaction_state, InteractionState::Grabbing(_)),
+        };
 
         // If OpenXR requests not to render (should_render == false), end frame with empty layers
         if !pacing.should_render {
@@ -352,6 +402,7 @@ impl QuestClientRuntime {
             &self.config,
             &self.vulkan_context,
             hud_rgba.as_deref(),
+            &self.overlay_scene,
         );
 
         if let Err(e) = present_res {
@@ -633,6 +684,14 @@ impl QuestClientRuntime {
     pub fn stop(&mut self) {
         self.is_running = false;
         let _ = self.decoder.flush();
+    }
+}
+
+/// Hover and grab transitions are rare and useful when checking input on a headset.
+fn log_interaction_event(event: &InteractionEvent) {
+    match event {
+        InteractionEvent::GrabUpdated { .. } => {}
+        other => tracing::info!(event = ?other, "screen interaction"),
     }
 }
 
