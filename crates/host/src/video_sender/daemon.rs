@@ -6,6 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use linux_quest_capture::{
     AutoCapture, CaptureBackendType, CaptureError, CaptureInfo, DisplayCapture, RawFrame,
+    ScreenCastError,
 };
 use linux_quest_encoder::{
     create_encoder, probe_backends, BackendKind, BackendPreference, EncodedFrame, EncoderConfig,
@@ -63,10 +64,55 @@ fn encode_geometry(info: Option<&CaptureInfo>, defaults: &EncoderConfig) -> (u32
     }
 }
 
+/// True when the capture ended (session closed, node removed) and `init` can start it again.
+fn capture_ended(e: &CaptureError) -> bool {
+    matches!(
+        e,
+        CaptureError::ScreenCast(ScreenCastError::SessionClosed | ScreenCastError::NodeRemoved)
+    )
+}
+
+/// True when restarting would only prompt the user again for something they refused.
+fn user_refused(e: &CaptureError) -> bool {
+    matches!(
+        e,
+        CaptureError::ScreenCast(ScreenCastError::UserCancelled | ScreenCastError::Denied(_))
+    )
+}
+
+/// Longest wait between attempts to restart an ended capture.
+const MAX_REOPEN_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[async_trait]
 impl<C: DisplayCapture + 'static> FrameSource for CaptureFrameSource<C> {
     async fn next_frame(&mut self) -> Result<RawFrame, CaptureError> {
-        self.capture.capture_frame().await
+        let err = match self.capture.capture_frame().await {
+            Ok(frame) => return Ok(frame),
+            Err(e) if capture_ended(&e) => e,
+            Err(e) => return Err(e),
+        };
+        // GNOME closes the screen-cast session when the screen locks, or when the user stops
+        // sharing. Start a new one (the stored restore token avoids a prompt) instead of
+        // ending video for good.
+        tracing::warn!(error = %err, "screen capture ended; restarting it");
+        let mut backoff = std::time::Duration::from_millis(500);
+        loop {
+            tokio::time::sleep(backoff).await;
+            match self.capture.init().await {
+                Ok(()) => {
+                    tracing::info!("screen capture restarted");
+                    return self.capture.capture_frame().await;
+                }
+                Err(e) if user_refused(&e) => {
+                    tracing::warn!(error = %e, "screen capture not restarted: the user declined");
+                    return Err(e);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, retry_in = ?backoff, "screen capture restart failed");
+                    backoff = (backoff * 2).min(MAX_REOPEN_BACKOFF);
+                }
+            }
+        }
     }
 }
 
@@ -273,5 +319,64 @@ mod tests {
             encode_geometry(None, &defaults),
             (defaults.width, defaults.height, defaults.fps)
         );
+    }
+
+    /// Ends after `frames_before_end` frames; `init` then succeeds or refuses.
+    struct EndingCapture {
+        frames_before_end: u32,
+        frames: u32,
+        inits: u32,
+        refuse_restart: bool,
+    }
+
+    #[async_trait]
+    impl DisplayCapture for EndingCapture {
+        async fn init(&mut self) -> Result<(), CaptureError> {
+            self.inits += 1;
+            if self.inits > 1 && self.refuse_restart {
+                return Err(ScreenCastError::UserCancelled.into());
+            }
+            self.frames = 0;
+            Ok(())
+        }
+        async fn capture_frame(&mut self) -> Result<RawFrame, CaptureError> {
+            if self.frames >= self.frames_before_end {
+                return Err(ScreenCastError::SessionClosed.into());
+            }
+            self.frames += 1;
+            SyntheticCapture::new(0, 16, 16, 1000).capture_frame().await
+        }
+        fn backend_type(&self) -> CaptureBackendType {
+            CaptureBackendType::PipeWire
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_ended_capture_is_restarted() {
+        let capture = EndingCapture {
+            frames_before_end: 1,
+            frames: 0,
+            inits: 0,
+            refuse_restart: false,
+        };
+        let mut source = CaptureFrameSource::open(capture, false).await.unwrap();
+        assert!(source.next_frame().await.is_ok());
+        // The session closes; the source restarts it and keeps delivering frames.
+        assert!(source.next_frame().await.is_ok());
+        assert_eq!(source.capture.inits, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_restart_is_not_retried() {
+        let capture = EndingCapture {
+            frames_before_end: 0,
+            frames: 0,
+            inits: 0,
+            refuse_restart: true,
+        };
+        let mut source = CaptureFrameSource::open(capture, false).await.unwrap();
+        let err = source.next_frame().await.unwrap_err();
+        assert!(user_refused(&err), "{err}");
+        assert_eq!(source.capture.inits, 2, "exactly one restart attempt");
     }
 }
