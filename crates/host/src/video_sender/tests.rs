@@ -971,10 +971,10 @@ async fn client_keyframe_requests_force_an_idr_and_are_rate_limited() {
     let encoder = ScriptedEncoder::new(vec![2400], 100);
     let key_requests = encoder.key_requests.clone();
     let keyframes = encoder.keyframes.clone();
-    let flag = Arc::new(AtomicBool::new(false));
+    let flags = KeyframeRequests::new();
     let config = VideoSenderConfig {
         pacing_fraction: 0.0,
-        keyframe_requests: Some(flag.clone()),
+        keyframe_requests: Some(flags.clone()),
         ..config_to(48441)
     };
     let handle = spawn_video_sender(source, encoder, sink, link.clone(), config);
@@ -994,14 +994,14 @@ async fn client_keyframe_requests_force_an_idr_and_are_rate_limited() {
 
     // Past the minimum interval since that IDR, a client request is honoured and consumed.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    flag.store(true, Ordering::Release);
+    flags.request(0);
     assert!(
         until_async(Duration::from_secs(5), || {
             key_requests.load(Ordering::Relaxed) == 2
         })
         .await
     );
-    assert!(!flag.load(Ordering::Acquire), "the sender clears the flag");
+    assert!(!flags.is_requested(0), "the sender clears the flag");
     assert_eq!(VideoSenderStats::get(&stats.keyframes_requested), 2);
     assert!(
         until_async(Duration::from_secs(5), || keyframes.lock().len() == 2).await,
@@ -1009,8 +1009,8 @@ async fn client_keyframe_requests_force_an_idr_and_are_rate_limited() {
     );
 
     // Asking again straight away is consumed but does not force another IDR.
-    flag.store(true, Ordering::Release);
-    assert!(until_async(Duration::from_secs(5), || !flag.load(Ordering::Acquire)).await);
+    flags.request(0);
+    assert!(until_async(Duration::from_secs(5), || !flags.is_requested(0)).await);
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         key_requests.load(Ordering::Relaxed),
@@ -1021,17 +1021,313 @@ async fn client_keyframe_requests_force_an_idr_and_are_rate_limited() {
 
     // Once the interval has passed, the next request goes through again.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    flag.store(true, Ordering::Release);
+    flags.request(0);
     assert!(
         until_async(Duration::from_secs(5), || {
             key_requests.load(Ordering::Relaxed) == 3
         })
         .await
     );
-    assert!(!flag.load(Ordering::Acquire));
+    assert!(!flags.is_requested(0));
     assert_eq!(VideoSenderStats::get(&stats.keyframes_requested), 3);
 
     handle.stop().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Several streams to one headset
+// ---------------------------------------------------------------------------------------------
+
+/// What a headset with several screens does on its one video port: datagrams are routed by
+/// `PacketHeader::stream_id` to one client receive path (jitter buffer, FEC, reassembler) per
+/// stream, because each stream has its own sequence numbers and frame ids.
+struct DemuxReceiver {
+    addr: SocketAddr,
+    frames: Arc<Mutex<HashMap<u16, Vec<AssembledFrame>>>>,
+    /// `(source datagrams, parity datagrams)` seen per stream id.
+    datagrams: Arc<Mutex<HashMap<u16, (u64, u64)>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<ThreadHandle<()>>,
+}
+
+impl DemuxReceiver {
+    fn spawn() -> Self {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(1)))
+            .unwrap();
+        let addr = socket.local_addr().unwrap();
+        let frames = Arc::new(Mutex::new(HashMap::<u16, Vec<AssembledFrame>>::new()));
+        let datagrams = Arc::new(Mutex::new(HashMap::<u16, (u64, u64)>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (f, d, s) = (frames.clone(), datagrams.clone(), stop.clone());
+        let thread = std::thread::spawn(move || {
+            let config = ClientConfig::default();
+            let mut receivers: HashMap<u16, ClientReceiver> = HashMap::new();
+            let mut buf = vec![0u8; 65536];
+            let mut quiet_since: Option<Instant> = None;
+            loop {
+                if let Ok((n, _)) = socket.recv_from(&mut buf) {
+                    quiet_since = None;
+                    if let Ok(packet) = Packet::from_bytes(&buf[..n]) {
+                        let stream_id = packet.header.stream_id;
+                        {
+                            let mut counts = d.lock();
+                            let entry = counts.entry(stream_id).or_default();
+                            match packet.header.packet_type {
+                                PacketType::FecParity => entry.1 += 1,
+                                _ => entry.0 += 1,
+                            }
+                        }
+                        receivers
+                            .entry(stream_id)
+                            .or_insert_with(|| ClientReceiver::new(&config))
+                            .ingest_packet(packet, Instant::now());
+                    }
+                }
+                let now = Instant::now();
+                for (stream_id, receiver) in receivers.iter_mut() {
+                    let ready = receiver.pop_ready_frames(now).unwrap();
+                    if !ready.is_empty() {
+                        quiet_since = None;
+                        f.lock().entry(*stream_id).or_default().extend(ready);
+                    }
+                }
+                if s.load(Ordering::Relaxed) {
+                    let since = *quiet_since.get_or_insert(now);
+                    if now.duration_since(since) > Duration::from_millis(150) {
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            addr,
+            frames,
+            datagrams,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// Stops after draining; returns the frames delivered per stream id, in arrival order.
+    fn finish(mut self) -> HashMap<u16, Vec<AssembledFrame>> {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            t.join().unwrap();
+        }
+        std::mem::take(&mut *self.frames.lock())
+    }
+}
+
+/// What a test can read from a stream's [`ScriptedEncoder`] after the encoder moved into a sender.
+struct StreamProbe {
+    key_requests: Arc<AtomicU64>,
+    keyframes: Arc<Mutex<Vec<u64>>>,
+    produced: Arc<Mutex<HashMap<u64, Bytes>>>,
+}
+
+/// One stream, wired like the daemon wires each of its streams: own source, encoder, packetizer
+/// and socket; shared peer and keyframe flags.
+fn spawn_stream(
+    stream_id: u16,
+    frame_bytes: usize,
+    port: u16,
+    peers: ManualPeer,
+    requests: &Arc<KeyframeRequests>,
+) -> (VideoSenderHandle, StreamProbe) {
+    let encoder = ScriptedEncoder::new(vec![frame_bytes], 100);
+    let probe = StreamProbe {
+        key_requests: encoder.key_requests.clone(),
+        keyframes: encoder.keyframes.clone(),
+        produced: encoder.produced.clone(),
+    };
+    let handle = spawn_video_sender(
+        TestSource::new(100_000, Duration::from_millis(10), 64),
+        encoder,
+        udp_sink(),
+        peers,
+        VideoSenderConfig {
+            video_port: port,
+            stream_id,
+            pacing_fraction: 0.0,
+            min_keyframe_interval: Duration::from_millis(50),
+            keyframe_requests: Some(requests.clone()),
+            ..VideoSenderConfig::default()
+        },
+    );
+    (handle, probe)
+}
+
+/// The client sends `events` on the input channel and the host input receiver takes the batch,
+/// which sets the keyframe flags exactly as in the daemon.
+async fn client_asks<I: linux_quest_input::InputInjector>(
+    client: &mut linux_quest_transport::InputChannelSender,
+    input_service: &mut crate::input_receiver::HostInputReceiver<I>,
+    events: Vec<linux_quest_protocol::InputEvent>,
+) {
+    client.send_events(events, 100_000).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), input_service.step())
+        .await
+        .expect("the input batch arrives")
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_streams_share_the_headset_port_with_independent_frame_ids_and_keyframes() {
+    use crate::input_receiver::HostInputReceiver;
+    use linux_quest_input::MockInputInjector;
+    use linux_quest_protocol::InputEvent;
+    use linux_quest_transport::{InputChannelReceiver, InputChannelSender};
+
+    let _serial = SERIAL.lock().await;
+    let receiver = DemuxReceiver::spawn();
+    let port = receiver.addr.port();
+    let peers = ManualPeer::at("127.0.0.1");
+    let requests = KeyframeRequests::new();
+
+    // The client's input channel into the host, as in the daemon: its keyframe requests reach
+    // the senders through the shared flags.
+    let client_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let host_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let (client_addr, host_addr) = (
+        client_socket.local_addr().unwrap(),
+        host_socket.local_addr().unwrap(),
+    );
+    let mut client = InputChannelSender::new(client_socket, Some(host_addr), 4);
+    let mut input_service = HostInputReceiver::new(
+        InputChannelReceiver::new(host_socket, Some(client_addr), true),
+        Arc::new(std::sync::Mutex::new(MockInputInjector::new())),
+    )
+    .with_keyframe_requests(requests.clone());
+    // Stream 0 runs alone for a while, so its frame ids are well ahead when stream 1 starts.
+    let (stream0, probe0) = spawn_stream(0, 2400, port, peers.clone(), &requests);
+    let stats0 = stream0.stats().clone();
+    assert!(
+        until_async(Duration::from_secs(5), || {
+            VideoSenderStats::get(&stats0.frames_sent) >= 8
+        })
+        .await
+    );
+    let (stream1, probe1) = spawn_stream(1, 3600, port, peers, &requests);
+    let stats1 = stream1.stats().clone();
+    assert!(
+        until_async(Duration::from_secs(5), || {
+            VideoSenderStats::get(&stats1.frames_sent) >= 8
+                && VideoSenderStats::get(&stats0.frames_sent) >= 16
+        })
+        .await
+    );
+
+    // Each stream's decoder start asked for exactly one IDR, its own.
+    assert_eq!(probe0.key_requests.load(Ordering::Relaxed), 1);
+    assert_eq!(probe1.key_requests.load(Ordering::Relaxed), 1);
+    assert_eq!(probe0.keyframes.lock().clone(), vec![1]);
+    assert_eq!(probe1.keyframes.lock().clone(), vec![1]);
+
+    // The client lost stream 1 only (wire tag 9): only stream 1 emits another keyframe.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    client_asks(
+        &mut client,
+        &mut input_service,
+        vec![InputEvent::KeyframeRequestFor { stream_id: 1 }],
+    )
+    .await;
+    assert!(
+        until_async(Duration::from_secs(5), || probe1.keyframes.lock().len()
+            == 2)
+        .await,
+        "stream 1 emitted the IDR"
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(probe1.key_requests.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        probe0.key_requests.load(Ordering::Relaxed),
+        1,
+        "stream 0 was not asked"
+    );
+    assert_eq!(probe0.keyframes.lock().len(), 1, "stream 0 emitted no IDR");
+    assert!(!requests.is_requested(0) && !requests.is_requested(1));
+
+    // The payload-less request (wire tag 8) still means stream 0, and only stream 0.
+    client_asks(
+        &mut client,
+        &mut input_service,
+        vec![InputEvent::KeyframeRequest],
+    )
+    .await;
+    assert!(
+        until_async(Duration::from_secs(5), || probe0.keyframes.lock().len()
+            == 2)
+        .await,
+        "stream 0 emitted the IDR"
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(probe0.key_requests.load(Ordering::Relaxed), 2);
+    assert_eq!(probe1.key_requests.load(Ordering::Relaxed), 2);
+    assert_eq!(probe1.keyframes.lock().len(), 2);
+
+    // A request for a stream nobody sends is harmless and wakes nobody.
+    client_asks(
+        &mut client,
+        &mut input_service,
+        vec![InputEvent::KeyframeRequestFor { stream_id: 2 }],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(probe0.key_requests.load(Ordering::Relaxed), 2);
+    assert_eq!(probe1.key_requests.load(Ordering::Relaxed), 2);
+
+    stream0.stop().await;
+    stream1.stop().await;
+    let datagrams = receiver.datagrams.lock().clone();
+    let frames = receiver.finish();
+
+    let mut ids_seen: Vec<u16> = frames.keys().copied().collect();
+    ids_seen.sort_unstable();
+    assert_eq!(
+        ids_seen,
+        vec![0, 1],
+        "packets carry stream ids 0 and 1 only"
+    );
+    for (stream_id, probe, frame_bytes) in [(0u16, &probe0, 2400usize), (1, &probe1, 3600)] {
+        let delivered = &frames[&stream_id];
+        assert!(delivered.len() >= 8, "stream {stream_id} delivered frames");
+
+        // Frame ids belong to the stream: each counts 1, 2, 3, ... on its own, although
+        // stream 1 started after stream 0 had already sent 8 frames.
+        let ids: Vec<u64> = delivered.iter().map(|f| f.meta.frame_id).collect();
+        let expected: Vec<u64> = (1..=ids.len() as u64).collect();
+        assert_eq!(ids, expected, "stream {stream_id}: independent frame ids");
+
+        // Bit-exact against what this stream's own encoder produced, so no datagram crossed
+        // over from the other stream.
+        let produced = probe.produced.lock();
+        for frame in delivered {
+            assert_eq!(frame.bitstream.len(), frame_bytes);
+            assert_eq!(frame.bitstream, produced[&frame.meta.frame_id]);
+        }
+
+        // The IDRs on the wire are exactly the ones this stream's encoder was asked for.
+        let key_ids: Vec<u64> = delivered
+            .iter()
+            .filter(|f| f.meta.is_keyframe)
+            .map(|f| f.meta.frame_id)
+            .collect();
+        assert_eq!(key_ids, *probe.keyframes.lock(), "stream {stream_id} IDRs");
+        assert_eq!(key_ids.len(), 2);
+
+        // Source and FEC parity datagrams are both stamped with the stream id.
+        let (sources, parity) = datagrams[&stream_id];
+        assert!(
+            sources > 0 && parity > 0,
+            "stream {stream_id}: {sources}+{parity}"
+        );
+    }
+    assert!(
+        frames[&0].len() > frames[&1].len(),
+        "stream 0 started earlier and ran longer"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

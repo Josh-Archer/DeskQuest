@@ -1,6 +1,5 @@
 //! Real-hardware adapters and the daemon's start-up probe for the video sender.
 
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -13,8 +12,8 @@ use linux_quest_encoder::{
 };
 
 use super::{
-    spawn_video_sender, FrameSource, UdpSink, VideoSenderConfig, VideoSenderHandle,
-    DEFAULT_SEND_BUFFER_BYTES,
+    spawn_video_sender, FrameSource, KeyframeRequests, UdpSink, VideoSenderConfig,
+    VideoSenderHandle, DEFAULT_SEND_BUFFER_BYTES,
 };
 use crate::codec_select::{plan_stream, StreamPlan, CLIENT_DECODE_CODECS, CODEC_PREFERENCE};
 use crate::link_status::SharedLinkTracker;
@@ -85,7 +84,7 @@ pub struct DaemonVideoOptions {
 }
 
 /// Forwards [`VideoEncoder`] to a boxed encoder from [`create_encoder`].
-struct BoxedEncoder(Box<dyn VideoEncoder>);
+pub(super) struct BoxedEncoder(Box<dyn VideoEncoder>);
 
 #[async_trait]
 impl VideoEncoder for BoxedEncoder {
@@ -110,7 +109,7 @@ impl VideoEncoder for BoxedEncoder {
 /// backend order, then the first codec that backend and the client both support). The mock
 /// is used only when explicitly requested with `--encoder mock`: its output is not a
 /// decodable bitstream.
-async fn open_planned_encoder(
+pub(super) async fn open_planned_encoder(
     preference: BackendPreference,
     bitrate_kbps: u32,
     (width, height, fps): (u32, u32, u32),
@@ -168,7 +167,7 @@ async fn open_planned_encoder(
 pub async fn start_daemon_video_sender(
     link: SharedLinkTracker,
     options: DaemonVideoOptions,
-    keyframe_requests: Arc<AtomicBool>,
+    keyframe_requests: Arc<KeyframeRequests>,
 ) -> Result<VideoSenderHandle, String> {
     let defaults = EncoderConfig::default();
     let capture = AutoCapture::new(0, defaults.width, defaults.height, defaults.fps);
@@ -235,7 +234,7 @@ mod tests {
                 test_pattern: false,
                 bitrate_mbps: 30,
             },
-            Arc::new(AtomicBool::new(false)),
+            KeyframeRequests::new(),
         )
         .await;
         // On a machine without a real capture backend and NVENC (CI, containers) this is an

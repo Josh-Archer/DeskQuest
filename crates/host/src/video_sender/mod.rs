@@ -20,8 +20,14 @@
 //!
 //! The pieces that touch hardware, [`FrameSource`], [`VideoEncoder`] and [`DatagramSink`], are
 //! traits, so the whole pipeline runs in tests with synthetic frames over loopback sockets.
+//!
+//! One sender is one video stream. To show several screens the daemon runs one sender per
+//! stream ([`multi`]); each has its own capture, encoder, packetizer and frame ids, and stamps
+//! its [`VideoSenderConfig::stream_id`] on every packet.
 
 pub mod daemon;
+pub mod keyframe;
+pub mod multi;
 pub mod packetizer;
 pub mod sink;
 
@@ -30,7 +36,7 @@ mod tests;
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -41,10 +47,11 @@ use linux_quest_transport::PacketPacer;
 use parking_lot::Mutex;
 use tokio::sync::{watch, Notify};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, info_span, warn, Instrument, Span};
 
 use crate::link_status::SharedLinkTracker;
 
+pub use keyframe::KeyframeRequests;
 pub use packetizer::{
     Datagram, FecConfig, FramePlan, Packetizer, VideoSendError, DEFAULT_MAX_PAYLOAD,
     DEFAULT_VIDEO_PORT, MAX_DATAGRAM_SIZE,
@@ -89,6 +96,8 @@ impl PeerProvider for SharedLinkTracker {
 pub struct VideoSenderConfig {
     /// UDP port on the headset (the client binds `0.0.0.0:48440`).
     pub video_port: u16,
+    /// Stream (screen) this sender carries; stamped on every data and parity packet. Equal to
+    /// the display id. Stream 0 is the primary capture.
     pub stream_id: u16,
     /// Bitstream bytes per datagram (clamped to [`packetizer::MAX_PAYLOAD_LIMIT`]).
     pub max_payload: usize,
@@ -104,9 +113,9 @@ pub struct VideoSenderConfig {
     /// Keyframes requested because the local socket refused datagrams, or by the client, are
     /// at least this far apart, so neither can trigger an IDR storm.
     pub min_keyframe_interval: Duration,
-    /// Set by the host input receiver when the client asks for a keyframe; the send loop
-    /// clears it and forces an IDR. `None` ignores client requests.
-    pub keyframe_requests: Option<Arc<AtomicBool>>,
+    /// Set by the host input receiver when the client asks for a keyframe; the send loop takes
+    /// the flag for its own `stream_id` and forces an IDR. `None` ignores client requests.
+    pub keyframe_requests: Option<Arc<KeyframeRequests>>,
 }
 
 impl Default for VideoSenderConfig {
@@ -196,10 +205,12 @@ pub enum KeyframeReason {
     Abandoned,
     /// The local socket refused datagrams. Rate limited, so congestion cannot cause IDR storms.
     SendFailure,
-    /// The client lost video and asked for one ([`InputEvent::KeyframeRequest`] on the input
-    /// channel). Rate limited like `SendFailure`.
+    /// The client lost video and asked for one ([`InputEvent::KeyframeRequest`], or
+    /// [`InputEvent::KeyframeRequestFor`] for a stream other than 0, on the input channel).
+    /// Rate limited like `SendFailure`.
     ///
     /// [`InputEvent::KeyframeRequest`]: linux_quest_protocol::InputEvent::KeyframeRequest
+    /// [`InputEvent::KeyframeRequestFor`]: linux_quest_protocol::InputEvent::KeyframeRequestFor
     ClientRequest,
 }
 
@@ -472,15 +483,20 @@ where
     let slot = Arc::new(FrameSlot::new(stats.clone()));
     let (stop_tx, stop_rx) = watch::channel(false);
     let video_port = cfg.video_port;
+    // Log lines of an extra stream carry `video_stream{stream_id=N}`; stream 0, the only stream
+    // of a single-screen daemon, logs exactly as before.
+    let span = if cfg.stream_id == 0 {
+        Span::none()
+    } else {
+        info_span!("video_stream", stream_id = cfg.stream_id)
+    };
 
-    let capture = tokio::spawn(capture_loop(
-        source,
-        slot.clone(),
-        stats.clone(),
-        stop_rx.clone(),
-    ));
+    let capture = tokio::spawn(
+        capture_loop(source, slot.clone(), stats.clone(), stop_rx.clone()).instrument(span.clone()),
+    );
     let pipeline = FramePipeline::new(encoder, sink, cfg, stats.clone());
-    let sender = tokio::spawn(send_loop(pipeline, slot, peers, stats.clone(), stop_rx));
+    let sender =
+        tokio::spawn(send_loop(pipeline, slot, peers, stats.clone(), stop_rx).instrument(span));
 
     VideoSenderHandle {
         stats,
@@ -538,6 +554,7 @@ async fn send_loop<E, K, P>(
     P: PeerProvider,
 {
     let video_port = pipeline.cfg.video_port;
+    let stream_id = pipeline.cfg.stream_id;
     let mut active: Option<IpAddr> = None;
     let mut encode_failures = 0u64;
     loop {
@@ -568,9 +585,9 @@ async fn send_loop<E, K, P>(
             .cfg
             .keyframe_requests
             .as_ref()
-            .is_some_and(|flag| flag.swap(false, Ordering::AcqRel));
+            .is_some_and(|requests| requests.take(stream_id));
         if client_asked {
-            debug!("Client requested a keyframe");
+            debug!(stream_id, "Client requested a keyframe");
             pipeline.request_keyframe(now, KeyframeReason::ClientRequest);
         }
 

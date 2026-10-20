@@ -10,6 +10,7 @@ use linux_quest_protocol::InputEvent;
 use linux_quest_transport::{InputChannelReceiver, TransportError};
 
 use crate::link_status::SharedLinkTracker;
+use crate::video_sender::KeyframeRequests;
 use crate::HostError;
 
 /// Host-side service that listens on the low-latency input channel
@@ -19,7 +20,7 @@ pub struct HostInputReceiver<I: InputInjector> {
     injector: Arc<Mutex<I>>,
     running: Arc<AtomicBool>,
     link: Option<SharedLinkTracker>,
-    keyframe_requests: Option<Arc<AtomicBool>>,
+    keyframe_requests: Option<Arc<KeyframeRequests>>,
 }
 
 impl<I: InputInjector> HostInputReceiver<I> {
@@ -33,10 +34,12 @@ impl<I: InputInjector> HostInputReceiver<I> {
         }
     }
 
-    /// Sets `flag` when the client sends [`InputEvent::KeyframeRequest`] (it lost video); the
-    /// video sender clears it and forces an IDR. Without this the request is dropped.
-    pub fn with_keyframe_requests(mut self, flag: Arc<AtomicBool>) -> Self {
-        self.keyframe_requests = Some(flag);
+    /// Raises the stream's flag in `requests` when the client sends [`InputEvent::KeyframeRequest`]
+    /// (stream 0) or [`InputEvent::KeyframeRequestFor`] (the named stream) because it lost video;
+    /// that stream's video sender clears the flag and forces an IDR. Without this the request is
+    /// dropped.
+    pub fn with_keyframe_requests(mut self, requests: Arc<KeyframeRequests>) -> Self {
+        self.keyframe_requests = Some(requests);
         self
     }
 
@@ -65,12 +68,22 @@ impl<I: InputInjector> HostInputReceiver<I> {
         if let (Some(link), Some(peer)) = (&self.link, self.receiver.remote_addr()) {
             link.lock().input_packet(peer, std::time::Instant::now());
         }
-        let (keyframe_requests, events): (Vec<_>, Vec<_>) = events
-            .into_iter()
-            .partition(|e| matches!(e, InputEvent::KeyframeRequest));
-        if !keyframe_requests.is_empty() {
-            if let Some(flag) = &self.keyframe_requests {
-                flag.store(true, Ordering::Release);
+        let (keyframe_requests, events): (Vec<_>, Vec<_>) = events.into_iter().partition(|e| {
+            matches!(
+                e,
+                InputEvent::KeyframeRequest | InputEvent::KeyframeRequestFor { .. }
+            )
+        });
+        if let Some(requests) = &self.keyframe_requests {
+            for request in keyframe_requests {
+                let stream_id = match request {
+                    InputEvent::KeyframeRequestFor { stream_id } => stream_id,
+                    // The payload-less request has always meant the primary stream.
+                    _ => 0,
+                };
+                if !requests.request(stream_id) {
+                    tracing::debug!(stream_id, "Ignoring keyframe request for an unknown stream");
+                }
             }
         }
         let count = events.len();
@@ -220,10 +233,10 @@ mod tests {
         let mut sender = InputChannelSender::new(s_sender, Some(addr_receiver), 4);
         let receiver = InputChannelReceiver::new(s_receiver, Some(addr_sender), true);
 
-        let flag = Arc::new(AtomicBool::new(false));
+        let flags = KeyframeRequests::new();
         let injector = Arc::new(Mutex::new(MockInputInjector::new()));
-        let mut host_receiver =
-            HostInputReceiver::new(receiver, injector.clone()).with_keyframe_requests(flag.clone());
+        let mut host_receiver = HostInputReceiver::new(receiver, injector.clone())
+            .with_keyframe_requests(flags.clone());
 
         let normal = InputEvent::MouseMoveRelative { dx: 3, dy: 4 };
         sender
@@ -233,7 +246,70 @@ mod tests {
 
         let count = host_receiver.step().await.unwrap();
         assert_eq!(count, 1);
-        assert!(flag.load(Ordering::Acquire));
+        assert!(
+            flags.is_requested(0),
+            "the payload-less request is stream 0"
+        );
+        assert!(!flags.is_requested(1));
+
+        let binding = injector.lock().unwrap();
+        assert_eq!(binding.received_events, vec![normal]);
+    }
+
+    #[tokio::test]
+    async fn test_host_input_receiver_keyframe_request_for_sets_only_that_streams_flag() {
+        let s_sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let s_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let addr_sender = s_sender.local_addr().unwrap();
+        let addr_receiver = s_receiver.local_addr().unwrap();
+
+        let mut sender = InputChannelSender::new(s_sender, Some(addr_receiver), 4);
+        let receiver = InputChannelReceiver::new(s_receiver, Some(addr_sender), true);
+
+        let flags = KeyframeRequests::new();
+        let injector = Arc::new(Mutex::new(MockInputInjector::new()));
+        let mut host_receiver = HostInputReceiver::new(receiver, injector.clone())
+            .with_keyframe_requests(flags.clone());
+
+        let normal = InputEvent::MouseMoveRelative { dx: 3, dy: 4 };
+        sender
+            .send_events(
+                vec![
+                    InputEvent::KeyframeRequestFor { stream_id: 1 },
+                    normal.clone(),
+                ],
+                100_000,
+            )
+            .await
+            .unwrap();
+
+        let count = host_receiver.step().await.unwrap();
+        assert_eq!(count, 1, "the request is not injected");
+        assert!(flags.is_requested(1));
+        assert!(!flags.is_requested(0), "stream 0 did not ask");
+        assert!(!flags.is_requested(2));
+        assert!(flags.take(1));
+        assert!(!flags.is_requested(1));
+
+        // Several streams in one batch, and an id with no flag is dropped quietly.
+        sender
+            .send_events(
+                vec![
+                    InputEvent::KeyframeRequest,
+                    InputEvent::KeyframeRequestFor { stream_id: 2 },
+                    InputEvent::KeyframeRequestFor {
+                        stream_id: u16::MAX,
+                    },
+                ],
+                100_000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(host_receiver.step().await.unwrap(), 0);
+        assert!(flags.is_requested(0));
+        assert!(!flags.is_requested(1));
+        assert!(flags.is_requested(2));
 
         let binding = injector.lock().unwrap();
         assert_eq!(binding.received_events, vec![normal]);
