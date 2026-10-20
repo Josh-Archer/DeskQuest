@@ -2,7 +2,7 @@ name: Packaging (test artifacts)
 
 on:
   push:
-    branches: [main, codex/lq-33-packaging]
+    branches: [main]
     paths:
       - '.github/workflows/packaging.yml'
       - 'Cargo.toml'
