@@ -336,7 +336,7 @@ fn with_ime_bridge<R>(
         )?
         .l()?;
     let class = JClass::from(class);
-    call(&mut env, &*activity, &class)
+    call(&mut env, &activity, &class)
 }
 
 #[cfg(target_os = "android")]
