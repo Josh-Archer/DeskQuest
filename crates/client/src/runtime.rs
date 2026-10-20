@@ -10,9 +10,10 @@ use crate::config::ClientConfig;
 use crate::decoder::{create_decoder, DecoderStats, HardwareVideoDecoder};
 use crate::error::ClientResult;
 use crate::graphics::VulkanContext;
-use crate::hud::DebugHud;
+use crate::hud::{DebugHud, ShortcutAction, ShortcutDetector};
 use crate::openxr::{FrameLoopEngine, FramePacingMetrics, OpenXrContext};
 use crate::receiver::ClientReceiver;
+use crate::settings::{ClientSettings, SettingsAction, SettingsPanel, SettingsStore};
 use crate::spatial::{
     Corner, GrabStateMachine, HandGestureDetector, Handedness, InteractionEvent, InteractionInput,
     InteractionState, PointerInput, ScreenTransform, SpatialLayoutStore, SpatialScreenLayout, Vec3,
@@ -41,6 +42,10 @@ pub struct QuestClientRuntime {
     pointer_input: PointerInput,
     pointer_event_sink: Option<Box<dyn Fn(InputEvent) + Send>>,
     pointer_queue_latency: Option<Box<dyn Fn() -> u64 + Send>>,
+    settings_panel: SettingsPanel,
+    settings_store: Option<SettingsStore>,
+    shortcuts: ShortcutDetector,
+    settings_action_sink: Option<Box<dyn Fn(SettingsAction) + Send>>,
 }
 
 impl QuestClientRuntime {
@@ -111,6 +116,7 @@ impl QuestClientRuntime {
         let interaction_state_machine = GrabStateMachine::new();
         let gesture_detector = HandGestureDetector::new();
         let pointer_input = PointerInput::new(config.pointer_bindings);
+        let settings_panel = SettingsPanel::new(ClientSettings::from_config(&config), 512, 256);
 
         Ok(Self {
             config,
@@ -134,6 +140,10 @@ impl QuestClientRuntime {
             pointer_input,
             pointer_event_sink: None,
             pointer_queue_latency: None,
+            settings_panel,
+            settings_store: None,
+            shortcuts: ShortcutDetector::default(),
+            settings_action_sink: None,
         })
     }
 
@@ -573,15 +583,23 @@ impl QuestClientRuntime {
         self.hud.set_input_latency_us(pointer_latency_us);
 
         // 6. Submit composition layers to OpenXR compositor for timewarp display
-        let hud_rgba = if self.config.enable_hud {
+        // The settings panel takes over the head-locked overlay while it is open.
+        let panel_open = self.settings_panel.is_visible();
+        let hud_rgba = if panel_open {
+            Some(self.settings_panel.render_to_rgba())
+        } else if self.config.enable_hud {
             Some(self.hud.render_to_rgba())
         } else {
             None
         };
+        let mut layer_config = std::borrow::Cow::Borrowed(&self.config);
+        if panel_open && !self.config.enable_hud {
+            layer_config.to_mut().enable_hud = true;
+        }
 
         let present_res = self.openxr_context.render_and_present_layers(
             display_time,
-            &self.config,
+            &layer_config,
             &self.vulkan_context,
             hud_rgba.as_deref(),
             &self.overlay_scene,
@@ -622,6 +640,90 @@ impl QuestClientRuntime {
     pub fn set_target_refresh_rate(&mut self, target_rate: f32) {
         self.config.target_refresh_rate = target_rate;
         let _ = self.openxr_context.request_refresh_rate(target_rate);
+    }
+
+    /// Loads persisted settings (if any), applies them to the runtime, and persists later changes.
+    pub fn set_settings_store(&mut self, store: SettingsStore) {
+        if let Some(saved) = store.load() {
+            saved.apply_to(&mut self.config);
+            self.pointer_input = PointerInput::new(self.config.pointer_bindings);
+            self.settings_panel = SettingsPanel::new(saved, 512, 256);
+            let _ = self
+                .openxr_context
+                .request_refresh_rate(self.config.target_refresh_rate);
+        }
+        self.settings_store = Some(store);
+    }
+
+    /// Receives the actions that need the session layer (reconnect, host control requests).
+    pub fn set_settings_action_sink(&mut self, sink: Box<dyn Fn(SettingsAction) + Send>) {
+        self.settings_action_sink = Some(sink);
+    }
+
+    pub fn settings_panel(&self) -> &SettingsPanel {
+        &self.settings_panel
+    }
+
+    /// Feeds the thumbstick-click state each frame; both clicks toggle the HUD, the left alone
+    /// toggles the settings panel.
+    pub fn step_shortcuts(&mut self, left_click: bool, right_click: bool) {
+        match self.shortcuts.update(left_click, right_click) {
+            Some(ShortcutAction::ToggleHud) => {
+                let enabled = !self.config.enable_hud;
+                self.config.enable_hud = enabled;
+                self.settings_panel.sync_hud(enabled);
+                self.persist_settings();
+            }
+            Some(ShortcutAction::TogglePanel) => {
+                self.settings_panel.toggle();
+            }
+            None => {}
+        }
+    }
+
+    /// Moves the panel selection (thumbstick up/down).
+    pub fn panel_navigate(&mut self, dir: i32) {
+        self.settings_panel.navigate(dir);
+    }
+
+    /// Steps the selected panel row (thumbstick left/right or trigger).
+    pub fn panel_adjust(&mut self, dir: i32) {
+        let actions = self.settings_panel.adjust(dir);
+        self.run_settings_actions(actions);
+    }
+
+    /// Clicks the panel at the pointer's UV position.
+    pub fn panel_click(&mut self, u: f32, v: f32) {
+        let actions = self.settings_panel.click_at(u, v);
+        self.run_settings_actions(actions);
+    }
+
+    fn run_settings_actions(&mut self, actions: Vec<SettingsAction>) {
+        for action in actions {
+            match &action {
+                SettingsAction::SetRefreshRate(rate) => self.set_target_refresh_rate(*rate),
+                SettingsAction::SetPassthrough(on) => {
+                    let _ = self.set_passthrough_enabled(*on);
+                }
+                SettingsAction::SetHud(on) => self.config.enable_hud = *on,
+                _ => {}
+            }
+            if let Some(sink) = &self.settings_action_sink {
+                sink(action);
+            }
+        }
+        self.persist_settings();
+    }
+
+    fn persist_settings(&mut self) {
+        if !self.settings_panel.take_dirty() {
+            return;
+        }
+        if let Some(store) = &self.settings_store {
+            if let Err(e) = store.save(self.settings_panel.settings()) {
+                tracing::warn!(error = ?e, "Failed to persist client settings");
+            }
+        }
     }
 
     /// Returns the current HUD telemetry text.
@@ -961,5 +1063,47 @@ mod tests {
                 .current_rate(),
             120.0
         );
+    }
+
+    #[test]
+    fn shortcuts_toggle_hud_and_panel_and_panel_actions_reach_sink_and_store() {
+        use crate::settings::PanelRow;
+        use std::sync::{Arc, Mutex};
+
+        let path = std::env::temp_dir().join(format!("lq-rt-settings-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut runtime = QuestClientRuntime::new(ClientConfig::default()).unwrap();
+        runtime.set_settings_store(SettingsStore::new(&path));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = seen.clone();
+        runtime.set_settings_action_sink(Box::new(move |a| sink_seen.lock().unwrap().push(a)));
+
+        // Both sticks toggle the HUD off and persist it.
+        assert!(runtime.config.enable_hud);
+        runtime.step_shortcuts(true, true);
+        runtime.step_shortcuts(false, false);
+        assert!(!runtime.config.enable_hud);
+        assert!(!SettingsStore::new(&path).load().unwrap().hud_enabled);
+
+        // Left stick opens the panel; adding a monitor reaches the sink and the store.
+        runtime.step_shortcuts(true, false);
+        runtime.step_shortcuts(false, false);
+        assert!(runtime.settings_panel().is_visible());
+        while runtime.settings_panel().selected_row() != PanelRow::Monitors {
+            runtime.panel_navigate(1);
+        }
+        runtime.panel_adjust(1);
+        let actions = seen.lock().unwrap().clone();
+        assert!(matches!(
+            &actions[..],
+            [SettingsAction::Display(
+                linux_quest_protocol::DisplayConfigMessage::SetMonitorCount { count: 2, .. }
+            )]
+        ));
+        assert_eq!(SettingsStore::new(&path).load().unwrap().monitor_count, 2);
+
+        // The panel renders while open even though the HUD is off.
+        runtime.step_frame().unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 }

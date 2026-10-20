@@ -12,7 +12,7 @@ const DEFAULT_CLICK_DEAD_ZONE_MS: u64 = 90;
 
 /// Default pointer bindings. Controller trigger selects, thumbstick click is secondary click,
 /// and the thumbstick scrolls while a ray is over a panel. Hand pinch selects.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PointerBindings {
     pub primary_button: MouseButton,
