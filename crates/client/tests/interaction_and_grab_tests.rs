@@ -441,7 +441,7 @@ fn test_hand_tracking_fist_grab_with_hysteresis() {
 }
 
 #[test]
-fn test_hand_tracking_manipulation_drives_same_state_machine() {
+fn test_hand_tracking_pinch_select_does_not_manipulate_screen() {
     let mut sm = GrabStateMachine::new();
     let screen = ScreenTransform::for_display(0);
     let screens = vec![(0, &screen)];
@@ -470,7 +470,8 @@ fn test_hand_tracking_manipulation_drives_same_state_machine() {
         InteractionEvent::HoverStarted { display_id: 0, .. }
     ));
 
-    // 2. Pinch gesture (distance 15mm < 25mm) initiates grab
+    // 2. Pinch gesture (distance 15mm < 25mm) selects the desktop pointer. It must not
+    // start a screen manipulation grab.
     hand_backend.simulate_pinch(
         Handedness::Right,
         Vec3::new(0.0, 1.4, -0.4),
@@ -484,59 +485,12 @@ fn test_hand_tracking_manipulation_drives_same_state_machine() {
     let gesture_pinch = detector.update(Handedness::Right, &data_pinch);
     let input_pinch = InteractionInput::from_hand(Handedness::Right, &gesture_pinch);
 
-    let ev_grab = sm
+    let ev_pinch = sm
         .update(&input_pinch, screens.clone(), 0.016)
-        .expect("Grab from hand pinch");
+        .expect("Hover update from hand pinch");
     assert!(matches!(
-        ev_grab,
-        InteractionEvent::GrabStarted { display_id: 0, .. }
-    ));
-    assert!(sm.is_grabbing());
-
-    // 3. Move pinched hand to (+0.2m, +0.1m)
-    hand_backend.simulate_pinch(
-        Handedness::Right,
-        Vec3::new(0.2, 1.5, -0.4),
-        Vec3::new(0.0, 0.0, -1.0),
-        0.015,
-    );
-    let data_moved = hand_backend
-        .locate_joints(Handedness::Right, openxr::Time::from_nanos(0), None)
-        .unwrap()
-        .unwrap();
-    let gesture_moved = detector.update(Handedness::Right, &data_moved);
-    let input_moved = InteractionInput::from_hand(Handedness::Right, &gesture_moved);
-
-    let ev_drag = sm
-        .update(&input_moved, screens.clone(), 0.016)
-        .expect("Drag from hand");
-    if let InteractionEvent::GrabUpdated { transform, .. } = ev_drag {
-        assert!((transform.position.x - 0.2).abs() < 1e-4);
-        assert!((transform.position.y - 1.5).abs() < 1e-4);
-    } else {
-        panic!("Expected GrabUpdated");
-    }
-
-    // 4. Release pinch (fingers open to 50mm > 40mm)
-    hand_backend.simulate_pinch(
-        Handedness::Right,
-        Vec3::new(0.2, 1.5, -0.4),
-        Vec3::new(0.0, 0.0, -1.0),
-        0.050,
-    );
-    let data_release = hand_backend
-        .locate_joints(Handedness::Right, openxr::Time::from_nanos(0), None)
-        .unwrap()
-        .unwrap();
-    let gesture_release = detector.update(Handedness::Right, &data_release);
-    let input_release = InteractionInput::from_hand(Handedness::Right, &gesture_release);
-
-    let ev_end = sm
-        .update(&input_release, screens, 0.016)
-        .expect("Release from hand pinch");
-    assert!(matches!(
-        ev_end,
-        InteractionEvent::GrabEnded { display_id: 0, .. }
+        ev_pinch,
+        InteractionEvent::HoverUpdated { display_id: 0, .. }
     ));
     assert!(!sm.is_grabbing());
 }

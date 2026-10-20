@@ -395,6 +395,7 @@ impl InteractionInput {
             source: InteractionSource::Controller(hand),
             aim_ray,
             grab_pose,
+            // Grip manipulates the panel; trigger is routed to desktop pointer selection.
             is_grabbing: state.is_grabbing(),
             is_selecting: state.is_selecting(),
             thumbstick: state.thumbstick,
@@ -413,7 +414,8 @@ impl InteractionInput {
             source: InteractionSource::Hand(hand),
             aim_ray: gesture.aim_ray,
             grab_pose,
-            is_grabbing: gesture.is_pinching || gesture.is_grabbing,
+            // Pinch selects the desktop. A fist grab remains available for handle manipulation.
+            is_grabbing: gesture.is_grabbing,
             is_selecting: gesture.is_pinching,
             thumbstick: (0.0, 0.0),
         }

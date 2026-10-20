@@ -66,7 +66,7 @@ This roadmap outlines the development trajectory of `linux-quest` from initial a
 ---
 
 ## Phase 2: Linux Capture & Hardware Encoding Engine
-> Status: PipeWire/DMA-BUF capture and NVENC (incl. intra-refresh, RPI) done. VA-API backend (HEVC, H.264, rolling intra refresh, VPP colour conversion; AV1 opt-in) implemented as a scaffold, unverified on AMD/Intel hardware; the stream codec is not yet negotiated per client, and the daemon does not run a video session yet ([#28](https://github.com/Josh-Archer/linux-quest/issues/28)).
+> Status: PipeWire/DMA-BUF capture and NVENC (including intra-refresh and reference picture invalidation) are implemented. The feature-gated VA-API backend for AMD/Intel implements capability probing, CBR, HEVC and H.264, experimental opt-in AV1, PRIME DMA-BUF import, intra-refresh and reference picture invalidation, with mock-based tests. Real AMD/Intel hardware validation is still manual; follow [`docs/vaapi-manual-test.md`](docs/vaapi-manual-test.md). Stream codec negotiation and daemon video-session wiring remain separate work.
 
 *Objective: Build a zero-copy capture pipeline on Linux capable of 4K @ 90Hz/120Hz with minimal CPU overhead.*
 
@@ -82,19 +82,21 @@ This roadmap outlines the development trajectory of `linux-quest` from initial a
   - Reference Picture Invalidation (RPI) feedback loop from client to host.
 
 - **2.3 VA-API / Intel & AMD Encoding Integration**
-  - Provide a modular backend for AMD and Intel GPUs via VA-API / Vulkan Video Encode.
+  - [x] Provide a modular, runtime-loaded VA-API backend for AMD and Intel GPUs, with CBR, no B-frames, PRIME DMA-BUF import, capability probing, and NVENC-then-VA-API fallback. HEVC and H.264 are implemented; AV1 is experimental and opt-in until verified against hardware decoders.
+  - [x] Mock-test capability selection, fallback order, low-latency settings, DMA-BUF import, intra-refresh and reference picture invalidation.
+  - [ ] Validate encode and decode on AMD and Intel hardware using [`docs/vaapi-manual-test.md`](docs/vaapi-manual-test.md).
 
 ---
 
 ## Phase 3: Ultra-Low-Latency Network & USB Transport
-> Status: paced UDP, FEC, ADB bridge and the optional QUIC control transport are implemented. The host/client daemon configuration still uses TCP until certificate identity provisioning and pairing are wired in. mDNS/SSDP discovery remains in progress ([#30](https://github.com/Josh-Archer/linux-quest/issues/30)).
+> Status: paced UDP, FEC, ADB bridge and the optional QUIC control transport are implemented. The host/client daemon configuration still uses TCP until certificate identity provisioning and pairing are wired in. mDNS LAN discovery is implemented, including Quest auto-connect at launch ([#30](https://github.com/Josh-Archer/linux-quest/issues/30)); SSDP is not.
 
 *Objective: Guarantee sub-10ms delivery over wired USB and sub-15ms delivery over Wi-Fi 6/6E.*
 
 - **3.1 USB ADB Reverse-Tethering Auto-Bridge**
   - Automatic detection of connected Meta Quest over USB.
   - Automated `adb reverse tcp:<port> tcp:<port>` setup for 0-jitter, zero packet-loss, high-bitrate (150-250 Mbps) streaming.
-  - Fallback to seamless LAN discovery via mDNS / SSDP.
+  - Fallback to seamless LAN discovery via mDNS (done; SSDP not implemented).
 
 - **3.2 Custom UDP / QUIC Streaming Transport with FEC**
   - Implement packet pacing to avoid Wi-Fi burst drops.

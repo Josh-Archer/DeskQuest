@@ -88,7 +88,7 @@ jobs:
         run: cargo install --locked cargo-deb cargo-generate-rpm
 
       - name: Build host release binary
-        run: cargo build --release --locked -p linux-quest-host
+        run: cargo build --release --locked -p linux-quest-host --features mdns
 
       - name: Build .deb
         run: cargo deb -p linux-quest-host --no-build

@@ -5,6 +5,7 @@ pub mod frame_loop;
 pub mod hand_tracking;
 pub mod interaction;
 pub mod layers;
+pub mod overlay;
 pub mod passthrough;
 pub mod refresh_rate;
 

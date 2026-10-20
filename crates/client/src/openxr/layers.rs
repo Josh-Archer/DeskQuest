@@ -33,8 +33,8 @@ impl Default for DesktopLayerConfig {
             mode: DisplayMode::CurvedCylinder,
             quad_size: (1.6, 0.9),
             distance: 1.2,
-            cylinder_radius: 1.5,
-            cylinder_central_angle: 1.2,
+            cylinder_radius: crate::spatial::limits::DEFAULT_CURVE_RADIUS_M,
+            cylinder_central_angle: crate::spatial::limits::DEFAULT_CURVE_ANGLE_RAD,
             cylinder_aspect_ratio: 16.0 / 9.0,
             pose: None,
         }
@@ -87,6 +87,36 @@ pub fn build_quad_layer<'a, G: Graphics>(
 }
 
 /// Builds an `XrCompositionLayerCylinderKHR` for immersive curved desktop presentation.
+/// An alpha-blended quad showing all of `swapchain` (`width_px` x `height_px`) at `pose`,
+/// `size` meters wide and high. Used for pointer rays and cursors.
+pub fn build_overlay_quad<'a, G: Graphics>(
+    space: &'a Space,
+    swapchain: &'a Swapchain<G>,
+    (width_px, height_px): (u32, u32),
+    pose: Posef,
+    (width_m, height_m): (f32, f32),
+) -> CompositionLayerQuad<'a, G> {
+    let sub_image = SwapchainSubImage::new()
+        .swapchain(swapchain)
+        .image_rect(Rect2Di {
+            offset: Offset2Di { x: 0, y: 0 },
+            extent: Extent2Di {
+                width: width_px as i32,
+                height: height_px as i32,
+            },
+        });
+    CompositionLayerQuad::new()
+        .layer_flags(CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA)
+        .space(space)
+        .eye_visibility(EyeVisibility::BOTH)
+        .sub_image(sub_image)
+        .pose(pose)
+        .size(Extent2Df {
+            width: width_m,
+            height: height_m,
+        })
+}
+
 pub fn build_cylinder_layer<'a, G: Graphics>(
     space: &'a Space,
     swapchain: &'a Swapchain<G>,

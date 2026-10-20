@@ -11,8 +11,14 @@ fn test_desktop_layer_config_defaults_and_validation() {
     assert_eq!(config.mode, DisplayMode::CurvedCylinder);
     assert_eq!(config.quad_size, (1.6, 0.9));
     assert_eq!(config.distance, 1.2);
-    assert_eq!(config.cylinder_radius, 1.5);
-    assert_eq!(config.cylinder_central_angle, 1.2);
+    // A gentle curve: a 3 m radius over 0.6 rad keeps the 1.8 m wide screen of the old
+    // 1.5 m / 1.2 rad default with half the bend.
+    assert_eq!(config.cylinder_radius, 3.0);
+    assert_eq!(config.cylinder_central_angle, 0.6);
+    assert!((config.cylinder_radius * config.cylinder_central_angle - 1.8).abs() < 1e-4);
+    let client = ClientConfig::default();
+    assert_eq!(client.cylinder_radius, config.cylinder_radius);
+    assert_eq!(client.cylinder_central_angle, config.cylinder_central_angle);
     assert!((config.cylinder_aspect_ratio - (16.0 / 9.0)).abs() < 1e-4);
 
     // Flat quad mode
