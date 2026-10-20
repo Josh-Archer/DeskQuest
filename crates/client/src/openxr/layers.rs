@@ -33,8 +33,8 @@ impl Default for DesktopLayerConfig {
             mode: DisplayMode::CurvedCylinder,
             quad_size: (1.6, 0.9),
             distance: 1.2,
-            cylinder_radius: 1.5,
-            cylinder_central_angle: 1.2,
+            cylinder_radius: crate::spatial::limits::DEFAULT_CURVE_RADIUS_M,
+            cylinder_central_angle: crate::spatial::limits::DEFAULT_CURVE_ANGLE_RAD,
             cylinder_aspect_ratio: 16.0 / 9.0,
             pose: None,
         }
