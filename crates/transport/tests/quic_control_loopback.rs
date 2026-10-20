@@ -7,8 +7,8 @@
 #![cfg(feature = "quic")]
 
 use linux_quest_protocol::{
-    chunk_clipboard_text, ClientHandshake, ClipboardReassembler, ResumeStatus, ServerHandshake, SessionToken, VideoCodec,
-    DEFAULT_CLIPBOARD_CHUNK_SIZE, MAX_CLIPBOARD_TEXT_SIZE,
+    chunk_clipboard_text, ClientHandshake, ClipboardReassembler, ResumeStatus, ServerHandshake,
+    SessionToken, VideoCodec, DEFAULT_CLIPBOARD_CHUNK_SIZE, MAX_CLIPBOARD_TEXT_SIZE,
 };
 use linux_quest_transport::quic::{QUIC_KEEP_ALIVE_INTERVAL, QUIC_MAX_IDLE_TIMEOUT};
 use linux_quest_transport::{
