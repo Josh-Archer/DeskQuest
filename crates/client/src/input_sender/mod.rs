@@ -46,6 +46,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
@@ -79,6 +80,62 @@ pub const MAX_TARGETS: usize = 5;
 pub const MAX_EVENTS_PER_DATAGRAM: usize = 32;
 /// Events buffered while sends are failing; oldest are dropped first.
 pub const MAX_PENDING_EVENTS: usize = 256;
+
+/// Thread-safe queue carrying XR pointer events to the existing UDP input sender.
+#[derive(Debug, Clone, Default)]
+pub struct SharedInputEvents(Arc<SharedInputEventsInner>);
+
+#[derive(Debug, Default)]
+struct SharedInputEventsInner {
+    events: Mutex<VecDeque<(Instant, InputEvent)>>,
+    last_queue_latency_us: AtomicU64,
+}
+
+impl SharedInputEvents {
+    pub fn push(&self, event: InputEvent) {
+        if let Ok(mut events) = self.0.events.lock() {
+            if events.len() == MAX_PENDING_EVENTS {
+                events.pop_front();
+            }
+            events.push_back((Instant::now(), event));
+        }
+    }
+
+    pub fn last_queue_latency_us(&self) -> u64 {
+        self.0.last_queue_latency_us.load(Ordering::Relaxed)
+    }
+
+    fn drain(&self) -> Vec<InputEvent> {
+        let Ok(mut queue) = self.0.events.lock() else {
+            return Vec::new();
+        };
+        let now = Instant::now();
+        let mut events = Vec::with_capacity(queue.len());
+        let mut max_latency = 0;
+        while let Some((queued_at, event)) = queue.pop_front() {
+            max_latency = max_latency.max(now.duration_since(queued_at).as_micros() as u64);
+            events.push(event);
+        }
+        self.0
+            .last_queue_latency_us
+            .store(max_latency, Ordering::Relaxed);
+        events
+    }
+}
+
+/// Sender source combining queued pointer events with keyframe requests.
+pub struct PointerInputSource {
+    pub events: SharedInputEvents,
+    pub keyframe: KeyframeRequestFlags,
+}
+
+impl InputSource for PointerInputSource {
+    fn poll(&mut self) -> Vec<InputEvent> {
+        let mut events = self.events.drain();
+        events.extend(self.keyframe.take_events());
+        events
+    }
+}
 
 /// Supplies input state to the sender. Implemented by the Android runtime.
 pub trait InputSource: Send {

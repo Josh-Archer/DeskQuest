@@ -4,6 +4,7 @@ pub mod grab;
 pub mod interaction;
 pub mod layout;
 pub mod limits;
+pub mod pointer;
 pub mod pose;
 pub mod ray;
 pub mod transform;
@@ -20,6 +21,7 @@ pub use interaction::{
 };
 pub use layout::{SpatialLayoutStore, SpatialScreenLayout, CURRENT_LAYOUT_VERSION};
 pub use limits::*;
+pub use pointer::{PointerBindings, PointerInput};
 pub use pose::{Quat, ScreenPose, Vec3};
 pub use ray::{ray_intersects_cylinder, ray_intersects_quad, Ray, RayHit};
 pub use transform::{CylinderLayerParams, QuadLayerParams, ScreenTransform};

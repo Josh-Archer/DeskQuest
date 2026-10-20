@@ -22,6 +22,7 @@
 //! manual entry path visible.
 
 pub mod android_jni;
+pub mod autoconnect;
 pub mod multicast_lock;
 pub mod scheduler;
 

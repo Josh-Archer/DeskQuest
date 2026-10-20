@@ -9,6 +9,35 @@ use linux_quest_transport::InputChannelReceiver;
 
 use super::*;
 
+#[test]
+fn pointer_events_and_keyframe_requests_share_the_sender_source() {
+    let events = SharedInputEvents::default();
+    let keyframe = KeyframeRequestFlags::default();
+    let mut source = PointerInputSource {
+        events: events.clone(),
+        keyframe: keyframe.clone(),
+    };
+    let movement = InputEvent::MouseMoveAbsolute {
+        x: 1234,
+        y: 5678,
+        display_id: 3,
+    };
+    events.push(movement.clone());
+    keyframe.raise(0);
+    keyframe.raise(1);
+
+    assert_eq!(
+        source.poll(),
+        vec![
+            movement,
+            InputEvent::KeyframeRequest,
+            InputEvent::KeyframeRequestFor { stream_id: 1 },
+        ]
+    );
+    assert!(events.last_queue_latency_us() <= 1_000_000);
+    assert!(source.poll().is_empty());
+}
+
 /// One datagram as the host receiver saw it.
 struct Got {
     events: Vec<InputEvent>,

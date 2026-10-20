@@ -326,7 +326,7 @@ pub fn probe_backends(codec: VideoCodec) -> Vec<BackendProbe> {
             reason,
         },
     };
-    let vaapi = match vaapi::probe(codec) {
+    let vaapi = match probe_vaapi(codec) {
         Ok(report) => BackendProbe {
             kind: BackendKind::Vaapi,
             available: true,
@@ -350,6 +350,18 @@ pub fn probe_backends(codec: VideoCodec) -> Vec<BackendProbe> {
             reason: "software mock (no encoding, test and development only)".into(),
         },
     ]
+}
+
+#[cfg(feature = "vaapi")]
+fn probe_vaapi(codec: VideoCodec) -> Result<vaapi::ProbeReport, vaapi::VaError> {
+    vaapi::probe(codec)
+}
+
+#[cfg(not(feature = "vaapi"))]
+fn probe_vaapi(_codec: VideoCodec) -> Result<vaapi::ProbeReport, vaapi::VaError> {
+    Err(vaapi::VaError::Unavailable(
+        "VA-API support is disabled at compile time; rebuild with the `vaapi` feature".into(),
+    ))
 }
 
 /// Builds and initialises the first hardware encoder in the preference order.
@@ -384,9 +396,47 @@ pub async fn create_encoder(
 fn build_backend(kind: BackendKind, config: &EncoderConfig) -> Box<dyn VideoEncoder> {
     match kind {
         BackendKind::Nvenc => Box::new(NvencEncoder::new(config.clone())),
-        BackendKind::Vaapi => Box::new(VaapiEncoder::new(config.clone())),
+        BackendKind::Vaapi => build_vaapi(config),
         BackendKind::Mock => Box::new(MockVideoEncoder::new(config.clone())),
     }
+}
+
+#[cfg(feature = "vaapi")]
+fn build_vaapi(config: &EncoderConfig) -> Box<dyn VideoEncoder> {
+    Box::new(VaapiEncoder::new(config.clone()))
+}
+
+#[cfg(not(feature = "vaapi"))]
+fn build_vaapi(config: &EncoderConfig) -> Box<dyn VideoEncoder> {
+    Box::new(UnavailableVaapiEncoder {
+        config: config.clone(),
+    })
+}
+
+#[cfg(not(feature = "vaapi"))]
+struct UnavailableVaapiEncoder {
+    config: EncoderConfig,
+}
+
+#[cfg(not(feature = "vaapi"))]
+#[async_trait]
+impl VideoEncoder for UnavailableVaapiEncoder {
+    async fn init(&mut self, config: EncoderConfig) -> Result<(), EncoderError> {
+        self.config = config;
+        Err(EncoderError::InitFailed(
+            "VA-API support is disabled at compile time; rebuild with the `vaapi` feature".into(),
+        ))
+    }
+
+    async fn encode(&mut self, _frame: &RawFrame) -> Result<EncodedFrame, EncoderError> {
+        Err(EncoderError::EncodeFailed(
+            "VA-API support is disabled at compile time".into(),
+        ))
+    }
+
+    fn request_keyframe(&mut self) {}
+
+    fn invalidate_reference_picture(&mut self, _pts_us: u64) {}
 }
 
 /// Picks a backend at init: the preference's hardware order, then the software mock.

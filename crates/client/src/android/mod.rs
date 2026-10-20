@@ -31,7 +31,8 @@ use std::net::{IpAddr, SocketAddr};
 
 use crate::config::{ClientConfig, TransportMode};
 use crate::input_sender::{
-    input_sender_config, InputSenderThread, KeyframeRequestFlags, KeyframeRequestSource,
+    input_sender_config, InputSenderThread, KeyframeRequestFlags, PointerInputSource,
+    SharedInputEvents,
 };
 use crate::runtime::QuestClientRuntime;
 
@@ -86,15 +87,13 @@ pub fn udp_config_warning(config: &ClientConfig) -> Option<String> {
 /// Starts the UDP input/keepalive sender for `config`, or returns `None` when none should run.
 ///
 /// Only `Udp` mode sends: `adb reverse` forwards TCP only, so in `AdbReverseTcp` mode the client
-/// sends no input (and no keepalive) at all. Sending real controller input is not mapped yet,
-/// so the source is keepalive-only: enough for the host to latch this headset and stream video
-/// to it. See `crate::input_sender` for the design.
+/// sends no input (and no keepalive) at all. See `crate::input_sender` for the design.
 /// Starts the UDP input/keepalive sender (Udp mode only). Returns it with the per-stream flags
 /// that, once raised (then [`crate::input_sender::InputSenderControl::notify`]), send a
-/// keyframe request for that stream.
+/// keyframe request for that stream, and the queue pointer events go out on.
 pub fn start_input_sender(
     config: &ClientConfig,
-) -> Option<(InputSenderThread, KeyframeRequestFlags)> {
+) -> Option<(InputSenderThread, KeyframeRequestFlags, SharedInputEvents)> {
     let Some(sender_config) = input_sender_config(config) else {
         match config.transport_mode {
             TransportMode::AdbReverseTcp => tracing::info!(
@@ -110,10 +109,14 @@ pub fn start_input_sender(
         return None;
     };
     tracing::info!(targets = ?sender_config.targets, "starting UDP input/keepalive sender");
-    let source = KeyframeRequestSource::new();
-    let keyframe_flag = source.requester();
+    let events = SharedInputEvents::default();
+    let keyframe_flag = KeyframeRequestFlags::default();
+    let source = PointerInputSource {
+        events: events.clone(),
+        keyframe: keyframe_flag.clone(),
+    };
     match InputSenderThread::spawn(sender_config, Box::new(source)) {
-        Ok(sender) => Some((sender, keyframe_flag)),
+        Ok(sender) => Some((sender, keyframe_flag, events)),
         Err(e) => {
             tracing::warn!(error = ?e, "failed to start UDP input sender");
             None
@@ -209,12 +212,15 @@ fn system_property(name: &str) -> Option<String> {
 }
 
 /// The default config with the `debug.linuxquest.*` overrides applied (see
-/// [`ClientConfig::with_launch_overrides`]). Bad values are logged and ignored.
+/// [`ClientConfig::with_launch_overrides`]), and whether any override was given. Bad values are
+/// logged and ignored.
 #[cfg(target_os = "android")]
-fn launch_config() -> ClientConfig {
+fn launch_config() -> (ClientConfig, bool) {
     use crate::config::{HOST_PROPERTY, TRANSPORT_PROPERTY};
     let host = system_property(HOST_PROPERTY);
     let transport = system_property(TRANSPORT_PROPERTY);
+    let explicit = host.as_deref().is_some_and(|v| !v.trim().is_empty())
+        || transport.as_deref().is_some_and(|v| !v.trim().is_empty());
     match ClientConfig::default().with_launch_overrides(host.as_deref(), transport.as_deref()) {
         Ok(config) => {
             tracing::info!(
@@ -222,12 +228,75 @@ fn launch_config() -> ClientConfig {
                 transport = ?config.transport_mode,
                 "client transport configured"
             );
-            config
+            (config, explicit)
         }
         Err(e) => {
             tracing::warn!("ignoring launch override: {e}");
-            ClientConfig::default()
+            (ClientConfig::default(), false)
         }
+    }
+}
+
+/// `true` when something accepts connections on the USB/ADB tunnel's loopback port, i.e.
+/// `adb reverse tcp:48444 tcp:48444` is set up. The cable is the lower-latency path, so it
+/// takes priority over LAN discovery.
+#[cfg(target_os = "android")]
+fn usb_tunnel_present(config: &ClientConfig) -> bool {
+    std::net::TcpStream::connect_timeout(&config.host_addr, Duration::from_millis(300)).is_ok()
+}
+
+/// Finds a host over mDNS and points `config` at it. Blocks for at most a few seconds. The
+/// config is returned unchanged when discovery is off, blocked or finds nothing.
+#[cfg(target_os = "android")]
+#[cfg_attr(not(feature = "mdns"), allow(unused_mut))]
+fn autodiscover_config(mut config: ClientConfig) -> ClientConfig {
+    #[cfg(not(feature = "mdns"))]
+    {
+        tracing::warn!(
+            "built without the `mdns` feature: LAN discovery is off, set debug.linuxquest.host"
+        );
+        config
+    }
+    #[cfg(feature = "mdns")]
+    {
+        use crate::discovery::autoconnect::{
+            autoconnect, AutoConnectOutcome, STARTUP_SCAN_ATTEMPTS,
+        };
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::warn!(error = ?e, "no async runtime for LAN discovery");
+                return config;
+            }
+        };
+        let mut discovery =
+            match crate::discovery::mdns_discovery(crate::discovery::AndroidMulticastLock::new()) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(error = %e, "mDNS unavailable; set debug.linuxquest.host");
+                    return config;
+                }
+            };
+        match runtime.block_on(autoconnect(
+            &mut discovery,
+            &mut config,
+            STARTUP_SCAN_ATTEMPTS,
+        )) {
+            AutoConnectOutcome::Connected { host, other_hosts } => {
+                tracing::info!(%host, other_hosts, "LAN discovery selected a host");
+            }
+            AutoConnectOutcome::NoHosts => tracing::warn!(
+                "no host found on the LAN; is linux-quest-host (built with --features mdns) \
+                 running on the same Wi-Fi? Set debug.linuxquest.host to bypass discovery"
+            ),
+            AutoConnectOutcome::Unavailable(reason) => {
+                tracing::warn!(%reason, "LAN discovery unavailable; set debug.linuxquest.host")
+            }
+        }
+        config
     }
 }
 
@@ -247,7 +316,13 @@ pub fn android_main(app: AndroidApp) {
     // `android_main`, for OpenXR, MediaCodec and JNI users. Initialising it again here
     // trips the "exactly once" assertion in ndk-context and aborts the app at startup.
 
-    let config = launch_config();
+    let (mut config, explicit_override) = launch_config();
+    if crate::discovery::autoconnect::should_autodiscover(
+        explicit_override,
+        usb_tunnel_present(&config),
+    ) {
+        config = autodiscover_config(config);
+    }
 
     // Background transport packet receiver (bounded channel: 512 packets, drops on overflow)
     let (packet_tx, packet_rx) =
@@ -263,9 +338,9 @@ pub fn android_main(app: AndroidApp) {
 
     // Input/keepalive sender (Udp mode only). The receiver below acks it for each accepted
     // host datagram so it stays on the host address that works.
-    let (input_sender, keyframe_flag) = match start_input_sender(&config) {
-        Some((sender, flag)) => (Some(sender), Some(flag)),
-        None => (None, None),
+    let (input_sender, keyframe_flag, pointer_events) = match start_input_sender(&config) {
+        Some((sender, flag, events)) => (Some(sender), Some(flag), Some(events)),
+        None => (None, None, None),
     };
     let ack_control: Option<crate::input_sender::InputSenderControl> =
         input_sender.as_ref().map(|s| s.control().clone());
@@ -475,6 +550,18 @@ pub fn android_main(app: AndroidApp) {
                         Ok(mut rt) => {
                             if let Some(request) = keyframe_requester() {
                                 rt.set_keyframe_requester(request);
+                            }
+                            if let (Some(events), Some(control)) =
+                                (pointer_events.clone(), ack_control.clone())
+                            {
+                                let latency_events = events.clone();
+                                rt.set_pointer_event_sink(Box::new(move |event| {
+                                    events.push(event);
+                                    control.notify();
+                                }));
+                                rt.set_pointer_queue_latency_source(Box::new(move || {
+                                    latency_events.last_queue_latency_us()
+                                }));
                             }
                             runtime = Some(rt);
                             lifecycle.on_session_created();
