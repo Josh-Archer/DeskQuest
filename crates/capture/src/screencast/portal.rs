@@ -21,6 +21,7 @@ use super::token_store::RestoreTokenStore;
 
 /// `org.freedesktop.portal.ScreenCast` source types.
 pub const SOURCE_MONITOR: u32 = 1;
+pub const SOURCE_WINDOW: u32 = 2;
 /// Cursor modes (bit flags in `AvailableCursorModes`).
 pub const CURSOR_HIDDEN: u32 = 1;
 pub const CURSOR_EMBEDDED: u32 = 2;
@@ -123,10 +124,28 @@ pub fn choose_cursor_mode(available: u32) -> Option<u32> {
     }
 }
 
-/// Runs the portal flow, reusing and refreshing the stored restore token.
+/// Runs the portal flow for a monitor, reusing and refreshing the stored restore token.
 pub async fn negotiate<P: ScreenCastPortal + ?Sized>(
     portal: &mut P,
     store: Option<&RestoreTokenStore>,
+) -> Result<PortalGrant, ScreenCastError> {
+    negotiate_source(portal, store, SOURCE_MONITOR).await
+}
+
+/// Like [`negotiate`] for a window: the portal picker offers a single application window.
+/// Each window panel needs its own session (and its own restore token store).
+pub async fn negotiate_window<P: ScreenCastPortal + ?Sized>(
+    portal: &mut P,
+    store: Option<&RestoreTokenStore>,
+) -> Result<PortalGrant, ScreenCastError> {
+    negotiate_source(portal, store, SOURCE_WINDOW).await
+}
+
+/// Runs the portal flow for `source_types` (a `SOURCE_*` bitmask).
+pub async fn negotiate_source<P: ScreenCastPortal + ?Sized>(
+    portal: &mut P,
+    store: Option<&RestoreTokenStore>,
+    source_types: u32,
 ) -> Result<PortalGrant, ScreenCastError> {
     let version = portal.version().await?;
     let can_persist = version >= RESTORE_TOKEN_MIN_VERSION;
@@ -140,7 +159,16 @@ pub async fn negotiate<P: ScreenCastPortal + ?Sized>(
 
     if let Some(token) = stored {
         tracing::info!("screencast: reusing stored restore token");
-        match attempt(portal, store, Some(token), cursor_mode, can_persist).await {
+        match attempt(
+            portal,
+            store,
+            Some(token),
+            cursor_mode,
+            can_persist,
+            source_types,
+        )
+        .await
+        {
             Ok(grant) => return Ok(grant),
             Err(e) if e.token_may_be_stale() => {
                 tracing::warn!(
@@ -153,7 +181,7 @@ pub async fn negotiate<P: ScreenCastPortal + ?Sized>(
             Err(e) => return Err(e),
         }
     }
-    attempt(portal, store, None, cursor_mode, can_persist).await
+    attempt(portal, store, None, cursor_mode, can_persist, source_types).await
 }
 
 async fn attempt<P: ScreenCastPortal + ?Sized>(
@@ -162,20 +190,18 @@ async fn attempt<P: ScreenCastPortal + ?Sized>(
     token: Option<String>,
     cursor_mode: Option<u32>,
     can_persist: bool,
+    source_types: u32,
 ) -> Result<PortalGrant, ScreenCastError> {
     let used_restore_token = token.is_some();
     let session = portal.create_session().await?;
-    match run_session(
-        portal,
-        store,
-        &session,
-        token,
+    let options = SelectOptions {
+        source_types,
+        multiple: false,
         cursor_mode,
-        can_persist,
-        used_restore_token,
-    )
-    .await
-    {
+        persist_mode: can_persist.then_some(PERSIST_UNTIL_REVOKED),
+        restore_token: token,
+    };
+    match run_session(portal, store, &session, options, used_restore_token).await {
         Ok(grant) => Ok(grant),
         Err(e) => {
             portal.close_session(&session).await;
@@ -188,20 +214,11 @@ async fn run_session<P: ScreenCastPortal + ?Sized>(
     portal: &mut P,
     store: Option<&RestoreTokenStore>,
     session: &SessionHandle,
-    token: Option<String>,
-    cursor_mode: Option<u32>,
-    can_persist: bool,
+    options: SelectOptions,
     used_restore_token: bool,
 ) -> Result<PortalGrant, ScreenCastError> {
     // Subscribe to Closed first so a close racing the rest of the flow is not missed.
     let closed = portal.watch_closed(session).await?;
-    let options = SelectOptions {
-        source_types: SOURCE_MONITOR,
-        multiple: false,
-        cursor_mode,
-        persist_mode: can_persist.then_some(PERSIST_UNTIL_REVOKED),
-        restore_token: token,
-    };
     portal.select_sources(session, &options).await?;
     let started = portal.start(session).await?;
     let stream = started
@@ -387,6 +404,15 @@ mod tests {
         assert_eq!(o.persist_mode, Some(PERSIST_UNTIL_REVOKED));
         assert_eq!(o.restore_token, None);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn window_negotiation_requests_the_window_source_type() {
+        let mut p = FakePortal::new();
+        p.start_results.push_back(ok_start(11, None));
+        negotiate_window(&mut p, None).await.unwrap();
+        assert_eq!(p.select_seen[0].source_types, SOURCE_WINDOW);
+        assert!(!p.select_seen[0].multiple);
     }
 
     #[tokio::test]
