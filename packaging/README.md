@@ -167,3 +167,22 @@ ANDROID_SERIAL=<serial> scripts/install-quest.sh   # pick one device when severa
 ```
 
 With no path argument, the script installs the newer of `linux-quest-release.apk` and `linux-quest-debug.apk` and warns when both exist. It needs `adb` on `PATH` and accepts the headset's "Allow USB debugging" prompt.
+
+### Testing LAN discovery on a real Quest (no IP address)
+
+The release `.deb`/`.rpm`/AUR package and the release APK are built with the `mdns` feature. A source build needs it explicitly: `cargo build --release -p linux-quest-host --features mdns` and `crates/client/android/build.sh` (which already passes `--features mdns`).
+
+1. Put the PC and the Quest on the same Wi-Fi network (same subnet; guest/isolated SSIDs and some mesh "AP isolation" settings block multicast). Allow UDP `5353` (mDNS), TCP `48444`, UDP `48442` and UDP `48440` through the PC firewall, for example `sudo ufw allow from 192.168.1.0/24`.
+2. Start the host with `linux-quest-host daemon` (do not pass `--no-advertise`). The log shows `Advertising host on the LAN` with the instance name, which is the PC's short hostname.
+3. Verify the PC is visible to the LAN, from a third machine: `avahi-browse -rt _linuxquest._tcp` should list the instance with TXT `proto=1`, `input=48442`, `codecs=av1,hevc`, and `video=48440` while a headset is streaming.
+4. On the Quest make sure no host override is set: `adb shell setprop debug.linuxquest.host ""` and `adb shell setprop debug.linuxquest.transport ""`, and that no `adb reverse` is active (`adb reverse --remove-all`, or unplug USB). Then launch the app.
+5. Watch `adb logcat -s linux_quest_client:* RustStdoutStderr:*`. Expected lines: `LAN discovery selected a host`, then `connecting to discovered host` with the PC's LAN address. Video should start without any IP having been entered.
+
+Troubleshooting:
+
+- `no host found on the LAN`: the browse ran for about four seconds and nothing answered. Check steps 1 and 3, then relaunch the app (discovery runs at launch).
+- `LAN discovery unavailable`: the Quest's mDNS daemon could not start. Set the host by hand: `adb shell setprop debug.linuxquest.host 192.168.1.20`.
+- Several hosts on the LAN: the client prefers one that is already streaming video, then the first by name, and logs how many others it saw. Pin one with `debug.linuxquest.host`.
+- With a USB tunnel up (`adb reverse tcp:48444 tcp:48444`), discovery is skipped and the cable is used.
+
+SSDP/UPnP is not implemented; mDNS is the only discovery protocol.

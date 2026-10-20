@@ -192,8 +192,8 @@ Run the QUIC loopback coverage with `cargo test -p linux-quest-transport --featu
 The project is structured into 7 core phases. Status reflects what is merged on `main`; see [ROADMAP.md](ROADMAP.md) for details.
 
 - [x] **Phase 1:** Foundation & Architecture (Cargo workspace, zero-copy binary protocol, telemetry, CI)
-- [~] **Phase 2:** Linux Capture & Hardware Encoding Engine (PipeWire DMA-BUF capture, NVENC AV1/HEVC with intra-refresh and reference picture invalidation done; VA-API backend for AMD/Intel implemented as an unverified scaffold (HEVC and H.264 encode, rolling intra refresh, RGB-to-NV12 via VPP; AV1 and crate-written HEVC parameter sets are off unless opted in with `LINUX_QUEST_VAAPI_AV1=1` / `LINUX_QUEST_VAAPI_PACKED_HEADERS=1`), never run on a GPU, see `crates/encoder/src/vaapi.rs`; select with `LINUX_QUEST_VIDEO_ENCODER=nvenc|vaapi|mock` or `linux-quest-host daemon --encoder auto|nvenc|vaapi|mock`)
-- [~] **Phase 3:** Low-Latency Network & USB Transport (paced UDP, Reed-Solomon/XOR FEC, ADB reverse tunnel and optional QUIC control channel done; mDNS/SSDP LAN discovery pending; QUIC identity pairing is not yet wired into the host/client application configuration)
+- [~] **Phase 2:** Linux Capture & Hardware Encoding Engine (NVENC and feature-gated VA-API backends; VA-API HEVC and H.264, experimental AV1 opt-in, DMA-BUF import, CBR, intra-refresh and reference picture invalidation are implemented and mock-tested, but AMD/Intel hardware validation remains manual; see [`docs/vaapi-manual-test.md`](docs/vaapi-manual-test.md). VA-API is selected with `LINUX_QUEST_VIDEO_ENCODER=vaapi` or `linux-quest-host daemon --encoder vaapi`; automatic selection tries NVENC then VA-API.)
+- [~] **Phase 3:** Low-Latency Network & USB Transport (paced UDP, Reed-Solomon/XOR FEC, ADB reverse tunnel and optional QUIC control channel done; mDNS LAN discovery with Quest auto-connect done, SSDP not implemented; QUIC identity pairing is not yet wired into the host/client application configuration)
 - [x] **Phase 4:** Meta Quest OpenXR Client & Hardware Decoder (AMediaCodec, Vulkan, Composition Layers)
 - [~] **Phase 5:** Virtual Multi-Monitor Management on Linux (wlroots, Mutter and X11 backends with dynamic EDID done; EVDI kernel dummy-driver fallback implemented but never run against real EVDI, see #31)
 - [x] **Phase 6:** Spatial Workspace, Passthrough & Input Redirection (6DoF screens, passthrough, controller/hand manipulation, uinput injection, clipboard sync)
@@ -202,6 +202,14 @@ The project is structured into 7 core phases. Status reflects what is merged on 
 > **Note:** Much of the code is tested against mock backends (display, decoder, uinput, clipboard, audio sink). End-to-end validation on real Quest 3 and GPU hardware, and the latency/CPU targets above, are still to be confirmed.
 
 Detailed milestone descriptions, deliverables, and acceptance criteria are outlined in [ROADMAP.md](ROADMAP.md).
+
+### VA-API hardware encoding (AMD and Intel)
+
+The encoder crate enables its `vaapi` feature by default. VA-API is loaded at runtime, so normal workspace builds do not need libva development headers or an installed GPU driver. To omit the backend and its runtime probe, build with `--no-default-features` for `linux-quest-encoder`. The host exposes the feature as `vaapi` and uses runtime capability probing; automatic selection tries NVENC first, then VA-API. VA-API requires a driver that supports CBR and the requested codec/profile. HEVC and H.264 are supported; AV1 remains experimental and disabled unless `LINUX_QUEST_VAAPI_AV1=1` is set.
+
+The backend imports supported NV12 and RGB DMA-BUFs through VA-API PRIME. NV12 imports directly; RGB requires the driver's video processing entrypoint for zero-copy conversion. CPU-backed frames remain available as a fallback. Mocked capability, selection, import, rate-control, intra-refresh and reference-invalidation tests do not require a GPU.
+
+Follow the [AMD and Intel manual validation procedure](docs/vaapi-manual-test.md) before treating real-device support as verified.
 
 ---
 

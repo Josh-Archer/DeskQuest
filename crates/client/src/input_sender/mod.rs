@@ -45,6 +45,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
@@ -78,6 +79,119 @@ pub const MAX_TARGETS: usize = 5;
 pub const MAX_EVENTS_PER_DATAGRAM: usize = 32;
 /// Events buffered while sends are failing; oldest are dropped first.
 pub const MAX_PENDING_EVENTS: usize = 256;
+
+/// Thread-safe queue carrying XR pointer events to the existing UDP input sender.
+#[derive(Debug, Clone, Default)]
+pub struct SharedInputEvents(Arc<SharedInputEventsInner>);
+
+#[derive(Debug, Default)]
+struct SharedInputEventsInner {
+    events: Mutex<VecDeque<(Instant, InputEvent)>>,
+    last_queue_latency_us: AtomicU64,
+}
+
+impl SharedInputEvents {
+    pub fn push(&self, event: InputEvent) {
+        if let Ok(mut events) = self.0.events.lock() {
+            if events.len() == MAX_PENDING_EVENTS {
+                events.pop_front();
+            }
+            events.push_back((Instant::now(), event));
+        }
+    }
+
+    pub fn last_queue_latency_us(&self) -> u64 {
+        self.0.last_queue_latency_us.load(Ordering::Relaxed)
+    }
+
+    fn drain(&self) -> Vec<InputEvent> {
+        let Ok(mut queue) = self.0.events.lock() else {
+            return Vec::new();
+        };
+        let now = Instant::now();
+        let mut events = Vec::with_capacity(queue.len());
+        let mut max_latency = 0;
+        while let Some((queued_at, event)) = queue.pop_front() {
+            max_latency = max_latency.max(now.duration_since(queued_at).as_micros() as u64);
+            events.push(event);
+        }
+        self.0
+            .last_queue_latency_us
+            .store(max_latency, Ordering::Relaxed);
+        events
+    }
+}
+
+/// Sender source combining queued pointer events with keyframe requests.
+pub struct PointerInputSource {
+    pub events: SharedInputEvents,
+    pub keyframe: Arc<AtomicBool>,
+}
+
+impl InputSource for PointerInputSource {
+    fn poll(&mut self) -> Vec<InputEvent> {
+        let mut events = self.events.drain();
+        if self.keyframe.swap(false, Ordering::AcqRel) {
+            events.push(InputEvent::KeyframeRequest);
+        }
+        events
+    }
+}
+
+/// Sender source combining queued keyboard/IME events with XR pointer events, plus
+/// keyframe requests.
+///
+/// [`KeyframeRequestSource`] drains only the keyboard [`InputEventQueue`], while
+/// [`PointerInputSource`] drains only the pointer [`SharedInputEvents`]; the runtime needs
+/// one sender carrying both, so this source drains both queues (keyboard first, then
+/// pointer) and appends [`InputEvent::KeyframeRequest`] when the shared flag is raised.
+pub struct CombinedInputSource {
+    keyboard: InputEventQueue,
+    pointer: SharedInputEvents,
+    keyframe: Arc<AtomicBool>,
+}
+
+impl CombinedInputSource {
+    pub fn new() -> Self {
+        Self {
+            keyboard: InputEventQueue::default(),
+            pointer: SharedInputEvents::default(),
+            keyframe: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// The flag to raise when a keyframe is needed.
+    pub fn requester(&self) -> Arc<AtomicBool> {
+        self.keyframe.clone()
+    }
+
+    /// Queue for native Android keyboard/IME events to be forwarded by this sender.
+    pub fn keyboard_queue(&self) -> InputEventQueue {
+        self.keyboard.clone()
+    }
+
+    /// Queue for XR pointer events to be forwarded by this sender.
+    pub fn pointer_events(&self) -> SharedInputEvents {
+        self.pointer.clone()
+    }
+}
+
+impl Default for CombinedInputSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InputSource for CombinedInputSource {
+    fn poll(&mut self) -> Vec<InputEvent> {
+        let mut events = self.keyboard.drain();
+        events.extend(self.pointer.drain());
+        if self.keyframe.swap(false, Ordering::AcqRel) {
+            events.push(InputEvent::KeyframeRequest);
+        }
+        events
+    }
+}
 
 /// Supplies input state to the sender. Implemented by the Android runtime.
 pub trait InputSource: Send {
@@ -188,6 +302,26 @@ mod live_input_source_tests {
         queue.push(text.clone());
 
         assert_eq!(source.poll(), vec![key, text]);
+        assert!(source.poll().is_empty());
+    }
+
+    #[test]
+    fn combined_source_drains_keyboard_then_pointer_plus_keyframe() {
+        let mut source = CombinedInputSource::new();
+        let key = InputEvent::KeyboardKey {
+            keycode: 30,
+            state: linux_quest_protocol::ElementState::Pressed,
+            modifiers: linux_quest_protocol::KeyModifiers::empty(),
+        };
+        let pointer = InputEvent::MouseMoveRelative { dx: 3, dy: -1 };
+        source.keyboard_queue().push(key.clone());
+        source.pointer_events().push(pointer.clone());
+        source.requester().store(true, Ordering::SeqCst);
+
+        assert_eq!(
+            source.poll(),
+            vec![key, pointer, InputEvent::KeyframeRequest]
+        );
         assert!(source.poll().is_empty());
     }
 }

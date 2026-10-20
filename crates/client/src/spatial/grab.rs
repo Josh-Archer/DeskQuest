@@ -1,4 +1,4 @@
-//! 6DoF screen grab state machine coordinating hover, rigid drag, push/pull, tilt/curve, and layout persistence on release.
+//! 6DoF screen grab state machine coordinating hover, rigid drag, corner resize, push/pull, tilt/curve, and layout persistence on release.
 
 use crate::config::DisplayMode;
 use crate::spatial::interaction::{InteractionInput, InteractionSource};
@@ -6,8 +6,62 @@ use crate::spatial::limits::{
     clamp_curve_angle, clamp_distance, clamp_tilt, MIN_TWO_HAND_SEPARATION_M,
 };
 use crate::spatial::pose::{ScreenPose, Vec3};
-use crate::spatial::ray::RayHit;
+use crate::spatial::ray::{Ray, RayHit};
 use crate::spatial::transform::ScreenTransform;
+
+/// Size of the corner zones, as a fraction of the screen's width and height, that start a resize.
+pub const CORNER_ZONE: f32 = 0.12;
+
+/// Screen corner that a corner resize grabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Corner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+/// Returns the corner whose zone contains the screen point `uv`, or `None` when it is on an edge
+/// midpoint or in the interior.
+///
+/// `uv` uses the [`RayHit::uv`] convention: `(0, 0)` is the top-left corner and `(1, 1)` the
+/// bottom-right. A point is in a corner zone when its `u` and its `v` are both within
+/// [`CORNER_ZONE`] of the same pair of edges, boundaries included.
+pub fn corner_at(uv: (f32, f32)) -> Option<Corner> {
+    let (u, v) = uv;
+    let on_left = u <= CORNER_ZONE;
+    let on_right = u >= 1.0 - CORNER_ZONE;
+    let on_top = v <= CORNER_ZONE;
+    let on_bottom = v >= 1.0 - CORNER_ZONE;
+    match (on_left, on_right, on_top, on_bottom) {
+        (true, _, true, _) => Some(Corner::TopLeft),
+        (_, true, true, _) => Some(Corner::TopRight),
+        (true, _, _, true) => Some(Corner::BottomLeft),
+        (_, true, _, true) => Some(Corner::BottomRight),
+        _ => None,
+    }
+}
+
+/// What a grab does to the screen while it is held.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GrabMode {
+    /// Rigid drag: the screen follows the grabbing hand or controller.
+    Move,
+
+    /// Corner resize: the screen size follows how far the grabbing ray reaches from the screen
+    /// centre. Position and orientation stay fixed.
+    Resize {
+        /// Corner the grab started from.
+        corner: Corner,
+
+        /// Distance in meters from the screen centre to the grabbing ray's hit point at grab start.
+        initial_reach: f32,
+
+        /// Screen transform when the grab started. The size is always scaled from this. Boxed to keep
+        /// `InteractionState` small, as `GrabSession::two_hand` is.
+        base: Box<ScreenTransform>,
+    },
+}
 
 /// Active grab manipulation session tracking initial poses and cumulative offsets.
 #[derive(Debug, Clone, PartialEq)]
@@ -17,6 +71,9 @@ pub struct GrabSession {
 
     /// Source that initiated this grab.
     pub source: InteractionSource,
+
+    /// Whether the grab moves the screen or resizes it from a corner.
+    pub mode: GrabMode,
 
     /// 6DoF controller/hand pose when grab started.
     pub initial_controller_pose: ScreenPose,
@@ -160,6 +217,25 @@ impl GrabStateMachine {
         }
     }
 
+    /// Corner under the hover ray, if hovering a screen at one of its corner zones.
+    pub fn hovered_corner(&self) -> Option<Corner> {
+        match &self.state {
+            InteractionState::Hovering { hit, .. } => corner_at(hit.uv),
+            _ => None,
+        }
+    }
+
+    /// Corner being dragged while a corner resize is active.
+    pub fn resizing(&self) -> Option<Corner> {
+        match &self.state {
+            InteractionState::Grabbing(GrabSession {
+                mode: GrabMode::Resize { corner, .. },
+                ..
+            }) => Some(*corner),
+            _ => None,
+        }
+    }
+
     /// Processes a single frame of input against the active screens, updating state and emitting events.
     pub fn update<'a>(
         &mut self,
@@ -213,11 +289,26 @@ impl GrabStateMachine {
 
             InteractionState::Hovering {
                 display_id,
-                hit: _,
+                hit,
                 source,
             } => {
+                let hover_hit = *hit;
                 let current_display_id = *display_id;
                 let current_source = *source;
+
+                // Another hand or controller pointing at a screen and squeezing takes the grab, so
+                // the user does not have to squeeze with the hand that happened to hover first.
+                let takeover = (input.is_grabbing && input.source != current_source)
+                    .then_some(input.aim_ray.as_ref())
+                    .flatten()
+                    .and_then(|ray| {
+                        ScreenTransform::find_closest_hit(ray, screens_vec.iter().copied())
+                    });
+                // The hit that decides between move and corner resize belongs to the grabbing source.
+                let (current_display_id, current_source, grab_hit) = match takeover {
+                    Some((id, takeover_hit)) => (id, input.source, takeover_hit),
+                    None => (current_display_id, current_source, hover_hit),
+                };
 
                 // Grab initiation: user squeezed grip or pinched while hovering
                 if input.is_grabbing && input.source == current_source {
@@ -230,9 +321,23 @@ impl GrabStateMachine {
                     let ctrl_pose = input.grab_pose.unwrap_or(ScreenPose::IDENTITY);
                     let screen_pose = target_screen.pose();
 
+                    let mode = match corner_at(grab_hit.uv) {
+                        Some(corner) => GrabMode::Resize {
+                            corner,
+                            initial_reach: initial_reach(
+                                input.aim_ray.as_ref(),
+                                &grab_hit,
+                                &target_screen,
+                            ),
+                            base: Box::new(target_screen.clone()),
+                        },
+                        None => GrabMode::Move,
+                    };
+
                     let session = GrabSession {
                         display_id: current_display_id,
                         source: input.source,
+                        mode,
                         initial_controller_pose: ctrl_pose,
                         initial_screen_pose: screen_pose,
                         initial_screen_transform: target_screen.clone(),
@@ -345,6 +450,34 @@ impl GrabStateMachine {
                         display_id,
                         source,
                         final_transform,
+                    });
+                }
+
+                // Corner resize: the grabbing ray's reach on the screen plane sets the size. Position,
+                // orientation, thumbstick and any second hand are ignored. Without a usable ray the
+                // size is kept.
+                if let GrabMode::Resize {
+                    initial_reach,
+                    base,
+                    ..
+                } = &session.mode
+                {
+                    let mut transform = session.current_screen_transform.clone();
+                    let reach = input
+                        .aim_ray
+                        .as_ref()
+                        .and_then(|ray| plane_reach(ray, base));
+                    if let Some(reach) = reach {
+                        if *initial_reach > MIN_CORNER_REACH_M {
+                            transform.set_uniform_scale_from(base, reach / *initial_reach);
+                        }
+                    }
+
+                    session.current_screen_transform = transform.clone();
+                    return Some(InteractionEvent::GrabUpdated {
+                        display_id: session.display_id,
+                        source: session.source,
+                        transform,
                     });
                 }
 
@@ -516,6 +649,50 @@ impl GrabStateMachine {
     }
 }
 
+/// Smallest grab-start reach, in meters, that can scale a corner resize. Below it the size is kept.
+const MIN_CORNER_REACH_M: f32 = 1e-3;
+
+/// Unit normal of the screen's facing plane, pointing towards the viewer.
+fn facing_normal(screen: &ScreenTransform) -> Vec3 {
+    screen.orientation.rotate_vec(Vec3::UNIT_Z).normalize()
+}
+
+/// Distance in meters from the screen centre to `point`, measured within the screen's facing plane.
+fn in_plane_reach(point: Vec3, screen: &ScreenTransform) -> f32 {
+    let offset = point - screen.position;
+    let normal = facing_normal(screen);
+    (offset - normal * offset.dot(normal)).length()
+}
+
+/// Distance in meters from the screen centre to where `ray` meets the screen's facing plane.
+///
+/// `None` when the ray is parallel to the plane or the plane lies behind its origin.
+fn plane_reach(ray: &Ray, screen: &ScreenTransform) -> Option<f32> {
+    let normal = facing_normal(screen);
+    let approach = ray.direction.dot(normal);
+    if approach.abs() < 1e-6 {
+        return None;
+    }
+
+    let t = (screen.position - ray.origin).dot(normal) / approach;
+    if t <= 1e-4 {
+        return None;
+    }
+    Some(in_plane_reach(ray.at(t), screen))
+}
+
+/// Reach of a corner grab at the moment it starts.
+///
+/// Measured the same way as the reach during the drag, from the grabbing frame's ray, so an
+/// unchanged ray gives a scale of exactly 1. A curved screen's hit point lies on the arc, not on
+/// the facing plane, so the hover hit point alone would make the size jump on the first frame.
+/// The hit point is used when the grabbing frame has no usable ray.
+fn initial_reach(aim_ray: Option<&Ray>, hit: &RayHit, screen: &ScreenTransform) -> f32 {
+    aim_ray
+        .and_then(|ray| plane_reach(ray, screen))
+        .unwrap_or_else(|| in_plane_reach(hit.point, screen))
+}
+
 /// Applies thumbstick push/pull (Y) and tilt or curve (X) to a grabbed screen transform.
 ///
 /// `speeds` is `(push_pull_speed, tilt_speed, curve_speed)`.
@@ -554,7 +731,7 @@ fn apply_thumbstick(
 mod tests {
     use super::*;
     use crate::spatial::interaction::Handedness;
-    use crate::spatial::limits::{MAX_SCREEN_WIDTH_M, MIN_SCREEN_WIDTH_M};
+    use crate::spatial::limits::{MAX_CURVE_ANGLE_RAD, MAX_SCREEN_WIDTH_M, MIN_SCREEN_WIDTH_M};
     use crate::spatial::pose::{Quat, Vec3};
     use std::f32::consts::FRAC_PI_2;
 
@@ -925,8 +1102,8 @@ mod tests {
     }
 
     #[test]
-    fn test_two_hand_scale_curved_scales_radius() {
-        // Default display mode is the curved cylinder: its radius (1.5 m) carries the size
+    fn test_two_hand_scale_curved_widens_the_arc() {
+        // Default display mode is the curved cylinder: its arc (central angle) carries the size
         let screen = ScreenTransform::for_display(0);
         assert_eq!(screen.display_mode, DisplayMode::CurvedCylinder);
         let (mut sm, _) = start_right_grab(&screen);
@@ -945,8 +1122,13 @@ mod tests {
             0.0,
             0.3,
         );
-        assert!((t.curve_radius - 3.0).abs() < 1e-4);
-        assert!((t.curve_angle - screen.curve_angle).abs() < 1e-6);
+        assert!((t.curve_radius - screen.curve_radius).abs() < 1e-6);
+        assert!(
+            t.curve_angle > screen.curve_angle * 1.2,
+            "arc widens: {} -> {}",
+            screen.curve_angle,
+            t.curve_angle
+        );
         assert!((t.aspect_ratio - screen.aspect_ratio).abs() < 1e-6);
     }
 
@@ -1096,5 +1278,382 @@ mod tests {
             assert_eq!(a, b);
         }
         assert!(!two.is_grabbing());
+    }
+
+    /// Where the user's eyes sit in the corner resize tests. Aim rays start here.
+    const USER_EYE: Vec3 = Vec3::new(0.0, 1.4, 0.0);
+
+    /// Aim ray from `origin` through `target`.
+    fn aim_at(origin: Vec3, target: Vec3) -> Ray {
+        Ray::new(origin, target - origin)
+    }
+
+    /// Hover or grab input for `hand` whose aim ray is `ray`.
+    fn ray_input(hand: Handedness, ray: Ray, grabbing: bool) -> InteractionInput {
+        InteractionInput {
+            source: InteractionSource::Hand(hand),
+            aim_ray: Some(ray),
+            grab_pose: Some(ScreenPose::new(ray.origin, Quat::IDENTITY)),
+            is_grabbing: grabbing,
+            is_selecting: grabbing,
+            thumbstick: (0.0, 0.0),
+        }
+    }
+
+    /// Point at screen coordinates `(u, v)` (see `RayHit::uv`) on an unrotated screen.
+    fn screen_point(screen: &ScreenTransform, u: f32, v: f32) -> Vec3 {
+        match screen.display_mode {
+            DisplayMode::FlatQuad => {
+                let (width, height) = screen.quad_size;
+                Vec3::new(
+                    screen.position.x + (u - 0.5) * width,
+                    screen.position.y + (0.5 - v) * height,
+                    screen.position.z,
+                )
+            }
+            DisplayMode::CurvedCylinder => {
+                let radius = screen.curve_radius;
+                let angle = (u - 0.5) * screen.curve_angle;
+                let arc_height = radius * screen.curve_angle / screen.aspect_ratio;
+                let axis = screen.cylinder_axis_pose().position;
+                Vec3::new(
+                    axis.x + radius * angle.sin(),
+                    screen.position.y + (0.5 - v) * arc_height,
+                    axis.z - radius * angle.cos(),
+                )
+            }
+        }
+    }
+
+    /// Point where the ray from `origin` through `through` meets the facing plane of an unrotated screen.
+    fn on_facing_plane(screen: &ScreenTransform, origin: Vec3, through: Vec3) -> Vec3 {
+        let dir = through - origin;
+        let t = (screen.position.z - origin.z) / dir.z;
+        origin + dir * t
+    }
+
+    /// Aim ray from the user to a point on the screen plane that is `factor` times as far from the
+    /// centre as the plane point of `through`.
+    fn scaled_reach_ray(screen: &ScreenTransform, through: Vec3, factor: f32) -> Ray {
+        let grab_point = on_facing_plane(screen, USER_EYE, through);
+        aim_at(
+            USER_EYE,
+            screen.position + (grab_point - screen.position) * factor,
+        )
+    }
+
+    /// Hovers `through` with the right hand, then squeezes. Returns the machine grabbing from there and the grab ray.
+    fn start_corner_grab(screen: &ScreenTransform, through: Vec3) -> (GrabStateMachine, Ray) {
+        let mut sm = GrabStateMachine::new();
+        let ray = aim_at(USER_EYE, through);
+        sm.update(
+            &ray_input(Handedness::Right, ray, false),
+            vec![(0, screen)],
+            0.016,
+        );
+        assert!(sm.hovered_corner().is_some(), "hover should be at a corner");
+
+        let ev = sm
+            .update(
+                &ray_input(Handedness::Right, ray, true),
+                vec![(0, screen)],
+                0.016,
+            )
+            .expect("GrabStarted");
+        assert!(matches!(ev, InteractionEvent::GrabStarted { .. }));
+        (sm, ray)
+    }
+
+    #[test]
+    fn test_corner_at_zones_and_boundaries() {
+        assert_eq!(corner_at((0.0, 0.0)), Some(Corner::TopLeft));
+        assert_eq!(corner_at((1.0, 0.0)), Some(Corner::TopRight));
+        assert_eq!(corner_at((0.0, 1.0)), Some(Corner::BottomLeft));
+        assert_eq!(corner_at((1.0, 1.0)), Some(Corner::BottomRight));
+
+        // Zone boundaries count as inside the zone
+        let far = 1.0 - CORNER_ZONE;
+        assert_eq!(corner_at((CORNER_ZONE, CORNER_ZONE)), Some(Corner::TopLeft));
+        assert_eq!(corner_at((far, far)), Some(Corner::BottomRight));
+        assert_eq!(corner_at((far, CORNER_ZONE)), Some(Corner::TopRight));
+        assert_eq!(corner_at((CORNER_ZONE, far)), Some(Corner::BottomLeft));
+
+        // Just outside a zone in one direction is not a corner
+        assert_eq!(corner_at((CORNER_ZONE + 0.01, CORNER_ZONE)), None);
+        assert_eq!(corner_at((far - 0.01, 0.0)), None);
+        assert_eq!(corner_at((0.0, CORNER_ZONE + 0.01)), None);
+
+        // Edge midpoints and the interior are not corners
+        assert_eq!(corner_at((0.5, 0.0)), None);
+        assert_eq!(corner_at((0.0, 0.5)), None);
+        assert_eq!(corner_at((0.05, 0.5)), None);
+        assert_eq!(corner_at((0.5, 0.5)), None);
+    }
+
+    #[test]
+    fn test_grab_started_in_middle_is_move() {
+        let screen = flat_screen();
+        let (sm, _) = start_right_grab(&screen);
+        assert!(matches!(sm.grab_session().unwrap().mode, GrabMode::Move));
+        assert_eq!(sm.resizing(), None);
+    }
+
+    #[test]
+    fn test_corner_grab_resizes_flat_screen_by_reach() {
+        let screen = flat_screen();
+        let corner = screen_point(&screen, 0.05, 0.05);
+        let (mut sm, _) = start_corner_grab(&screen, corner);
+        assert!(matches!(
+            sm.grab_session().unwrap().mode,
+            GrabMode::Resize {
+                corner: Corner::TopLeft,
+                ..
+            }
+        ));
+        assert_eq!(sm.resizing(), Some(Corner::TopLeft));
+
+        // Ray dragged out to twice the grab reach: the flat screen doubles about its centre
+        let out = ray_input(
+            Handedness::Right,
+            scaled_reach_ray(&screen, corner, 2.0),
+            true,
+        );
+        let t = transform_of(sm.update(&out, vec![(0, &screen)], 0.016));
+        assert_size(&t, 3.2, 1.8);
+        assert_eq!(t.position, screen.position);
+        assert!(sm.grab_session().unwrap().two_hand.is_none());
+
+        // Ray pulled in to half the grab reach, same grab: the screen shrinks from the base size
+        let back_in = ray_input(
+            Handedness::Right,
+            scaled_reach_ray(&screen, corner, 0.5),
+            true,
+        );
+        let t = transform_of(sm.update(&back_in, vec![(0, &screen)], 0.016));
+        assert_size(&t, 0.8, 0.45);
+        assert_eq!(t.position, screen.position);
+    }
+
+    #[test]
+    fn test_corner_grab_resizes_curved_screen_arc() {
+        let screen = ScreenTransform::for_display(0);
+        assert_eq!(screen.display_mode, DisplayMode::CurvedCylinder);
+        let corner = screen_point(&screen, 0.05, 0.05);
+        let (mut sm, _) = start_corner_grab(&screen, corner);
+
+        let out = ray_input(
+            Handedness::Right,
+            scaled_reach_ray(&screen, corner, 2.0),
+            true,
+        );
+        let t = transform_of(sm.update(&out, vec![(0, &screen)], 0.016));
+        assert!((t.curve_angle - 2.0 * screen.curve_angle).abs() < 1e-5);
+        assert!((t.curve_radius - screen.curve_radius).abs() < 1e-6);
+        assert!((t.aspect_ratio - screen.aspect_ratio).abs() < 1e-6);
+        assert_eq!(t.position, screen.position);
+
+        // Far out: the arc clamps at a half turn
+        let far = ray_input(
+            Handedness::Right,
+            scaled_reach_ray(&screen, corner, 6.0),
+            true,
+        );
+        let t = transform_of(sm.update(&far, vec![(0, &screen)], 0.016));
+        assert!((t.curve_angle - MAX_CURVE_ANGLE_RAD).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_corner_grab_resize_clamps_to_size_limits() {
+        let screen = flat_screen();
+        let corner = screen_point(&screen, 0.05, 0.05);
+        let (mut sm, _) = start_corner_grab(&screen, corner);
+
+        // Ten times the reach: the width clamps to the maximum, aspect ratio kept
+        let out = ray_input(
+            Handedness::Right,
+            scaled_reach_ray(&screen, corner, 10.0),
+            true,
+        );
+        let t = transform_of(sm.update(&out, vec![(0, &screen)], 0.016));
+        assert!((t.quad_size.0 - MAX_SCREEN_WIDTH_M).abs() < 1e-4);
+        assert!((t.quad_size.0 / t.quad_size.1 - 16.0 / 9.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_corner_grab_does_not_jump_when_ray_is_unchanged() {
+        // The grab frame's own ray must give a scale of 1, on flat and curved screens alike
+        for screen in [flat_screen(), ScreenTransform::for_display(0)] {
+            let corner = screen_point(&screen, 0.05, 0.05);
+            let (mut sm, grab_ray) = start_corner_grab(&screen, corner);
+            let same = ray_input(Handedness::Right, grab_ray, true);
+            let t = transform_of(sm.update(&same, vec![(0, &screen)], 0.016));
+            assert!((t.quad_size.0 - screen.quad_size.0).abs() < 1e-5);
+            assert!((t.curve_angle - screen.curve_angle).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_corner_resize_keeps_size_when_ray_misses_the_plane() {
+        let screen = flat_screen();
+        let corner = screen_point(&screen, 0.05, 0.05);
+        let (mut sm, _) = start_corner_grab(&screen, corner);
+
+        // Parallel to the screen, then pointing away from it: neither meets the plane in front
+        for ray in [
+            aim_at(USER_EYE, USER_EYE + Vec3::UNIT_X),
+            aim_at(USER_EYE, USER_EYE + Vec3::UNIT_Z),
+        ] {
+            let t = transform_of(sm.update(
+                &ray_input(Handedness::Right, ray, true),
+                vec![(0, &screen)],
+                0.016,
+            ));
+            assert_size(&t, 1.6, 0.9);
+        }
+
+        // A grab frame without an aim ray keeps the size too
+        let no_ray = grab_input(Handedness::Right, USER_EYE, true);
+        let t = transform_of(sm.update(&no_ray, vec![(0, &screen)], 0.016));
+        assert_size(&t, 1.6, 0.9);
+        assert!(sm.is_grabbing());
+    }
+
+    #[test]
+    fn test_corner_resize_release_emits_grab_ended_with_resized_transform() {
+        let screen = flat_screen();
+        let corner = screen_point(&screen, 0.05, 0.05);
+        let (mut sm, _) = start_corner_grab(&screen, corner);
+
+        let out = ray_input(
+            Handedness::Right,
+            scaled_reach_ray(&screen, corner, 2.0),
+            true,
+        );
+        transform_of(sm.update(&out, vec![(0, &screen)], 0.016));
+
+        // Release on the same ray: still over the resized screen, so the grab returns to hover
+        let release = ray_input(
+            Handedness::Right,
+            scaled_reach_ray(&screen, corner, 2.0),
+            false,
+        );
+        match sm.update(&release, vec![(0, &screen)], 0.016) {
+            Some(InteractionEvent::GrabEnded {
+                display_id: 0,
+                final_transform,
+                ..
+            }) => assert_size(&final_transform, 3.2, 1.8),
+            other => panic!("expected GrabEnded, got {other:?}"),
+        }
+        assert!(sm.is_hovering());
+        assert_eq!(sm.resizing(), None);
+    }
+
+    #[test]
+    fn test_corner_resize_ignores_second_hand() {
+        let screen = flat_screen();
+        let corner = screen_point(&screen, 0.05, 0.05);
+        let (mut sm, _) = start_corner_grab(&screen, corner);
+
+        // Left hand grabs 0.4 m away, which would start a two-handed scale in a move grab
+        let left = grab_input(Handedness::Left, Vec3::new(-0.4, 1.4, 0.0), true);
+        let still = ray_input(Handedness::Right, aim_at(USER_EYE, corner), true);
+        let t = transform_of(sm.update_two(&still, Some(&left), vec![(0, &screen)], 0.016));
+        assert_size(&t, 1.6, 0.9);
+        assert!(sm.grab_session().unwrap().two_hand.is_none());
+
+        let out = ray_input(
+            Handedness::Right,
+            scaled_reach_ray(&screen, corner, 2.0),
+            true,
+        );
+        let t = transform_of(sm.update_two(&out, Some(&left), vec![(0, &screen)], 0.016));
+        assert_size(&t, 3.2, 1.8);
+        assert!(sm.grab_session().unwrap().two_hand.is_none());
+        assert_eq!(sm.resizing(), Some(Corner::TopLeft));
+    }
+
+    #[test]
+    fn test_takeover_grab_uses_the_grabbing_sources_own_hit() {
+        let screen = flat_screen();
+        let corner = screen_point(&screen, 0.05, 0.05);
+        let centre = screen.position;
+
+        // Right hand hovers the middle, left hand squeezes while pointing at a corner: resize
+        let mut sm = GrabStateMachine::new();
+        sm.update(
+            &ray_input(Handedness::Right, aim_at(USER_EYE, centre), false),
+            vec![(0, &screen)],
+            0.016,
+        );
+        let ev = sm
+            .update(
+                &ray_input(Handedness::Left, aim_at(USER_EYE, corner), true),
+                vec![(0, &screen)],
+                0.016,
+            )
+            .expect("GrabStarted");
+        assert!(matches!(ev, InteractionEvent::GrabStarted { .. }));
+        assert_eq!(
+            sm.grab_session().unwrap().source,
+            InteractionSource::Hand(Handedness::Left)
+        );
+        assert!(matches!(
+            sm.grab_session().unwrap().mode,
+            GrabMode::Resize {
+                corner: Corner::TopLeft,
+                ..
+            }
+        ));
+
+        // Right hand hovers a corner, left hand squeezes in the middle: a plain move
+        let mut sm = GrabStateMachine::new();
+        sm.update(
+            &ray_input(Handedness::Right, aim_at(USER_EYE, corner), false),
+            vec![(0, &screen)],
+            0.016,
+        );
+        sm.update(
+            &ray_input(Handedness::Left, aim_at(USER_EYE, centre), true),
+            vec![(0, &screen)],
+            0.016,
+        );
+        assert!(matches!(sm.grab_session().unwrap().mode, GrabMode::Move));
+    }
+
+    #[test]
+    fn test_hovered_corner_and_resizing_report_state() {
+        let screen = flat_screen();
+        let corner = screen_point(&screen, 0.05, 0.05);
+        let centre = screen.position;
+        let mut sm = GrabStateMachine::new();
+        assert_eq!(sm.hovered_corner(), None);
+        assert_eq!(sm.resizing(), None);
+
+        let hover_corner = ray_input(Handedness::Right, aim_at(USER_EYE, corner), false);
+        sm.update(&hover_corner, vec![(0, &screen)], 0.016);
+        assert_eq!(sm.hovered_corner(), Some(Corner::TopLeft));
+        assert_eq!(sm.resizing(), None);
+
+        // Hovering the middle clears the corner
+        sm.update(
+            &ray_input(Handedness::Right, aim_at(USER_EYE, centre), false),
+            vec![(0, &screen)],
+            0.016,
+        );
+        assert_eq!(sm.hovered_corner(), None);
+
+        // Grabbing from the corner: resizing reports it, and no hover corner while grabbing
+        sm.update(&hover_corner, vec![(0, &screen)], 0.016);
+        let grab_corner = ray_input(Handedness::Right, aim_at(USER_EYE, corner), true);
+        sm.update(&grab_corner, vec![(0, &screen)], 0.016);
+        assert_eq!(sm.hovered_corner(), None);
+        assert_eq!(sm.resizing(), Some(Corner::TopLeft));
+
+        // Released over the same corner: resizing ends and the corner is hovered again
+        let release = ray_input(Handedness::Right, aim_at(USER_EYE, corner), false);
+        sm.update(&release, vec![(0, &screen)], 0.016);
+        assert_eq!(sm.resizing(), None);
+        assert_eq!(sm.hovered_corner(), Some(Corner::TopLeft));
     }
 }
