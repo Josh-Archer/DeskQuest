@@ -33,7 +33,7 @@ build() {
   cd "linux-quest-${pkgver}"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
-  cargo build --frozen --release -p linux-quest-host
+  cargo build --frozen --release -p linux-quest-host --features mdns
 }
 
 check() {
