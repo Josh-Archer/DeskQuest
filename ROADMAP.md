@@ -87,14 +87,14 @@ This roadmap outlines the development trajectory of `linux-quest` from initial a
 ---
 
 ## Phase 3: Ultra-Low-Latency Network & USB Transport
-> Status: paced UDP, FEC, ADB bridge and the optional QUIC control transport are implemented. The host/client daemon configuration still uses TCP until certificate identity provisioning and pairing are wired in. mDNS/SSDP discovery remains in progress ([#30](https://github.com/Josh-Archer/linux-quest/issues/30)).
+> Status: paced UDP, FEC, ADB bridge and the optional QUIC control transport are implemented. The host/client daemon configuration still uses TCP until certificate identity provisioning and pairing are wired in. mDNS LAN discovery is implemented, including Quest auto-connect at launch ([#30](https://github.com/Josh-Archer/linux-quest/issues/30)); SSDP is not.
 
 *Objective: Guarantee sub-10ms delivery over wired USB and sub-15ms delivery over Wi-Fi 6/6E.*
 
 - **3.1 USB ADB Reverse-Tethering Auto-Bridge**
   - Automatic detection of connected Meta Quest over USB.
   - Automated `adb reverse tcp:<port> tcp:<port>` setup for 0-jitter, zero packet-loss, high-bitrate (150-250 Mbps) streaming.
-  - Fallback to seamless LAN discovery via mDNS / SSDP.
+  - Fallback to seamless LAN discovery via mDNS (done; SSDP not implemented).
 
 - **3.2 Custom UDP / QUIC Streaming Transport with FEC**
   - Implement packet pacing to avoid Wi-Fi burst drops.
