@@ -253,6 +253,8 @@ where
                                                     refresh_rate: m.refresh_rate,
                                                     dpi: m.dpi,
                                                     is_virtual: m.is_virtual,
+                                                    x: m.x,
+                                                    y: m.y,
                                                 })
                                                 .collect();
                                             Some(linux_quest_protocol::DisplayConfigMessage::ActiveMonitors(
@@ -267,6 +269,10 @@ where
                                     }
                                 }
                                 linux_quest_protocol::DisplayConfigMessage::ActiveMonitors(_)
+                                | linux_quest_protocol::DisplayConfigMessage::MonitorAdded(_)
+                                | linux_quest_protocol::DisplayConfigMessage::MonitorRemoved {
+                                    ..
+                                }
                                 | linux_quest_protocol::DisplayConfigMessage::Error(_) => None,
                             }
                         } else {

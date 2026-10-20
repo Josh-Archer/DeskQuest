@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use linux_quest_capture::{
-    AutoCapture, CaptureBackendType, CaptureError, DisplayCapture, RawFrame,
+    AutoCapture, CaptureBackendType, CaptureError, CaptureInfo, DisplayCapture, RawFrame,
+    ScreenCastError,
 };
 use linux_quest_encoder::{
     create_encoder, probe_backends, BackendKind, BackendPreference, EncodedFrame, EncoderConfig,
@@ -43,12 +44,75 @@ impl<C: DisplayCapture> CaptureFrameSource<C> {
         }
         Ok(Self { capture })
     }
+
+    /// Size and rate the capture negotiated, if it reports them.
+    pub fn capture_info(&self) -> Option<CaptureInfo> {
+        self.capture.capture_info()
+    }
 }
+
+/// Encoder size and rate for `info`: the capture's own resolution (so the whole screen is
+/// encoded, not the top-left corner of it) with even dimensions, and its frame rate when known.
+fn encode_geometry(info: Option<&CaptureInfo>, defaults: &EncoderConfig) -> (u32, u32, u32) {
+    match info {
+        Some(info) if info.width >= 2 && info.height >= 2 => (
+            info.width & !1,
+            info.height & !1,
+            if info.fps > 0 { info.fps } else { defaults.fps },
+        ),
+        _ => (defaults.width, defaults.height, defaults.fps),
+    }
+}
+
+/// True when the capture ended (session closed, node removed) and `init` can start it again.
+fn capture_ended(e: &CaptureError) -> bool {
+    matches!(
+        e,
+        CaptureError::ScreenCast(ScreenCastError::SessionClosed | ScreenCastError::NodeRemoved)
+    )
+}
+
+/// True when restarting would only prompt the user again for something they refused.
+fn user_refused(e: &CaptureError) -> bool {
+    matches!(
+        e,
+        CaptureError::ScreenCast(ScreenCastError::UserCancelled | ScreenCastError::Denied(_))
+    )
+}
+
+/// Longest wait between attempts to restart an ended capture.
+const MAX_REOPEN_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[async_trait]
 impl<C: DisplayCapture + 'static> FrameSource for CaptureFrameSource<C> {
     async fn next_frame(&mut self) -> Result<RawFrame, CaptureError> {
-        self.capture.capture_frame().await
+        let err = match self.capture.capture_frame().await {
+            Ok(frame) => return Ok(frame),
+            Err(e) if capture_ended(&e) => e,
+            Err(e) => return Err(e),
+        };
+        // GNOME closes the screen-cast session when the screen locks, or when the user stops
+        // sharing. Start a new one (the stored restore token avoids a prompt) instead of
+        // ending video for good.
+        tracing::warn!(error = %err, "screen capture ended; restarting it");
+        let mut backoff = std::time::Duration::from_millis(500);
+        loop {
+            tokio::time::sleep(backoff).await;
+            match self.capture.init().await {
+                Ok(()) => {
+                    tracing::info!("screen capture restarted");
+                    return self.capture.capture_frame().await;
+                }
+                Err(e) if user_refused(&e) => {
+                    tracing::warn!(error = %e, "screen capture not restarted: the user declined");
+                    return Err(e);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, retry_in = ?backoff, "screen capture restart failed");
+                    backoff = (backoff * 2).min(MAX_REOPEN_BACKOFF);
+                }
+            }
+        }
     }
 }
 
@@ -95,6 +159,7 @@ impl VideoEncoder for BoxedEncoder {
 async fn open_planned_encoder(
     preference: BackendPreference,
     bitrate_kbps: u32,
+    (width, height, fps): (u32, u32, u32),
 ) -> Result<(BoxedEncoder, StreamPlan), String> {
     let probes = tokio::task::spawn_blocking(|| {
         CODEC_PREFERENCE
@@ -125,6 +190,9 @@ async fn open_planned_encoder(
     let config = EncoderConfig {
         codec: plan.codec,
         bitrate_kbps,
+        width,
+        height,
+        fps,
         ..EncoderConfig::default()
     };
     let backend_only = match plan.backend {
@@ -148,37 +216,97 @@ pub async fn start_daemon_video_sender(
     options: DaemonVideoOptions,
     keyframe_requests: Arc<AtomicBool>,
 ) -> Result<VideoSenderHandle, String> {
+    start_daemon_video_stream(link, options, 0, 0, options.bitrate_mbps, keyframe_requests).await
+}
+
+/// Starts independent capture/encode/send pipelines for the supplied active monitors. Each
+/// pipeline owns its packetizer, FEC state, pacing state, keyframe flag and stream id.
+/// Bitrate is divided evenly (remainder goes to lower ids) so the aggregate does not exceed
+/// the configured session bitrate.
+pub async fn start_daemon_video_senders(
+    link: SharedLinkTracker,
+    options: DaemonVideoOptions,
+    monitors: &[linux_quest_protocol::DisplayInfo],
+) -> Result<Vec<VideoSenderHandle>, String> {
+    if monitors.is_empty() {
+        return Err("no active monitors to stream".into());
+    }
+    if monitors.len() > usize::from(u16::MAX) {
+        return Err(format!(
+            "{} monitors exceed the protocol stream id limit",
+            monitors.len()
+        ));
+    }
+    let shares = bitrate_shares(options.bitrate_mbps, monitors.len())?;
+    let mut handles = Vec::with_capacity(monitors.len());
+    for (monitor, bitrate) in monitors.iter().zip(shares) {
+        handles.push(
+            start_daemon_video_stream(
+                link.clone(),
+                options,
+                monitor.display_id,
+                monitor.display_id,
+                bitrate,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await?,
+        );
+    }
+    Ok(handles)
+}
+
+fn bitrate_shares(total_mbps: u32, streams: usize) -> Result<Vec<u32>, String> {
+    if streams == 0 {
+        return Err("no active monitors to stream".into());
+    }
+    let count = u32::try_from(streams).map_err(|_| "monitor count exceeds bitrate allocator")?;
+    let base = total_mbps / count;
+    let remainder = total_mbps % count;
+    if base == 0 {
+        return Err(format!(
+            "{total_mbps} Mbit/s total bitrate cannot provide a positive share to {streams} monitor streams"
+        ));
+    }
+    Ok((0..count)
+        .map(|index| base + u32::from(index < remainder))
+        .collect())
+}
+
+async fn start_daemon_video_stream(
+    link: SharedLinkTracker,
+    options: DaemonVideoOptions,
+    display_id: u16,
+    stream_id: u16,
+    bitrate_mbps: u32,
+    keyframe_requests: Arc<AtomicBool>,
+) -> Result<VideoSenderHandle, String> {
     let defaults = EncoderConfig::default();
-    let capture = AutoCapture::new(0, defaults.width, defaults.height, defaults.fps);
+    let capture = AutoCapture::new(display_id, defaults.width, defaults.height, defaults.fps);
 
-    let source = CaptureFrameSource::open(capture, options.test_pattern).await;
-    let bitrate_kbps = options.bitrate_mbps.saturating_mul(1000);
-    let encoder = open_planned_encoder(options.encoder, bitrate_kbps).await;
-
-    let (source, (encoder, plan)) = match (source, encoder) {
-        (Ok(source), Ok(encoder)) => (source, encoder),
-        (source, encoder) => {
-            let mut reasons = Vec::new();
-            if let Err(e) = source {
-                reasons.push(format!("capture: {e}"));
-            }
-            if let Err(e) = encoder {
-                reasons.push(format!("encoder: {e}"));
-            }
-            return Err(reasons.join("; "));
-        }
-    };
+    let source = CaptureFrameSource::open(capture, options.test_pattern)
+        .await
+        .map_err(|e| format!("capture: {e}"))?;
+    let geometry = encode_geometry(source.capture_info().as_ref(), &defaults);
+    let bitrate_kbps = bitrate_mbps.saturating_mul(1000);
+    let (encoder, plan) = open_planned_encoder(options.encoder, bitrate_kbps, geometry)
+        .await
+        .map_err(|e| format!("encoder: {e}"))?;
 
     tracing::info!(
         backend = plan.backend.name(),
         codec = ?plan.codec,
-        bitrate_mbps = options.bitrate_mbps,
+        bitrate_mbps,
+        stream_id,
+        width = geometry.0,
+        height = geometry.1,
+        fps = geometry.2,
         "UDP video sender encoder chosen"
     );
     let sink = UdpSink::new(DEFAULT_SEND_BUFFER_BYTES, super::Dscp::Af41)
         .map_err(|e| format!("UDP socket: {e}"))?;
     let config = VideoSenderConfig {
         video_port: options.video_port,
+        stream_id,
         keyframe_requests: Some(keyframe_requests),
         ..VideoSenderConfig::default()
     };
@@ -189,6 +317,13 @@ pub async fn start_daemon_video_sender(
 mod tests {
     use super::*;
     use linux_quest_capture::SyntheticCapture;
+
+    #[test]
+    fn monitor_streams_receive_independent_bitrate_shares() {
+        assert_eq!(bitrate_shares(30, 3).unwrap(), vec![10, 10, 10]);
+        assert_eq!(bitrate_shares(32, 3).unwrap(), vec![11, 11, 10]);
+        assert!(bitrate_shares(2, 3).unwrap_err().contains("positive share"));
+    }
 
     #[tokio::test]
     async fn synthetic_capture_is_refused_unless_allowed() {
@@ -231,5 +366,90 @@ mod tests {
             ),
             Ok(handle) => handle.stop().await,
         }
+    }
+
+    #[test]
+    fn encoder_geometry_follows_the_capture() {
+        let defaults = EncoderConfig::default();
+        let info = |width, height, fps| CaptureInfo {
+            width,
+            height,
+            fps,
+            format: linux_quest_capture::PixelFormat::Bgra8,
+            dmabuf: false,
+            modifier: None,
+        };
+        assert_eq!(
+            encode_geometry(Some(&info(3840, 2160, 60)), &defaults),
+            (3840, 2160, 60)
+        );
+        // Odd sizes are rounded down to even; an unknown rate keeps the default.
+        assert_eq!(
+            encode_geometry(Some(&info(1365, 767, 0)), &defaults),
+            (1364, 766, defaults.fps)
+        );
+        assert_eq!(
+            encode_geometry(None, &defaults),
+            (defaults.width, defaults.height, defaults.fps)
+        );
+    }
+
+    /// Ends after `frames_before_end` frames; `init` then succeeds or refuses.
+    struct EndingCapture {
+        frames_before_end: u32,
+        frames: u32,
+        inits: u32,
+        refuse_restart: bool,
+    }
+
+    #[async_trait]
+    impl DisplayCapture for EndingCapture {
+        async fn init(&mut self) -> Result<(), CaptureError> {
+            self.inits += 1;
+            if self.inits > 1 && self.refuse_restart {
+                return Err(ScreenCastError::UserCancelled.into());
+            }
+            self.frames = 0;
+            Ok(())
+        }
+        async fn capture_frame(&mut self) -> Result<RawFrame, CaptureError> {
+            if self.frames >= self.frames_before_end {
+                return Err(ScreenCastError::SessionClosed.into());
+            }
+            self.frames += 1;
+            SyntheticCapture::new(0, 16, 16, 1000).capture_frame().await
+        }
+        fn backend_type(&self) -> CaptureBackendType {
+            CaptureBackendType::PipeWire
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_ended_capture_is_restarted() {
+        let capture = EndingCapture {
+            frames_before_end: 1,
+            frames: 0,
+            inits: 0,
+            refuse_restart: false,
+        };
+        let mut source = CaptureFrameSource::open(capture, false).await.unwrap();
+        assert!(source.next_frame().await.is_ok());
+        // The session closes; the source restarts it and keeps delivering frames.
+        assert!(source.next_frame().await.is_ok());
+        assert_eq!(source.capture.inits, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_restart_is_not_retried() {
+        let capture = EndingCapture {
+            frames_before_end: 0,
+            frames: 0,
+            inits: 0,
+            refuse_restart: true,
+        };
+        let mut source = CaptureFrameSource::open(capture, false).await.unwrap();
+        let err = source.next_frame().await.unwrap_err();
+        assert!(user_refused(&err), "{err}");
+        assert_eq!(source.capture.inits, 2, "exactly one restart attempt");
     }
 }

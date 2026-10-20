@@ -4,12 +4,14 @@
 //! absolute pointer, and keyboard devices.
 
 pub mod auto;
+pub mod backend;
 pub mod clipboard;
 pub mod device;
 pub mod error;
 pub mod uinput;
 
 pub use auto::{create_auto_injector, AutoInputInjector};
+pub use backend::{BackendDiagnostic, BackendKind, XTestInjector};
 pub use clipboard::{
     AutoClipboardBackend, ClipboardBackend, ClipboardCommandRunner, ClipboardMessage,
     ClipboardReassembler, ClipboardSyncEngine, ClipboardWatcher, ClipboardWatcherConfig,
@@ -35,6 +37,14 @@ pub trait InputInjector: Send + Sync {
     fn release_all(&mut self) -> Result<(), InputError> {
         Ok(())
     }
+}
+
+/// Backend contract used by automatic host input discovery.
+///
+/// Backends must remember pressed keys and buttons and release them on disconnect.
+pub trait InputBackend: InputInjector {
+    fn backend_kind(&self) -> BackendKind;
+    fn diagnostic(&self) -> BackendDiagnostic;
 }
 
 impl<T: ?Sized + InputInjector> InputInjector for Box<T> {

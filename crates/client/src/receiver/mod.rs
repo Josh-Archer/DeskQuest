@@ -2,6 +2,7 @@
 
 pub mod loss_recovery;
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use linux_quest_protocol::packet::Packet;
@@ -16,6 +17,7 @@ use crate::error::ClientResult;
 
 /// Client network receiver that reconstructs lost packets and reassembles video frames.
 pub struct ClientReceiver {
+    stream_id: Option<u16>,
     jitter_buffer: AdaptiveJitterBuffer,
     reassembler: FrameReassembler,
     packets_received: u64,
@@ -34,6 +36,7 @@ impl ClientReceiver {
         };
 
         Self {
+            stream_id: None,
             jitter_buffer: AdaptiveJitterBuffer::new(jb_config),
             reassembler: FrameReassembler::new(16),
             packets_received: 0,
@@ -41,8 +44,21 @@ impl ClientReceiver {
         }
     }
 
+    /// Creates an isolated receiver for one protocol stream id.
+    pub fn for_stream(config: &ClientConfig, stream_id: u16) -> Self {
+        let mut receiver = Self::new(config);
+        receiver.stream_id = Some(stream_id);
+        receiver
+    }
+
     /// Ingests a raw transport packet into the jitter buffer.
     pub fn ingest_packet(&mut self, packet: Packet, now: Instant) {
+        if self
+            .stream_id
+            .is_some_and(|id| packet.header.stream_id != id)
+        {
+            return;
+        }
         self.packets_received += 1;
         self.jitter_buffer.ingest_packet(packet, now);
         let restarts = self.jitter_buffer.stats().stream_restarts;
@@ -110,6 +126,87 @@ impl ClientReceiver {
     /// Packets permanently lost.
     pub fn packets_lost_count(&self) -> u64 {
         self.jitter_buffer.stats().packets_lost
+    }
+}
+
+/// Routes packets into independent jitter, FEC and reassembly state for each monitor stream.
+pub struct MultiStreamReceiver {
+    config: ClientConfig,
+    streams: BTreeMap<u16, ClientReceiver>,
+}
+
+#[cfg(test)]
+mod multi_stream_tests {
+    use super::*;
+    use bytes::Bytes;
+    use linux_quest_protocol::packet::{PacketHeader, PacketType};
+
+    #[test]
+    fn packets_are_routed_to_isolated_stream_receivers() {
+        let mut receivers = MultiStreamReceiver::new(ClientConfig::default());
+        assert!(receivers.add_stream(4));
+        assert!(receivers.add_stream(8));
+        assert!(!receivers.add_stream(4));
+        let payload = Bytes::from_static(b"ignored non-video payload");
+        let packet = Packet::new(
+            PacketHeader::new(PacketType::Ping, 8, 1, 10, &payload),
+            payload,
+        );
+        assert!(receivers.ingest_packet(packet, Instant::now()));
+        let unknown = Packet::new(
+            PacketHeader::new(PacketType::Ping, 9, 1, 10, &[]),
+            Bytes::new(),
+        );
+        assert!(!receivers.ingest_packet(unknown, Instant::now()));
+        assert_eq!(receivers.stream_ids().collect::<Vec<_>>(), vec![4, 8]);
+        assert!(receivers.remove_stream(4));
+        assert_eq!(receivers.stream_ids().collect::<Vec<_>>(), vec![8]);
+    }
+}
+
+impl MultiStreamReceiver {
+    pub fn new(config: ClientConfig) -> Self {
+        Self {
+            config,
+            streams: BTreeMap::new(),
+        }
+    }
+
+    pub fn add_stream(&mut self, stream_id: u16) -> bool {
+        if self.streams.contains_key(&stream_id) {
+            return false;
+        }
+        self.streams.insert(
+            stream_id,
+            ClientReceiver::for_stream(&self.config, stream_id),
+        );
+        true
+    }
+
+    pub fn remove_stream(&mut self, stream_id: u16) -> bool {
+        self.streams.remove(&stream_id).is_some()
+    }
+
+    pub fn ingest_packet(&mut self, packet: Packet, now: Instant) -> bool {
+        let Some(receiver) = self.streams.get_mut(&packet.header.stream_id) else {
+            return false;
+        };
+        receiver.ingest_packet(packet, now);
+        true
+    }
+
+    pub fn pop_ready_frames(
+        &mut self,
+        now: Instant,
+    ) -> ClientResult<BTreeMap<u16, Vec<AssembledFrame>>> {
+        self.streams
+            .iter_mut()
+            .map(|(id, receiver)| Ok((*id, receiver.pop_ready_frames(now)?)))
+            .collect()
+    }
+
+    pub fn stream_ids(&self) -> impl Iterator<Item = u16> + '_ {
+        self.streams.keys().copied()
     }
 }
 

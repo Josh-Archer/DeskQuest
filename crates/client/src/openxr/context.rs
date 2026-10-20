@@ -30,6 +30,93 @@ use crate::openxr::refresh_rate::RefreshRateManager;
 use crate::spatial::interaction::{HandTrackingData, Handedness};
 use crate::spatial::ScreenTransform;
 
+/// A small RGBA swapchain for one overlay texture (ray, cursor or border).
+struct OverlaySwapchain {
+    swapchain: Swapchain<Vulkan>,
+    images: Vec<vk::Image>,
+    size: (u32, u32),
+    /// An image has been released with the current content. The compositor keeps showing the
+    /// last released image, so a texture is only uploaded again when it changes (each upload
+    /// waits on the GPU; doing it every frame stalled the app).
+    ready: bool,
+}
+
+impl OverlaySwapchain {
+    fn create(session: &Session<Vulkan>, format: u32, size: (u32, u32)) -> ClientResult<Self> {
+        let info = SwapchainCreateInfo {
+            create_flags: SwapchainCreateFlags::EMPTY,
+            usage_flags: SwapchainUsageFlags::COLOR_ATTACHMENT
+                | SwapchainUsageFlags::SAMPLED
+                | SwapchainUsageFlags::TRANSFER_DST,
+            format,
+            sample_count: 1,
+            width: size.0,
+            height: size.1,
+            face_count: 1,
+            array_size: 1,
+            mip_count: 1,
+        };
+        let swapchain = session.create_swapchain(&info).map_err(|e| {
+            ClientError::OpenXr(format!("Failed to create overlay swapchain: {e:?}"))
+        })?;
+        let images = swapchain
+            .enumerate_images()
+            .map(|imgs| {
+                imgs.into_iter()
+                    .map(|raw| vk::Image::from_raw(raw as _))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Self {
+            swapchain,
+            images,
+            size,
+            ready: false,
+        })
+    }
+
+    /// Uploads `rgba` into the next image. False if the image could not be filled this frame.
+    fn upload(&mut self, vulkan: &VulkanContext, rgba: &[u8]) -> bool {
+        let Ok(idx) = self.swapchain.acquire_image() else {
+            return false;
+        };
+        let waited = self
+            .swapchain
+            .wait_image(openxr::Duration::INFINITE)
+            .is_ok();
+        let uploaded = waited
+            && self.images.get(idx as usize).is_some_and(|&img| {
+                vulkan
+                    .upload_rgba_to_image(img, self.size.0, self.size.1, rgba)
+                    .is_ok()
+            });
+        let released = self.swapchain.release_image().is_ok();
+        self.ready = uploaded && released;
+        self.ready
+    }
+
+    /// Uploads only if no current content has been released yet.
+    fn ensure(&mut self, vulkan: &VulkanContext, rgba: &[u8]) -> bool {
+        self.ready || self.upload(vulkan, rgba)
+    }
+}
+
+/// Swapchains and cached textures for pointers and the window handles.
+struct OverlaySwapchains {
+    ray: OverlaySwapchain,
+    cursor: OverlaySwapchain,
+    bar: OverlaySwapchain,
+    bar_active: OverlaySwapchain,
+    corner: OverlaySwapchain,
+    corner_active: OverlaySwapchain,
+    ray_rgba: Vec<u8>,
+    cursor_rgba: Vec<u8>,
+    bar_rgba: Vec<u8>,
+    bar_active_rgba: Vec<u8>,
+    corner_rgba: Vec<u8>,
+    corner_active_rgba: Vec<u8>,
+}
+
 /// OpenXR application runtime context managing instance, session, and swapchains.
 pub struct OpenXrContext {
     instance: Option<Instance>,
@@ -42,6 +129,7 @@ pub struct OpenXrContext {
     desktop_swapchain: Option<Swapchain<Vulkan>>,
     hud_swapchain: Option<Swapchain<Vulkan>>,
     hud_images: Vec<vk::Image>,
+    overlay_swapchains: Option<OverlaySwapchains>,
     #[cfg(target_os = "android")]
     surface_window: Option<ndk::native_window::NativeWindow>,
     #[cfg(target_os = "android")]
@@ -82,6 +170,7 @@ impl OpenXrContext {
             desktop_swapchain: None,
             hud_swapchain: None,
             hud_images: Vec::new(),
+            overlay_swapchains: None,
             #[cfg(target_os = "android")]
             surface_window: None,
             #[cfg(target_os = "android")]
@@ -501,6 +590,7 @@ impl OpenXrContext {
             desktop_swapchain: None,
             hud_swapchain: None,
             hud_images: Vec::new(),
+            overlay_swapchains: None,
             #[cfg(target_os = "android")]
             surface_window: None,
             #[cfg(target_os = "android")]
@@ -698,6 +788,32 @@ impl OpenXrContext {
         }
         self.hud_swapchain = Some(hud_swapchain);
         self.hud_images = hud_images;
+        // Pointers and border are optional: without them the desktop still works.
+        let overlay = (|| -> ClientResult<OverlaySwapchains> {
+            use crate::openxr::overlay::*;
+            Ok(OverlaySwapchains {
+                ray: OverlaySwapchain::create(&session, swapchain_format, RAY_TEXTURE)?,
+                cursor: OverlaySwapchain::create(&session, swapchain_format, CURSOR_TEXTURE)?,
+                bar: OverlaySwapchain::create(&session, swapchain_format, BAR_TEXTURE)?,
+                bar_active: OverlaySwapchain::create(&session, swapchain_format, BAR_TEXTURE)?,
+                corner: OverlaySwapchain::create(&session, swapchain_format, CORNER_TEXTURE)?,
+                corner_active: OverlaySwapchain::create(
+                    &session,
+                    swapchain_format,
+                    CORNER_TEXTURE,
+                )?,
+                ray_rgba: ray_rgba(),
+                cursor_rgba: cursor_rgba(),
+                bar_rgba: bar_rgba(0.28),
+                bar_active_rgba: bar_rgba(0.75),
+                corner_rgba: corner_rgba(0.35),
+                corner_active_rgba: corner_rgba(0.85),
+            })
+        })();
+        match overlay {
+            Ok(o) => self.overlay_swapchains = Some(o),
+            Err(e) => tracing::warn!(error = ?e, "pointer and window-handle overlays unavailable"),
+        }
         self.swapchains_created = true;
         Ok(())
     }
@@ -980,6 +1096,7 @@ impl OpenXrContext {
         config: &ClientConfig,
         vulkan_context: &VulkanContext,
         hud_rgba: Option<&[u8]>,
+        overlay: &crate::openxr::overlay::OverlayScene,
     ) -> ClientResult<()> {
         if self.is_simulated {
             return Ok(());
@@ -1076,7 +1193,104 @@ impl OpenXrContext {
                 None
             };
 
-            let mut layers: Vec<&CompositionLayerBase<'_, Vulkan>> = Vec::with_capacity(3);
+            // Pointers and window handles: upload what is drawn (once; the compositor keeps
+            // showing a swapchain's last released image), then build their layers.
+            use crate::openxr::overlay::{
+                cursor_pose, ray_quad_pose, BAR_TEXTURE, CORNER_TEXTURE, CURSOR_SIZE_M,
+                CURSOR_TEXTURE, RAY_TEXTURE, RAY_WIDTH_M,
+            };
+            let (mut rays_ok, mut cursor_ok, mut bar_ok, mut corner_ok) =
+                (false, false, false, false);
+            if let Some(o) = &mut self.overlay_swapchains {
+                if !overlay.pointers.is_empty() {
+                    rays_ok = o.ray.ensure(vulkan_context, &o.ray_rgba);
+                    if overlay.pointers.iter().any(|p| p.hit) {
+                        cursor_ok = o.cursor.ensure(vulkan_context, &o.cursor_rgba);
+                    }
+                }
+                if let Some(bar) = &overlay.bar {
+                    bar_ok = if bar.active {
+                        o.bar_active.ensure(vulkan_context, &o.bar_active_rgba)
+                    } else {
+                        o.bar.ensure(vulkan_context, &o.bar_rgba)
+                    };
+                }
+                if let Some(corner) = &overlay.corner {
+                    corner_ok = if corner.active {
+                        o.corner_active
+                            .ensure(vulkan_context, &o.corner_active_rgba)
+                    } else {
+                        o.corner.ensure(vulkan_context, &o.corner_rgba)
+                    };
+                }
+            }
+            let eye = self
+                .view_space
+                .as_ref()
+                .and_then(|v| v.locate(space, display_time).ok())
+                .filter(|l| {
+                    l.location_flags
+                        .contains(openxr::SpaceLocationFlags::POSITION_VALID)
+                })
+                .map(|l| crate::spatial::Vec3::from(l.pose.position))
+                .unwrap_or(crate::spatial::Vec3::new(0.0, 1.6, 0.0));
+            let ov = self.overlay_swapchains.as_ref();
+            let mut pointer_layers = Vec::new();
+            if let Some(o) = ov {
+                if bar_ok {
+                    if let Some(bar) = &overlay.bar {
+                        let sc = if bar.active { &o.bar_active } else { &o.bar };
+                        pointer_layers.push(crate::openxr::layers::build_overlay_quad(
+                            space,
+                            &sc.swapchain,
+                            BAR_TEXTURE,
+                            openxr::Posef::from(bar.pose),
+                            bar.size,
+                        ));
+                    }
+                }
+                if corner_ok {
+                    if let Some(corner) = &overlay.corner {
+                        let sc = if corner.active {
+                            &o.corner_active
+                        } else {
+                            &o.corner
+                        };
+                        pointer_layers.push(crate::openxr::layers::build_overlay_quad(
+                            space,
+                            &sc.swapchain,
+                            CORNER_TEXTURE,
+                            openxr::Posef::from(corner.pose),
+                            corner.size,
+                        ));
+                    }
+                }
+                if rays_ok {
+                    for p in &overlay.pointers {
+                        pointer_layers.push(crate::openxr::layers::build_overlay_quad(
+                            space,
+                            &o.ray.swapchain,
+                            RAY_TEXTURE,
+                            openxr::Posef::from(ray_quad_pose(p, eye)),
+                            (RAY_WIDTH_M, p.length.max(0.01)),
+                        ));
+                    }
+                }
+                if cursor_ok {
+                    for p in overlay.pointers.iter().filter(|p| p.hit) {
+                        pointer_layers.push(crate::openxr::layers::build_overlay_quad(
+                            space,
+                            &o.cursor.swapchain,
+                            CURSOR_TEXTURE,
+                            openxr::Posef::from(cursor_pose(p)),
+                            (CURSOR_SIZE_M, CURSOR_SIZE_M),
+                        ));
+                    }
+                }
+            }
+
+            let mut layers: Vec<&CompositionLayerBase<'_, Vulkan>> =
+                Vec::with_capacity(4 + pointer_layers.len());
             if let Some(ref pt) = pt_layer {
                 layers.push(pt);
             }
@@ -1100,6 +1314,9 @@ impl OpenXrContext {
                 };
 
                 layers.push(&cyl_layer);
+                for l in &pointer_layers {
+                    layers.push(l);
+                }
                 if let Some(ref hud) = hud_layer {
                     layers.push(hud);
                 }
@@ -1123,6 +1340,9 @@ impl OpenXrContext {
                 };
 
                 layers.push(&quad_layer);
+                for l in &pointer_layers {
+                    layers.push(l);
+                }
                 if let Some(ref hud) = hud_layer {
                     layers.push(hud);
                 }
@@ -1246,7 +1466,13 @@ mod tests {
 
         let vk_ctx = VulkanContext::new_simulated();
         assert!(ctx
-            .render_and_present_layers(Time::from_nanos(1), &config, &vk_ctx, None)
+            .render_and_present_layers(
+                Time::from_nanos(1),
+                &config,
+                &vk_ctx,
+                None,
+                &Default::default()
+            )
             .is_ok());
 
         // Test passthrough in simulated context
