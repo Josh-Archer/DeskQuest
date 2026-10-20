@@ -176,6 +176,29 @@ mod tests {
         assert_eq!(config.input_port, 48999);
     }
 
+    #[test]
+    fn connection_uses_advertised_ports_and_prefers_the_lan_address() {
+        let mut discovered = host("studio", 20, 48445);
+        discovered.addresses = vec![
+            IpAddr::from([172, 17, 0, 1]),
+            IpAddr::from([192, 168, 1, 20]),
+            IpAddr::from([10, 0, 0, 4]),
+        ];
+        discovered.control_port = 50123;
+        discovered.input_port = 50124;
+
+        let mut config = ClientConfig::default();
+        connect_config_to(&mut config, &discovered).unwrap();
+
+        assert_eq!(config.transport_mode, TransportMode::Udp);
+        assert_eq!(config.host_addr, "192.168.1.20:50123".parse().unwrap());
+        assert_eq!(config.input_port, 50124);
+        assert_eq!(
+            config.extra_host_ips,
+            vec![IpAddr::from([10, 0, 0, 4]), IpAddr::from([172, 17, 0, 1])]
+        );
+    }
+
     #[tokio::test]
     async fn multiple_hosts_choose_deterministically_and_report_the_rest() {
         let mut d = discovery(
