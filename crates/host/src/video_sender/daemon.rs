@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use linux_quest_capture::{
-    AutoCapture, CaptureBackendType, CaptureError, DisplayCapture, RawFrame,
+    AutoCapture, CaptureBackendType, CaptureError, CaptureInfo, DisplayCapture, RawFrame,
 };
 use linux_quest_encoder::{
     create_encoder, probe_backends, BackendKind, BackendPreference, EncodedFrame, EncoderConfig,
@@ -42,6 +42,24 @@ impl<C: DisplayCapture> CaptureFrameSource<C> {
             )));
         }
         Ok(Self { capture })
+    }
+
+    /// Size and rate the capture negotiated, if it reports them.
+    pub fn capture_info(&self) -> Option<CaptureInfo> {
+        self.capture.capture_info()
+    }
+}
+
+/// Encoder size and rate for `info`: the capture's own resolution (so the whole screen is
+/// encoded, not the top-left corner of it) with even dimensions, and its frame rate when known.
+fn encode_geometry(info: Option<&CaptureInfo>, defaults: &EncoderConfig) -> (u32, u32, u32) {
+    match info {
+        Some(info) if info.width >= 2 && info.height >= 2 => (
+            info.width & !1,
+            info.height & !1,
+            if info.fps > 0 { info.fps } else { defaults.fps },
+        ),
+        _ => (defaults.width, defaults.height, defaults.fps),
     }
 }
 
@@ -95,6 +113,7 @@ impl VideoEncoder for BoxedEncoder {
 async fn open_planned_encoder(
     preference: BackendPreference,
     bitrate_kbps: u32,
+    (width, height, fps): (u32, u32, u32),
 ) -> Result<(BoxedEncoder, StreamPlan), String> {
     let probes = tokio::task::spawn_blocking(|| {
         CODEC_PREFERENCE
@@ -125,6 +144,9 @@ async fn open_planned_encoder(
     let config = EncoderConfig {
         codec: plan.codec,
         bitrate_kbps,
+        width,
+        height,
+        fps,
         ..EncoderConfig::default()
     };
     let backend_only = match plan.backend {
@@ -151,28 +173,22 @@ pub async fn start_daemon_video_sender(
     let defaults = EncoderConfig::default();
     let capture = AutoCapture::new(0, defaults.width, defaults.height, defaults.fps);
 
-    let source = CaptureFrameSource::open(capture, options.test_pattern).await;
+    let source = CaptureFrameSource::open(capture, options.test_pattern)
+        .await
+        .map_err(|e| format!("capture: {e}"))?;
+    let geometry = encode_geometry(source.capture_info().as_ref(), &defaults);
     let bitrate_kbps = options.bitrate_mbps.saturating_mul(1000);
-    let encoder = open_planned_encoder(options.encoder, bitrate_kbps).await;
-
-    let (source, (encoder, plan)) = match (source, encoder) {
-        (Ok(source), Ok(encoder)) => (source, encoder),
-        (source, encoder) => {
-            let mut reasons = Vec::new();
-            if let Err(e) = source {
-                reasons.push(format!("capture: {e}"));
-            }
-            if let Err(e) = encoder {
-                reasons.push(format!("encoder: {e}"));
-            }
-            return Err(reasons.join("; "));
-        }
-    };
+    let (encoder, plan) = open_planned_encoder(options.encoder, bitrate_kbps, geometry)
+        .await
+        .map_err(|e| format!("encoder: {e}"))?;
 
     tracing::info!(
         backend = plan.backend.name(),
         codec = ?plan.codec,
         bitrate_mbps = options.bitrate_mbps,
+        width = geometry.0,
+        height = geometry.1,
+        fps = geometry.2,
         "UDP video sender encoder chosen"
     );
     let sink = UdpSink::new(DEFAULT_SEND_BUFFER_BYTES, super::Dscp::Af41)
@@ -231,5 +247,31 @@ mod tests {
             ),
             Ok(handle) => handle.stop().await,
         }
+    }
+
+    #[test]
+    fn encoder_geometry_follows_the_capture() {
+        let defaults = EncoderConfig::default();
+        let info = |width, height, fps| CaptureInfo {
+            width,
+            height,
+            fps,
+            format: linux_quest_capture::PixelFormat::Bgra8,
+            dmabuf: false,
+            modifier: None,
+        };
+        assert_eq!(
+            encode_geometry(Some(&info(3840, 2160, 60)), &defaults),
+            (3840, 2160, 60)
+        );
+        // Odd sizes are rounded down to even; an unknown rate keeps the default.
+        assert_eq!(
+            encode_geometry(Some(&info(1365, 767, 0)), &defaults),
+            (1364, 766, defaults.fps)
+        );
+        assert_eq!(
+            encode_geometry(None, &defaults),
+            (defaults.width, defaults.height, defaults.fps)
+        );
     }
 }
