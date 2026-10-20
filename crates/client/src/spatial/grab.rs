@@ -219,6 +219,19 @@ impl GrabStateMachine {
                 let current_display_id = *display_id;
                 let current_source = *source;
 
+                // Another hand or controller pointing at a screen and squeezing takes the grab, so
+                // the user does not have to squeeze with the hand that happened to hover first.
+                let takeover = (input.is_grabbing && input.source != current_source)
+                    .then_some(input.aim_ray.as_ref())
+                    .flatten()
+                    .and_then(|ray| {
+                        ScreenTransform::find_closest_hit(ray, screens_vec.iter().copied())
+                    });
+                let (current_display_id, current_source) = match takeover {
+                    Some((id, _)) => (id, input.source),
+                    None => (current_display_id, current_source),
+                };
+
                 // Grab initiation: user squeezed grip or pinched while hovering
                 if input.is_grabbing && input.source == current_source {
                     let target_screen = screens_vec
@@ -925,8 +938,8 @@ mod tests {
     }
 
     #[test]
-    fn test_two_hand_scale_curved_scales_radius() {
-        // Default display mode is the curved cylinder: its radius (1.5 m) carries the size
+    fn test_two_hand_scale_curved_widens_the_arc() {
+        // Default display mode is the curved cylinder: its arc (central angle) carries the size
         let screen = ScreenTransform::for_display(0);
         assert_eq!(screen.display_mode, DisplayMode::CurvedCylinder);
         let (mut sm, _) = start_right_grab(&screen);
@@ -945,8 +958,13 @@ mod tests {
             0.0,
             0.3,
         );
-        assert!((t.curve_radius - 3.0).abs() < 1e-4);
-        assert!((t.curve_angle - screen.curve_angle).abs() < 1e-6);
+        assert!((t.curve_radius - screen.curve_radius).abs() < 1e-6);
+        assert!(
+            t.curve_angle > screen.curve_angle * 1.2,
+            "arc widens: {} -> {}",
+            screen.curve_angle,
+            t.curve_angle
+        );
         assert!((t.aspect_ratio - screen.aspect_ratio).abs() < 1e-6);
     }
 

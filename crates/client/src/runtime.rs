@@ -284,15 +284,44 @@ impl QuestClientRuntime {
             })
             .collect();
 
+        // An input that points at the screen and squeezes wins (it starts or takes over the
+        // grab); otherwise a grab or hover in progress keeps its source.
+        let squeezing_on_screen = pointing
+            .iter()
+            .zip(&hits)
+            .find(|(i, hit)| i.is_grabbing && hit.is_some())
+            .map(|(i, _)| *i);
+        let grabbing = matches!(
+            self.interaction_state_machine.state(),
+            InteractionState::Grabbing(_)
+        );
         let selected_input = match active_source {
-            // A grab or hover in progress keeps its source.
-            Some(src) => pointing.iter().find(|inp| inp.source == src).cloned(),
-            None => pointing
-                .iter()
-                .zip(&hits)
-                .find(|(_, hit)| hit.is_some())
-                .map(|(i, _)| *i)
-                .or_else(|| pointing.first().cloned()),
+            // The grabbing hand or controller lost tracking (no ray, no pose): treat that as a
+            // release. Otherwise the grab would never see one and would stick forever.
+            Some(src) if grabbing => {
+                pointing
+                    .iter()
+                    .find(|inp| inp.source == src)
+                    .cloned()
+                    .or(Some(InteractionInput {
+                        source: src,
+                        aim_ray: None,
+                        grab_pose: None,
+                        is_grabbing: false,
+                        is_selecting: false,
+                        thumbstick: (0.0, 0.0),
+                    }))
+            }
+            Some(src) => squeezing_on_screen
+                .or_else(|| pointing.iter().find(|inp| inp.source == src).copied()),
+            None => squeezing_on_screen.or_else(|| {
+                pointing
+                    .iter()
+                    .zip(&hits)
+                    .find(|(_, hit)| hit.is_some())
+                    .map(|(i, _)| *i)
+                    .or_else(|| pointing.first().cloned())
+            }),
         };
 
         if let Some(input) = selected_input {
@@ -717,7 +746,7 @@ impl QuestClientRuntime {
 /// Hover and grab transitions are rare and useful when checking input on a headset.
 fn log_interaction_event(event: &InteractionEvent) {
     match event {
-        InteractionEvent::GrabUpdated { .. } => {}
+        InteractionEvent::GrabUpdated { .. } | InteractionEvent::HoverUpdated { .. } => {}
         other => tracing::info!(event = ?other, "screen interaction"),
     }
 }

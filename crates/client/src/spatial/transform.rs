@@ -234,10 +234,13 @@ impl ScreenTransform {
                 self.quad_size = (base.quad_size.0 * applied, base.quad_size.1 * applied);
                 applied
             }
+            // The cylinder is centred on the user, so a larger radius only moves the screen
+            // away at the same apparent size. Widen the arc instead (the height follows from
+            // the aspect ratio).
             DisplayMode::CurvedCylinder => {
-                let applied = clamp_radius_scale(factor, base.curve_radius);
-                self.curve_radius = base.curve_radius * applied;
-                applied
+                let angle = clamp_curve_angle(base.curve_angle * factor);
+                self.curve_angle = angle;
+                angle / base.curve_angle.max(f32::EPSILON)
             }
         };
         self.clamp();
@@ -252,6 +255,17 @@ impl ScreenTransform {
     /// Returns the 6DoF `ScreenPose`.
     pub fn pose(&self) -> ScreenPose {
         ScreenPose::new(self.position, self.orientation)
+    }
+
+    /// Axis of the curved screen: one radius behind the screen centre (`position`), towards
+    /// the viewer. The arc's middle is then exactly at `position`, whatever the radius, so the
+    /// curvature can change without moving the screen. Used for both the compositor layer and
+    /// the hit test, so what is drawn and what the pointer hits always agree.
+    pub fn cylinder_axis_pose(&self) -> ScreenPose {
+        let back = self
+            .orientation
+            .rotate_vec(Vec3::new(0.0, 0.0, self.curve_radius));
+        ScreenPose::new(self.position + back, self.orientation)
     }
 
     /// Clamps all fields to safe, ergonomic ranges.
@@ -304,7 +318,10 @@ impl ScreenTransform {
             cylinder_radius: self.curve_radius,
             cylinder_central_angle: self.curve_angle,
             cylinder_aspect_ratio: self.aspect_ratio,
-            pose: Some(self.pose().into()),
+            pose: Some(match self.display_mode {
+                DisplayMode::CurvedCylinder => self.cylinder_axis_pose().into(),
+                DisplayMode::FlatQuad => self.pose().into(),
+            }),
         }
     }
 

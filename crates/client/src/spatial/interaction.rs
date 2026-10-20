@@ -395,7 +395,9 @@ impl InteractionInput {
             source: InteractionSource::Controller(hand),
             aim_ray,
             grab_pose,
-            is_grabbing: state.is_grabbing(),
+            // Grip or trigger grabs, like moving windows on Horizon. The trigger is not used for
+            // desktop clicks yet.
+            is_grabbing: state.is_grabbing() || state.is_selecting(),
             is_selecting: state.is_selecting(),
             thumbstick: state.thumbstick,
         }
