@@ -30,7 +30,9 @@ pub(crate) fn activity_jobject() -> *mut std::ffi::c_void {
 use std::net::{IpAddr, SocketAddr};
 
 use crate::config::{ClientConfig, TransportMode};
-use crate::input_sender::{input_sender_config, InputSenderThread, KeyframeRequestSource};
+use crate::input_sender::{
+    input_sender_config, InputSenderThread, PointerInputSource, SharedInputEvents,
+};
 use crate::runtime::QuestClientRuntime;
 
 /// Source IPs that UDP video datagrams must come from, or `None` to accept any source.
@@ -84,9 +86,7 @@ pub fn udp_config_warning(config: &ClientConfig) -> Option<String> {
 /// Starts the UDP input/keepalive sender for `config`, or returns `None` when none should run.
 ///
 /// Only `Udp` mode sends: `adb reverse` forwards TCP only, so in `AdbReverseTcp` mode the client
-/// sends no input (and no keepalive) at all. Sending real controller input is not mapped yet,
-/// so the source is keepalive-only: enough for the host to latch this headset and stream video
-/// to it. See `crate::input_sender` for the design.
+/// sends no input (and no keepalive) at all. See `crate::input_sender` for the design.
 /// Starts the UDP input/keepalive sender (Udp mode only). Returns it with the flag that, once
 /// raised (then [`crate::input_sender::InputSenderControl::notify`]), sends a keyframe request.
 pub fn start_input_sender(
@@ -94,6 +94,7 @@ pub fn start_input_sender(
 ) -> Option<(
     InputSenderThread,
     std::sync::Arc<std::sync::atomic::AtomicBool>,
+    SharedInputEvents,
 )> {
     let Some(sender_config) = input_sender_config(config) else {
         match config.transport_mode {
@@ -110,10 +111,14 @@ pub fn start_input_sender(
         return None;
     };
     tracing::info!(targets = ?sender_config.targets, "starting UDP input/keepalive sender");
-    let source = KeyframeRequestSource::new();
-    let keyframe_flag = source.requester();
+    let events = SharedInputEvents::default();
+    let keyframe_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let source = PointerInputSource {
+        events: events.clone(),
+        keyframe: keyframe_flag.clone(),
+    };
     match InputSenderThread::spawn(sender_config, Box::new(source)) {
-        Ok(sender) => Some((sender, keyframe_flag)),
+        Ok(sender) => Some((sender, keyframe_flag, events)),
         Err(e) => {
             tracing::warn!(error = ?e, "failed to start UDP input sender");
             None
@@ -263,9 +268,9 @@ pub fn android_main(app: AndroidApp) {
 
     // Input/keepalive sender (Udp mode only). The receiver below acks it for each accepted
     // host datagram so it stays on the host address that works.
-    let (input_sender, keyframe_flag) = match start_input_sender(&config) {
-        Some((sender, flag)) => (Some(sender), Some(flag)),
-        None => (None, None),
+    let (input_sender, keyframe_flag, pointer_events) = match start_input_sender(&config) {
+        Some((sender, flag, events)) => (Some(sender), Some(flag), Some(events)),
+        None => (None, None, None),
     };
     let ack_control: Option<crate::input_sender::InputSenderControl> =
         input_sender.as_ref().map(|s| s.control().clone());
@@ -475,6 +480,18 @@ pub fn android_main(app: AndroidApp) {
                         Ok(mut rt) => {
                             if let Some(request) = keyframe_requester() {
                                 rt.set_keyframe_requester(request);
+                            }
+                            if let (Some(events), Some(control)) =
+                                (pointer_events.clone(), ack_control.clone())
+                            {
+                                let latency_events = events.clone();
+                                rt.set_pointer_event_sink(Box::new(move |event| {
+                                    events.push(event);
+                                    control.notify();
+                                }));
+                                rt.set_pointer_queue_latency_source(Box::new(move || {
+                                    latency_events.last_queue_latency_us()
+                                }));
                             }
                             runtime = Some(rt);
                             lifecycle.on_session_created();
