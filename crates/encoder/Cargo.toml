@@ -17,5 +17,12 @@ libloading.workspace = true
 audiopus = "0.3.0-rc.0"
 audiopus_sys = { version = "0.2.2", features = ["static"] }
 
+[features]
+# VA-API is loaded dynamically, so enabling this feature does not require libva headers
+# or development packages at build time. It can be disabled for builds that should not
+# probe or select the AMD/Intel backend.
+default = ["vaapi"]
+vaapi = []
+
 [dev-dependencies]
 tokio.workspace = true

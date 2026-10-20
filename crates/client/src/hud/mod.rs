@@ -40,6 +40,7 @@ pub struct DebugHud {
     last_snapshot: HudSnapshot,
     hud_width: u32,
     hud_height: u32,
+    input_latency_us: u64,
 }
 
 impl Default for DebugHud {
@@ -67,6 +68,7 @@ impl DebugHud {
             },
             hud_width,
             hud_height,
+            input_latency_us: 0,
         }
     }
 
@@ -123,14 +125,20 @@ impl DebugHud {
         };
     }
 
+    /// Records the most recent client pointer processing latency for the telemetry HUD.
+    pub fn set_input_latency_us(&mut self, latency_us: u64) {
+        self.input_latency_us = latency_us;
+    }
+
     /// Formats the HUD telemetry summary text.
     pub fn formatted_text(&self) -> String {
         format!(
-            "FPS: {:.1} / {:.0}Hz\nM2P: {:.1}ms | Dec: {:.1}ms\nCodec: {}\nPackets: {} | FEC: {} | Loss: {}",
+            "FPS: {:.1} / {:.0}Hz\nM2P: {:.1}ms | Dec: {:.1}ms\nInput: {:.2}ms\nCodec: {}\nPackets: {} | FEC: {} | Loss: {}",
             self.last_snapshot.fps,
             self.last_snapshot.target_fps,
             self.last_snapshot.motion_to_photon_ms,
             self.last_snapshot.decode_latency_ms,
+            self.input_latency_us as f32 / 1000.0,
             self.last_snapshot.decoder_name,
             self.last_snapshot.packets_received,
             self.last_snapshot.fec_recovered,
@@ -216,10 +224,12 @@ mod tests {
         };
 
         hud.update(&config, &pacing, &stats, 100, 5, 0);
+        hud.set_input_latency_us(1250);
 
         let text = hud.formatted_text();
         assert!(text.contains("M2P: 12.1ms"));
         assert!(text.contains("Dec: 2.4ms"));
+        assert!(text.contains("Input: 1.25ms"));
         assert!(text.contains("c2.qti.av1"));
 
         let rgba = hud.render_to_rgba();

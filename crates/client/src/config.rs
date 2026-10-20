@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use linux_quest_transport::{DEFAULT_CONTROL_PORT, DEFAULT_INPUT_PORT};
 
 use crate::error::{ClientError, ClientResult};
+use crate::spatial::PointerBindings;
 
 /// Supported transport protocol modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +138,10 @@ pub struct ClientConfig {
 
     /// Optional file path to persist spatial screen layout across sessions.
     pub spatial_layout_path: Option<std::path::PathBuf>,
+
+    /// Controller and hand pointer button/scroll/filter settings.
+    #[serde(default)]
+    pub pointer_bindings: PointerBindings,
 }
 
 impl Default for ClientConfig {
@@ -168,6 +173,7 @@ impl Default for ClientConfig {
             force_mock_decoder: true,
             enable_passthrough: true,
             spatial_layout_path: None,
+            pointer_bindings: PointerBindings::default(),
         }
     }
 }
