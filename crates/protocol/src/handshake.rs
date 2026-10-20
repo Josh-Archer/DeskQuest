@@ -1,3 +1,4 @@
+use crate::session::{ResumeStatus, SessionToken};
 use crate::video::VideoCodec;
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +21,8 @@ pub struct ClientHandshake {
     pub requested_displays: u16,
     pub max_bandwidth_mbps: u32,
     pub preferred_refresh_rate: u32,
+    /// Token from a previous `ServerHandshake` to resume that session; `None` for a new one.
+    pub resume_token: Option<SessionToken>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +31,11 @@ pub struct ServerHandshake {
     pub selected_codec: VideoCodec,
     pub negotiated_bitrate_mbps: u32,
     pub displays: Vec<DisplayInfo>,
+    /// Token the client presents to resume this session after a link drop.
+    pub session_token: SessionToken,
+    pub resume_status: ResumeStatus,
+    /// How long the host keeps the session after the link drops, in milliseconds.
+    pub resume_grace_ms: u32,
 }
 
 /// Dynamic multi-monitor control message exchanged over PacketType::DisplayConfig.
