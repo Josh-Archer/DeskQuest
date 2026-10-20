@@ -101,7 +101,7 @@ jobs:
       - name: Install Flatpak build tools and SDK
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y flatpak flatpak-builder python3-aiohttp python3-yaml python3-tomlkit
+          sudo apt-get install --no-install-recommends -y elfutils flatpak flatpak-builder python3-aiohttp python3-yaml python3-tomlkit
           sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
           sudo flatpak install --system --noninteractive flathub org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08 org.freedesktop.Sdk.Extension.rust-stable//24.08
       - uses: dtolnay/rust-toolchain@stable
