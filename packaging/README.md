@@ -1,4 +1,4 @@
-# Packaging
+# Packaging and local builds
 
 Files for running `linux-quest-host` as a background service on Ubuntu / systemd desktops.
 
@@ -8,7 +8,8 @@ Files for running `linux-quest-host` as a background service on Ubuntu / systemd
 | `udev/99-uinput.rules` | Grants the `input` group access to `/dev/uinput` |
 | `modules-load/linux-quest.conf` | Loads the `uinput` module at boot |
 | `debian/postinst`, `debian/copyright` | Debian maintainer script (reloads udev) and copyright file, used by `cargo deb` |
-| `arch/PKGBUILD` | AUR package recipe (see below) |
+| `arch/PKGBUILD` | AUR package recipe |
+| `flatpak/` | Flatpak manifest and vendored Cargo source manifest |
 
 The optional tray icon (`linux-quest-host tray`, tracked in #32) is off by default. See [Optional tray icon](#optional-tray-icon) below.
 
@@ -81,7 +82,7 @@ systemctl --user disable --now linux-quest-host
 
 The tray is a separate process. It asks the daemon for its status over the IPC socket every 2 seconds (`--interval-ms`, minimum 500).
 
-**Build it with the `tray` feature.** The feature pulls in D-Bus (`ksni`), so it is off by default. The release packages do not include it:
+**Build it with the `tray` feature.** The feature pulls in D-Bus (`ksni`), so it is off by default. The host package recipes do not include it:
 
 ```bash
 cargo install --path crates/host --bin linux-quest-host --features tray --root ~/.local
@@ -139,22 +140,94 @@ systemd-analyze --user verify packaging/systemd/linux-quest-host.service
 
 `verify` warns if `/usr/bin/linux-quest-host` does not exist yet. That is expected before installing the binary.
 
-## Packages and the Quest sideload script
+## Build packages locally
 
-Release builds (see `.github/workflows/release.yml`) attach these to each GitHub Release:
+All commands below run from the repository root. They only create local files; CI
+uploads build results as temporary workflow artifacts. This project does not
+publish packages or create releases.
 
-| Artifact | Built with | Installs |
-| :--- | :--- | :--- |
-| `linux-quest-host_<ver>-1_amd64.deb` | `cargo deb -p linux-quest-host --no-build` | host binary, udev rule, `uinput` modules-load config, user unit, licenses |
-| `linux-quest-host-<ver>-1.x86_64.rpm` | `cargo generate-rpm -p crates/host` | same files as the `.deb` |
-| `linux-quest-host-<tag>-x86_64-linux.tar.gz` | plain tar of the binary | binary, udev rule, licenses (copy the rest by hand) |
-| `linux-quest-<tag>-debugsigned.apk` | `crates/client/android/build.sh --release` | Quest client APK, debug-signed |
+### Debian package
 
-The `.deb` and `.rpm` run `udevadm control --reload` and `udevadm trigger` after install (best effort), so the uinput rule applies without a reboot. Neither loads the `uinput` module immediately; the modules-load config does that at the next boot.
+Install Rust and the native build prerequisites, then run:
 
-The AUR package (`arch/PKGBUILD`) builds from the tagged source tarball. It installs the binary, udev rule, modules-load config, user unit and licenses, but no maintainer scripts, so run the `udevadm` reload yourself after install. Its `optdepends` list covers clipboard tools, PipeWire, and `nvidia-utils` for NVENC. Its `check()` runs only the unit tests (`--lib`).
+```bash
+cargo install --locked cargo-deb
+cargo build --release --locked -p linux-quest-host --features mdns
+cargo deb -p linux-quest-host --no-build
+```
 
-The release APK is signed with the debug keystore that `build.sh` generates. It is installable by sideloading, but it is not production-signed. Releases stay marked as pre-releases until a release keystore is configured.
+The `.deb` is written under `target/debian/`. It installs the daemon, `/dev/uinput`
+udev rule, boot-time module configuration, systemd user unit and licenses.
+
+### RPM package
+
+```bash
+cargo install --locked cargo-generate-rpm
+cargo build --release --locked -p linux-quest-host --features mdns
+cargo generate-rpm -p crates/host
+```
+
+The `.rpm` is written under `target/generate-rpm/` and contains the same host
+files. The package runs a best-effort udev reload after installation.
+
+### Arch Linux / AUR package
+
+On Arch Linux, install `base-devel` and `rust`. For a published source tag, update
+`pkgver` and the source checksum in `packaging/arch/PKGBUILD`, then build it:
+
+```bash
+cd packaging/arch
+makepkg --syncdeps --cleanbuild
+```
+
+This builds the host binary with mDNS and installs the udev rule, module-load
+configuration, user unit and licenses. The recipe does not upload to the AUR.
+
+### Flatpak
+
+Install `flatpak`, `flatpak-builder`, Python 3 with `aiohttp`, `PyYAML` and `tomlkit`,
+and the Flathub `org.freedesktop.Sdk//24.08`, `org.freedesktop.Platform//24.08` and
+`org.freedesktop.Sdk.Extension.rust-stable//24.08` refs. Generate the locked Cargo
+dependency source manifest and build locally:
+
+```bash
+python3 packaging/flatpak/flatpak-cargo-generator.py Cargo.lock \
+  -o packaging/flatpak/cargo-sources.json
+flatpak-builder --force-clean --repo=repo build-dir packaging/flatpak/org.linuxquest.Host.yml
+```
+
+Install the local build for testing with `flatpak remote-add --user
+--no-gpg-verify linux-quest-local repo` and `flatpak install --user
+linux-quest-local org.linuxquest.Host`; remove it with `flatpak uninstall --user
+org.linuxquest.Host`.
+Flatpak runs the host daemon in a sandbox. Configure its device and network access
+for your desktop before expecting `/dev/uinput` or capture devices to be available;
+the udev rule and systemd unit are shipped as docs for host-side setup.
+
+### Meta Quest APK
+
+Install Android SDK platform 34, build-tools 34.0.0, NDK 27.2.12479018, Java 17,
+Rust target `aarch64-linux-android`, and `cargo-ndk`. Then build a debug-signed,
+sideloadable APK:
+
+```bash
+cargo install --locked cargo-ndk
+rustup target add aarch64-linux-android
+export ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
+bash crates/client/android/build.sh --release
+```
+
+The APK is `crates/client/target/android-apk/linux-quest-release.apk`. It is
+debug-signed for sideload testing, not signed for store distribution. Install it
+on a connected Quest with `scripts/install-quest.sh` (or pass the APK path).
+
+## Quest sideloading
+
+The `.deb` and `.rpm` run `udevadm control --reload` and `udevadm trigger` after
+install (best effort). Neither loads `uinput` immediately; the module-load config
+does that at the next boot. The AUR package has no maintainer scripts, so reload
+udev manually after installation. Its optional dependencies cover clipboard
+tools, PipeWire, and NVIDIA encoding.
 
 ### Sideloading the APK with `scripts/install-quest.sh`
 
@@ -170,7 +243,9 @@ With no path argument, the script installs the newer of `linux-quest-release.apk
 
 ### Testing LAN discovery on a real Quest (no IP address)
 
-The release `.deb`/`.rpm`/AUR package and the release APK are built with the `mdns` feature. A source build needs it explicitly: `cargo build --release -p linux-quest-host --features mdns` and `crates/client/android/build.sh` (which already passes `--features mdns`).
+The host package recipes and Quest APK use the `mdns` feature. A source build needs
+it explicitly: `cargo build --release -p linux-quest-host --features mdns` and
+`crates/client/android/build.sh` (which already passes `--features mdns`).
 
 1. Put the PC and the Quest on the same Wi-Fi network (same subnet; guest/isolated SSIDs and some mesh "AP isolation" settings block multicast). Allow UDP `5353` (mDNS), TCP `48444`, UDP `48442` and UDP `48440` through the PC firewall, for example `sudo ufw allow from 192.168.1.0/24`.
 2. Start the host with `linux-quest-host daemon` (do not pass `--no-advertise`). The log shows `Advertising host on the LAN` with the instance name, which is the PC's short hostname.

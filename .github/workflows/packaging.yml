@@ -1,0 +1,157 @@
+name: Packaging (test artifacts)
+
+on:
+  push:
+    branches: [main, codex/lq-33-packaging]
+    paths:
+      - '.github/workflows/packaging.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - 'packaging/**'
+      - 'scripts/install-quest.sh'
+  pull_request:
+    paths:
+      - '.github/workflows/packaging.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - 'packaging/**'
+      - 'scripts/install-quest.sh'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-packages:
+    name: Build Debian and RPM packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential edid-decode rpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: packaging-host
+      - name: Install package builders
+        run: cargo install --locked cargo-deb cargo-generate-rpm
+      - name: Build host package payload
+        run: cargo build --release --locked -p linux-quest-host --features mdns
+      - name: Build .deb and .rpm
+        run: |
+          cargo deb -p linux-quest-host --no-build
+          cargo generate-rpm -p crates/host
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-quest-deb-rpm
+          path: |
+            target/debian/*.deb
+            target/generate-rpm/*.rpm
+          if-no-files-found: error
+          retention-days: 7
+
+  aur-package:
+    name: Build Arch package from PKGBUILD
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build package in Arch Linux
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/aur-build"
+          mkdir -p "$stage"
+          cp packaging/arch/PKGBUILD "$stage/PKGBUILD"
+          git archive --format=tar.gz --prefix=linux-quest-0.1.0/ HEAD > "$stage/linux-quest-host-0.1.0.tar.gz"
+          # A CI branch has no release tag. Substitute only the source URL so makepkg
+          # builds this checked-out commit with the same recipe and package steps.
+          # shellcheck disable=SC2016
+          sed -i 's#source=(.*#source=("${pkgname}-${pkgver}.tar.gz")#' "$stage/PKGBUILD"
+          docker run --rm -v "$stage:/build" -w /build archlinux:base-devel bash -lc "
+            set -euo pipefail
+            pacman -Syu --noconfirm --needed rust
+            useradd -m builder
+            chown -R builder:builder /build
+            su builder -c 'makepkg --syncdeps --cleanbuild --noconfirm'
+          "
+          mkdir -p artifacts
+          cp "$stage"/*.pkg.tar.zst artifacts/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-quest-aur-package
+          path: artifacts/*.pkg.tar.zst
+          if-no-files-found: error
+          retention-days: 7
+
+  flatpak:
+    name: Build Flatpak bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Flatpak build tools and SDK
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y flatpak flatpak-builder python3-aiohttp python3-yaml python3-tomlkit
+          sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          sudo flatpak install --system --noninteractive flathub org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08 org.freedesktop.Sdk.Extension.rust-stable//24.08
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Generate locked Cargo source manifest
+        run: python3 packaging/flatpak/flatpak-cargo-generator.py Cargo.lock -o packaging/flatpak/cargo-sources.json
+      - name: Build Flatpak and bundle
+        run: |
+          flatpak-builder --force-clean --repo=flatpak-repo flatpak-build packaging/flatpak/org.linuxquest.Host.yml
+          flatpak build-bundle flatpak-repo linux-quest-host.flatpak org.linuxquest.Host
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-quest-flatpak
+          path: linux-quest-host.flatpak
+          if-no-files-found: error
+          retention-days: 7
+
+  quest-apk:
+    name: Build debug-signed Quest APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential cmake edid-decode
+      - name: Install Android SDK components
+        run: |
+          set -euo pipefail
+          sdkmanager="${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdkmanager" --licenses >/dev/null || true
+          "$sdkmanager" --install 'platforms;android-34' 'build-tools;34.0.0' 'ndk;27.2.12479018'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: packaging-android
+      - name: Build APK
+        run: |
+          cargo install --locked cargo-ndk
+          export ANDROID_NDK_HOME="${ANDROID_SDK_ROOT}/ndk/27.2.12479018"
+          bash crates/client/android/build.sh --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-quest-debug-signed-apk
+          path: crates/client/target/android-apk/linux-quest-release.apk
+          if-no-files-found: error
+          retention-days: 7

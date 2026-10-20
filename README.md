@@ -118,6 +118,18 @@ systemctl --user enable --now linux-quest-host
 
 See [`packaging/README.md`](packaging/README.md) for installation, the `/dev/uinput` udev rule and operating notes.
 
+### Build and install packages
+
+Packaging is currently for local builds and CI test artifacts; no package
+repository or app store is being published. Build instructions for `.deb`, `.rpm`,
+Arch/AUR, Flatpak and the Quest APK are in [`packaging/README.md`](packaging/README.md#build-packages-locally).
+Install a locally built host package with `sudo apt install ./linux-quest-host_*.deb`
+on Debian/Ubuntu or `sudo dnf install ./linux-quest-host-*.rpm` on Fedora. On Arch,
+build and install the PKGBUILD with `makepkg --syncdeps --cleanbuild --install`.
+Install a locally built Flatpak bundle with `flatpak install --user ./linux-quest-host.flatpak`.
+The APK is debug-signed for sideloading; connect a Quest with Developer Mode enabled
+and run `scripts/install-quest.sh <path-to-apk>`.
+
 ### Optional tray icon
 
 `linux-quest-host tray` shows connection state in the system tray, with Open dashboard, Restart service and Quit. It is a separate process, and it is off by default, so build it with the `tray` feature:
