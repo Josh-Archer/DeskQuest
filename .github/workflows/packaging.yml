@@ -78,7 +78,7 @@ jobs:
           sed -i 's#source=(.*#source=("${pkgname}-${pkgver}.tar.gz")#' "$stage/PKGBUILD"
           docker run --rm -v "$stage:/build" -w /build archlinux:base-devel bash -lc "
             set -euo pipefail
-            pacman -Syu --noconfirm --needed rust
+            pacman -Syu --noconfirm --needed rust cmake
             useradd -m builder
             chown -R builder:builder /build
             su builder -c 'makepkg --syncdeps --cleanbuild --noconfirm'
