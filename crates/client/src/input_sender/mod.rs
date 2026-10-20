@@ -44,7 +44,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -108,12 +108,39 @@ impl InputSource for KeepaliveOnlySource {
     }
 }
 
-/// An [`InputSource`] that only emits keepalives, plus [`InputEvent::KeyframeRequest`] each
-/// time [`KeyframeRequestSource::requester`]'s flag is raised (then call
+/// Streams waiting for a keyframe request, one bit per stream id (ids 0..32).
+#[derive(Debug, Default, Clone)]
+pub struct KeyframeRequestFlags(Arc<AtomicU32>);
+
+impl KeyframeRequestFlags {
+    /// Marks `stream_id` as needing a keyframe. Ids of 32 and above are ignored.
+    pub fn raise(&self, stream_id: u16) {
+        if let Some(bit) = 1u32.checked_shl(u32::from(stream_id)) {
+            self.0.fetch_or(bit, Ordering::AcqRel);
+        }
+    }
+
+    /// Takes the pending streams as request events: [`InputEvent::KeyframeRequest`] for
+    /// stream 0 (what single-stream hosts understand) and
+    /// [`InputEvent::KeyframeRequestFor`] for the others.
+    fn take_events(&self) -> Vec<InputEvent> {
+        let pending = self.0.swap(0, Ordering::AcqRel);
+        (0..32u16)
+            .filter(|id| pending & (1 << id) != 0)
+            .map(|id| match id {
+                0 => InputEvent::KeyframeRequest,
+                stream_id => InputEvent::KeyframeRequestFor { stream_id },
+            })
+            .collect()
+    }
+}
+
+/// An [`InputSource`] that only emits keepalives, plus a keyframe request for each stream
+/// raised on [`KeyframeRequestSource::requester`]'s flags (then call
 /// [`InputSenderControl::notify`] so it goes out at once).
 #[derive(Debug, Default, Clone)]
 pub struct KeyframeRequestSource {
-    pending: std::sync::Arc<AtomicBool>,
+    pending: KeyframeRequestFlags,
 }
 
 impl KeyframeRequestSource {
@@ -121,19 +148,15 @@ impl KeyframeRequestSource {
         Self::default()
     }
 
-    /// The flag to raise when a keyframe is needed.
-    pub fn requester(&self) -> std::sync::Arc<AtomicBool> {
+    /// The flags to raise when a stream needs a keyframe.
+    pub fn requester(&self) -> KeyframeRequestFlags {
         self.pending.clone()
     }
 }
 
 impl InputSource for KeyframeRequestSource {
     fn poll(&mut self) -> Vec<InputEvent> {
-        if self.pending.swap(false, Ordering::AcqRel) {
-            vec![InputEvent::KeyframeRequest]
-        } else {
-            Vec::new()
-        }
+        self.pending.take_events()
     }
     fn needs_polling(&self) -> bool {
         false

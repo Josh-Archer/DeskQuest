@@ -501,3 +501,22 @@ async fn input_sender_latency() {
     );
     sender.stop().await;
 }
+
+#[test]
+fn keyframe_requests_are_per_stream() {
+    let mut source = KeyframeRequestSource::new();
+    let flags = source.requester();
+    assert!(source.poll().is_empty());
+    flags.raise(2);
+    flags.raise(0);
+    flags.raise(2);
+    flags.raise(40); // no such stream bit: ignored
+    assert_eq!(
+        source.poll(),
+        vec![
+            InputEvent::KeyframeRequest,
+            InputEvent::KeyframeRequestFor { stream_id: 2 },
+        ]
+    );
+    assert!(source.poll().is_empty());
+}

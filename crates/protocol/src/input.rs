@@ -190,7 +190,15 @@ pub enum InputEvent {
     /// The client lost video (a frame gap, or the decoder refused a frame) and needs an IDR.
     /// Travels on the input channel because that is the only client-to-host path in UDP mode.
     /// Not an input event for the injector: the host input receiver hands it to the video sender.
+    ///
+    /// Always means stream 0 (the primary screen); [`InputEvent::KeyframeRequestFor`] names any
+    /// other stream.
     KeyframeRequest,
+    /// Like [`InputEvent::KeyframeRequest`] but for the video stream `stream_id` (the same value
+    /// as the stream's `PacketHeader::stream_id`, which is also its display id). Wire tag 9.
+    KeyframeRequestFor {
+        stream_id: u16,
+    },
 }
 
 impl InputEvent {
@@ -243,6 +251,10 @@ impl InputEvent {
             }
             InputEvent::KeyframeRequest => {
                 dst.put_u8(8);
+            }
+            InputEvent::KeyframeRequestFor { stream_id } => {
+                dst.put_u8(9);
+                dst.put_u16(*stream_id);
             }
         }
     }
@@ -364,6 +376,17 @@ impl InputEvent {
                 Ok(InputEvent::ClipboardSync { mime_type, content })
             }
             8 => Ok(InputEvent::KeyframeRequest),
+            9 => {
+                if src.len() < 2 {
+                    return Err(ProtocolError::BufferTooShort {
+                        required: 2,
+                        found: src.len(),
+                    });
+                }
+                Ok(InputEvent::KeyframeRequestFor {
+                    stream_id: src.get_u16(),
+                })
+            }
             other => Err(ProtocolError::DeserializationError(format!(
                 "Invalid event tag: {other}"
             ))),
@@ -573,6 +596,11 @@ mod tests {
                 content: b"clipboard text content".to_vec(),
             },
             InputEvent::KeyframeRequest,
+            InputEvent::KeyframeRequestFor { stream_id: 0 },
+            InputEvent::KeyframeRequestFor { stream_id: 2 },
+            InputEvent::KeyframeRequestFor {
+                stream_id: u16::MAX,
+            },
         ];
 
         for ev in &events {
@@ -583,6 +611,48 @@ mod tests {
             assert_eq!(&decoded, ev);
             assert!(slice.is_empty());
         }
+    }
+
+    #[test]
+    fn keyframe_request_wire_tags_are_stable() {
+        // Tag 8 is payload-less and keeps meaning "stream 0".
+        let mut buf = bytes::BytesMut::new();
+        InputEvent::KeyframeRequest.encode(&mut buf);
+        assert_eq!(&buf[..], &[8]);
+        let mut slice = &[8u8][..];
+        assert_eq!(
+            InputEvent::decode(&mut slice).unwrap(),
+            InputEvent::KeyframeRequest
+        );
+        assert!(slice.is_empty());
+
+        // Tag 9 carries the stream id as a big-endian u16.
+        let mut buf = bytes::BytesMut::new();
+        InputEvent::KeyframeRequestFor { stream_id: 0x0102 }.encode(&mut buf);
+        assert_eq!(&buf[..], &[9, 0x01, 0x02]);
+        let mut slice = &[9u8, 0x00, 0x02][..];
+        assert_eq!(
+            InputEvent::decode(&mut slice).unwrap(),
+            InputEvent::KeyframeRequestFor { stream_id: 2 }
+        );
+        assert!(slice.is_empty());
+
+        // A truncated tag 9 is an error, not a panic or a stream 0 request.
+        for truncated in [&[9u8][..], &[9u8, 0x01][..]] {
+            let mut slice = truncated;
+            assert!(InputEvent::decode(&mut slice).is_err());
+        }
+    }
+
+    #[test]
+    fn keyframe_request_for_survives_a_batch() {
+        let batch = InputBatch::new(7, 1_000).with_events(vec![
+            InputEvent::KeyframeRequestFor { stream_id: 1 },
+            InputEvent::KeyframeRequest,
+            InputEvent::MouseMoveRelative { dx: 1, dy: 2 },
+        ]);
+        let decoded = InputBatch::decode(&batch.encode()).unwrap();
+        assert_eq!(decoded, batch);
     }
 
     #[test]

@@ -30,7 +30,9 @@ pub(crate) fn activity_jobject() -> *mut std::ffi::c_void {
 use std::net::{IpAddr, SocketAddr};
 
 use crate::config::{ClientConfig, TransportMode};
-use crate::input_sender::{input_sender_config, InputSenderThread, KeyframeRequestSource};
+use crate::input_sender::{
+    input_sender_config, InputSenderThread, KeyframeRequestFlags, KeyframeRequestSource,
+};
 use crate::runtime::QuestClientRuntime;
 
 /// Source IPs that UDP video datagrams must come from, or `None` to accept any source.
@@ -87,14 +89,12 @@ pub fn udp_config_warning(config: &ClientConfig) -> Option<String> {
 /// sends no input (and no keepalive) at all. Sending real controller input is not mapped yet,
 /// so the source is keepalive-only: enough for the host to latch this headset and stream video
 /// to it. See `crate::input_sender` for the design.
-/// Starts the UDP input/keepalive sender (Udp mode only). Returns it with the flag that, once
-/// raised (then [`crate::input_sender::InputSenderControl::notify`]), sends a keyframe request.
+/// Starts the UDP input/keepalive sender (Udp mode only). Returns it with the per-stream flags
+/// that, once raised (then [`crate::input_sender::InputSenderControl::notify`]), send a
+/// keyframe request for that stream.
 pub fn start_input_sender(
     config: &ClientConfig,
-) -> Option<(
-    InputSenderThread,
-    std::sync::Arc<std::sync::atomic::AtomicBool>,
-)> {
+) -> Option<(InputSenderThread, KeyframeRequestFlags)> {
     let Some(sender_config) = input_sender_config(config) else {
         match config.transport_mode {
             TransportMode::AdbReverseTcp => tracing::info!(
@@ -271,12 +271,12 @@ pub fn android_main(app: AndroidApp) {
         input_sender.as_ref().map(|s| s.control().clone());
     // Raises the keyframe request on the input channel and sends it right away.
     let requester_control = ack_control.clone();
-    let keyframe_requester = move || -> Option<Box<dyn Fn() + Send>> {
-        let flag = keyframe_flag.clone()?;
+    let keyframe_requester = move || -> Option<Box<dyn Fn(u16) + Send>> {
+        let flags = keyframe_flag.clone()?;
         let control = requester_control.clone()?;
-        Some(Box::new(move || {
-            tracing::info!("video lost; requesting a keyframe from the host");
-            flag.store(true, std::sync::atomic::Ordering::Release);
+        Some(Box::new(move |stream_id| {
+            tracing::info!(stream_id, "video lost; requesting a keyframe from the host");
+            flags.raise(stream_id);
             control.notify();
         }))
     };
