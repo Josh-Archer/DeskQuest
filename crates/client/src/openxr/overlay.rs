@@ -115,7 +115,17 @@ pub fn border_rgba(inner: (f32, f32)) -> Vec<u8> {
             // Fully transparent over the screen itself, soft at its edge.
             let in_screen = (u.abs() / ix).max(v.abs() / iy);
             let ring = smoothstep(0.97, 1.0, in_screen);
-            put(&mut px, w, x, y, [235, 240, 255], 0.55 * outer * ring);
+            // Mostly clear, like Horizon's own window frames: a faint fill plus a thin, soft
+            // highlight along the outer edge.
+            let rim = 1.0 - smoothstep(0.0, 0.035, -outside);
+            put(
+                &mut px,
+                w,
+                x,
+                y,
+                [240, 244, 255],
+                (0.08 + 0.22 * rim) * outer * ring,
+            );
         }
     }
     px
@@ -267,6 +277,7 @@ mod tests {
         let mid = (((bh / 2) * bw + bw / 2) * 4 + 3) as usize;
         assert_eq!(border[mid], 0, "border is transparent over the screen");
         let ring = (((bh / 2) * bw + (bw as f32 * 0.02) as u32) * 4 + 3) as usize;
-        assert!(border[ring] > 60, "border ring is visible");
+        assert!(border[ring] > 15, "border ring is faintly visible");
+        assert!(border[ring] < 120, "border stays mostly transparent");
     }
 }

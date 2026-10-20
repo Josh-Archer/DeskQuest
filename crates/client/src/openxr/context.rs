@@ -35,6 +35,10 @@ struct OverlaySwapchain {
     swapchain: Swapchain<Vulkan>,
     images: Vec<vk::Image>,
     size: (u32, u32),
+    /// An image has been released with the current content. The compositor keeps showing the
+    /// last released image, so a texture is only uploaded again when it changes (each upload
+    /// waits on the GPU; doing it every frame stalled the app).
+    ready: bool,
 }
 
 impl OverlaySwapchain {
@@ -67,6 +71,7 @@ impl OverlaySwapchain {
             swapchain,
             images,
             size,
+            ready: false,
         })
     }
 
@@ -86,7 +91,13 @@ impl OverlaySwapchain {
                     .is_ok()
             });
         let released = self.swapchain.release_image().is_ok();
-        uploaded && released
+        self.ready = uploaded && released;
+        self.ready
+    }
+
+    /// Uploads only if no current content has been released yet.
+    fn ensure(&mut self, vulkan: &VulkanContext, rgba: &[u8]) -> bool {
+        self.ready || self.upload(vulkan, rgba)
     }
 }
 
@@ -99,6 +110,8 @@ struct OverlaySwapchains {
     cursor_rgba: Vec<u8>,
     /// Border texture and the screen share (`inner`) it was drawn for.
     border_rgba: Option<((f32, f32), Vec<u8>)>,
+    /// When the border texture was last redrawn (rate limit while resizing).
+    border_drawn_at: Option<std::time::Instant>,
 }
 
 /// OpenXR application runtime context managing instance, session, and swapchains.
@@ -782,6 +795,7 @@ impl OpenXrContext {
                 ray_rgba: ray_rgba(),
                 cursor_rgba: cursor_rgba(),
                 border_rgba: None,
+                border_drawn_at: None,
             })
         })();
         match overlay {
@@ -1190,9 +1204,9 @@ impl OpenXrContext {
             let (mut rays_ok, mut cursor_ok, mut border_ok) = (false, false, false);
             if let Some(o) = &mut self.overlay_swapchains {
                 if !overlay.pointers.is_empty() {
-                    rays_ok = o.ray.upload(vulkan_context, &o.ray_rgba);
+                    rays_ok = o.ray.ensure(vulkan_context, &o.ray_rgba);
                     if overlay.pointers.iter().any(|p| p.hit) {
-                        cursor_ok = o.cursor.upload(vulkan_context, &o.cursor_rgba);
+                        cursor_ok = o.cursor.ensure(vulkan_context, &o.cursor_rgba);
                     }
                 }
                 if overlay.border {
@@ -1200,14 +1214,19 @@ impl OpenXrContext {
                         (inner.0 - border_inner.0).abs() > 0.005
                             || (inner.1 - border_inner.1).abs() > 0.005
                     });
-                    if stale {
+                    let due = o
+                        .border_drawn_at
+                        .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(100));
+                    if stale && due {
                         o.border_rgba = Some((
                             border_inner,
                             crate::openxr::overlay::border_rgba(border_inner),
                         ));
+                        o.border_drawn_at = Some(std::time::Instant::now());
+                        o.border.ready = false;
                     }
                     if let Some((_, rgba)) = &o.border_rgba {
-                        border_ok = o.border.upload(vulkan_context, rgba);
+                        border_ok = o.border.ensure(vulkan_context, rgba);
                     }
                 }
             }
