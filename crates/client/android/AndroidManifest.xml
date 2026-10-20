@@ -56,7 +56,7 @@
 
     <application
         android:label="linux-quest"
-        android:hasCode="false"
+        android:hasCode="true"
         android:allowBackup="false">
 
         <activity

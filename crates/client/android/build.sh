@@ -35,6 +35,7 @@ if [[ -z "${BUILD_TOOLS_DIR}" || ! -d "${BUILD_TOOLS_DIR}" ]]; then
 fi
 
 AAPT="${BUILD_TOOLS_DIR}/aapt"
+D8="${BUILD_TOOLS_DIR}/d8"
 ZIPALIGN="${BUILD_TOOLS_DIR}/zipalign"
 APKSIGNER="${BUILD_TOOLS_DIR}/apksigner"
 ANDROID_JAR="${ANDROID_SDK_ROOT}/platforms/android-34/android.jar"
@@ -45,6 +46,11 @@ fi
 
 if [[ ! -f "${ANDROID_JAR}" ]]; then
     ANDROID_JAR="$(find "${ANDROID_SDK_ROOT}/platforms" -name "android.jar" | sort -V | tail -n1 || true)"
+fi
+
+if [[ ! -f "${D8}" ]]; then
+    echo "ERROR: d8 not found in ${BUILD_TOOLS_DIR}." >&2
+    exit 1
 fi
 
 if [[ ! -f "${ANDROID_JAR}" ]]; then
@@ -123,6 +129,17 @@ echo "[2/6] Packaging APK manifest and resources with aapt..."
     -I "${ANDROID_JAR}" \
     -0 so \
     -f
+
+# Compile the tiny Java IME bridge used by NativeActivity to expose an Android InputConnection.
+JAVA_OUT="${OUT_DIR}/java-classes"
+mkdir -p "${JAVA_OUT}"
+javac -source 8 -target 8 -bootclasspath "${ANDROID_JAR}" \
+    -d "${JAVA_OUT}" "${SCRIPT_DIR}/src/com/linuxquest/client/ImeBridge.java"
+"${D8}" --lib "${ANDROID_JAR}" --min-api 30 --output "${OUT_DIR}" \
+    "${JAVA_OUT}/com/linuxquest/client/ImeBridge.class"
+cd "${OUT_DIR}"
+"${AAPT}" add "${UNALIGNED_APK}" classes.dex
+cd "${CLIENT_DIR}"
 
 # Step 4: Add native libraries to APK (uncompressed for direct page-alignment)
 echo "[3/6] Adding native shared libraries to APK..."

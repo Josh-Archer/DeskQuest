@@ -16,6 +16,8 @@ makedepends=('cargo')
 optdepends=(
   'wl-clipboard: clipboard sync on Wayland'
   'xclip: clipboard sync on X11'
+  'wtype: committed Unicode text injection on Wayland'
+  'xdotool: committed Unicode text injection on X11'
   'pipewire: screen and audio capture'
   'nvidia-utils: NVIDIA GPU encoding'
 )

@@ -191,6 +191,11 @@ pub enum InputEvent {
     /// Travels on the input channel because that is the only client-to-host path in UDP mode.
     /// Not an input event for the injector: the host input receiver hands it to the video sender.
     KeyframeRequest,
+    /// Text committed by an IME or virtual keyboard. Kept separate from key presses so Unicode
+    /// input does not depend on the host keyboard layout.
+    TextCommit {
+        text: String,
+    },
 }
 
 impl InputEvent {
@@ -243,6 +248,11 @@ impl InputEvent {
             }
             InputEvent::KeyframeRequest => {
                 dst.put_u8(8);
+            }
+            InputEvent::TextCommit { text } => {
+                dst.put_u8(9);
+                dst.put_u32(text.len() as u32);
+                dst.put_slice(text.as_bytes());
             }
         }
     }
@@ -364,6 +374,26 @@ impl InputEvent {
                 Ok(InputEvent::ClipboardSync { mime_type, content })
             }
             8 => Ok(InputEvent::KeyframeRequest),
+            9 => {
+                if src.len() < 4 {
+                    return Err(ProtocolError::BufferTooShort {
+                        required: 4,
+                        found: src.len(),
+                    });
+                }
+                let text_len = src.get_u32() as usize;
+                if src.len() < text_len {
+                    return Err(ProtocolError::BufferTooShort {
+                        required: text_len,
+                        found: src.len(),
+                    });
+                }
+                let text = std::str::from_utf8(&src[..text_len])
+                    .map_err(|e| ProtocolError::DeserializationError(e.to_string()))?
+                    .to_owned();
+                src.advance(text_len);
+                Ok(InputEvent::TextCommit { text })
+            }
             other => Err(ProtocolError::DeserializationError(format!(
                 "Invalid event tag: {other}"
             ))),
@@ -573,6 +603,9 @@ mod tests {
                 content: b"clipboard text content".to_vec(),
             },
             InputEvent::KeyframeRequest,
+            InputEvent::TextCommit {
+                text: "héllo 🥐".into(),
+            },
         ];
 
         for ev in &events {
