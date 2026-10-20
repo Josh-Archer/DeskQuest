@@ -13,7 +13,7 @@ use crate::hud::DebugHud;
 use crate::openxr::{FrameLoopEngine, FramePacingMetrics, OpenXrContext};
 use crate::receiver::ClientReceiver;
 use crate::spatial::{
-    GrabStateMachine, HandGestureDetector, Handedness, InteractionEvent, InteractionInput,
+    Corner, GrabStateMachine, HandGestureDetector, Handedness, InteractionEvent, InteractionInput,
     InteractionState, ScreenTransform, SpatialLayoutStore, SpatialScreenLayout, Vec3,
 };
 
@@ -35,6 +35,7 @@ pub struct QuestClientRuntime {
     is_running: bool,
     swapchains_ready: bool,
     loss_recovery: crate::receiver::loss_recovery::LossRecovery,
+    overlay_scene: crate::openxr::overlay::OverlayScene,
     keyframe_requester: Option<Box<dyn Fn() + Send>>,
 }
 
@@ -123,6 +124,7 @@ impl QuestClientRuntime {
             is_running: true,
             swapchains_ready,
             loss_recovery: crate::receiver::loss_recovery::LossRecovery::new(),
+            overlay_scene: Default::default(),
             keyframe_requester: None,
         })
     }
@@ -258,14 +260,68 @@ impl QuestClientRuntime {
                 .map(|g| InteractionInput::from_hand(Handedness::Left, g)),
         ];
 
-        let selected_input = if let Some(src) = active_source {
-            candidate_inputs
-                .iter()
-                .filter_map(|opt| opt.as_ref())
-                .find(|inp| inp.source == src)
+        // One pointer per hand: the controller when it has a pose, else the tracked hand. A
+        // controller state exists even with no controller held, so inputs without a ray are
+        // ignored (otherwise the right controller would always win and hands never could).
+        let pointing: Vec<InteractionInput> = [
+            (&candidate_inputs[0], &candidate_inputs[1]),
+            (&candidate_inputs[2], &candidate_inputs[3]),
+        ]
+        .into_iter()
+        .filter_map(|(ctrl, hand)| {
+            ctrl.as_ref()
+                .filter(|i| i.aim_ray.is_some())
+                .or(hand.as_ref().filter(|i| i.aim_ray.is_some()))
                 .cloned()
-        } else {
-            candidate_inputs.into_iter().flatten().next()
+        })
+        .collect();
+        let hits: Vec<Option<crate::spatial::RayHit>> = pointing
+            .iter()
+            .map(|i| {
+                i.aim_ray
+                    .as_ref()
+                    .and_then(|r| self.screen_transform.intersect_ray(r))
+            })
+            .collect();
+
+        // An input that points at the screen and squeezes wins (it starts or takes over the
+        // grab); otherwise a grab or hover in progress keeps its source.
+        let squeezing_on_screen = pointing
+            .iter()
+            .zip(&hits)
+            .find(|(i, hit)| i.is_grabbing && hit.is_some())
+            .map(|(i, _)| *i);
+        let grabbing = matches!(
+            self.interaction_state_machine.state(),
+            InteractionState::Grabbing(_)
+        );
+        let selected_input = match active_source {
+            // The grabbing hand or controller lost tracking (no ray, no pose): treat that as a
+            // release. Otherwise the grab would never see one and would stick forever.
+            Some(src) if grabbing => {
+                pointing
+                    .iter()
+                    .find(|inp| inp.source == src)
+                    .cloned()
+                    .or(Some(InteractionInput {
+                        source: src,
+                        aim_ray: None,
+                        grab_pose: None,
+                        is_grabbing: false,
+                        is_selecting: false,
+                        thumbstick: (0.0, 0.0),
+                    }))
+            }
+            Some(src) => squeezing_on_screen
+                .or_else(|| pointing.iter().find(|inp| inp.source == src).copied()),
+            None => squeezing_on_screen.or_else(|| {
+                pointing
+                    .iter()
+                    .zip(&hits)
+                    .find(|(_, hit)| hit.is_some())
+                    .map(|(i, _)| *i)
+                    .or_else(|| pointing.first().cloned())
+            }),
         };
 
         if let Some(input) = selected_input {
@@ -276,14 +332,60 @@ impl QuestClientRuntime {
                     .filter_map(|opt| opt.as_ref())
                     .find(|inp| {
                         inp.is_grabbing
+                            && inp.grab_pose.is_some()
                             && inp.source != session.source
                             && inp.source.handedness() != session.source.handedness()
                     })
                     .copied(),
                 _ => None,
             };
-            let _ = self.step_interaction_two(&input, secondary_input.as_ref(), dt_seconds);
+            if let Some(event) =
+                self.step_interaction_two(&input, secondary_input.as_ref(), dt_seconds)
+            {
+                log_interaction_event(&event);
+            }
         }
+
+        let interaction_state = self.interaction_state_machine.state();
+        self.overlay_scene = crate::openxr::overlay::OverlayScene {
+            pointers: pointing
+                .iter()
+                .zip(&hits)
+                .filter_map(|(i, hit)| {
+                    let ray = i.aim_ray.as_ref()?;
+                    Some(crate::openxr::overlay::PointerVisual {
+                        origin: ray.origin,
+                        direction: ray.direction,
+                        length: hit
+                            .as_ref()
+                            .map_or(crate::openxr::overlay::RAY_MISS_LENGTH_M, |h| h.distance),
+                        hit: hit.is_some(),
+                    })
+                })
+                .collect(),
+            bar: None,
+            corner: None,
+        };
+        let hover_uv = match interaction_state {
+            InteractionState::Hovering { hit, .. } => Some(hit.uv),
+            _ => None,
+        };
+        let resizing = self.interaction_state_machine.resizing().map(|c| match c {
+            Corner::TopLeft => (0.0, 0.0),
+            Corner::TopRight => (1.0, 0.0),
+            Corner::BottomLeft => (0.0, 1.0),
+            Corner::BottomRight => (1.0, 1.0),
+        });
+        let moving =
+            matches!(interaction_state, InteractionState::Grabbing(_)) && resizing.is_none();
+        let (bar, corner) = crate::openxr::overlay::window_handles(
+            &self.screen_transform,
+            hover_uv,
+            moving,
+            resizing,
+        );
+        self.overlay_scene.bar = bar;
+        self.overlay_scene.corner = corner;
 
         // If OpenXR requests not to render (should_render == false), end frame with empty layers
         if !pacing.should_render {
@@ -365,6 +467,7 @@ impl QuestClientRuntime {
             &self.config,
             &self.vulkan_context,
             hud_rgba.as_deref(),
+            &self.overlay_scene,
         );
 
         if let Err(e) = present_res {
@@ -657,6 +760,14 @@ impl QuestClientRuntime {
     pub fn stop(&mut self) {
         self.is_running = false;
         let _ = self.decoder.flush();
+    }
+}
+
+/// Hover and grab transitions are rare and useful when checking input on a headset.
+fn log_interaction_event(event: &InteractionEvent) {
+    match event {
+        InteractionEvent::GrabUpdated { .. } | InteractionEvent::HoverUpdated { .. } => {}
+        other => tracing::info!(event = ?other, "screen interaction"),
     }
 }
 
