@@ -203,7 +203,7 @@ pub fn corner_rgba(alpha: f32) -> Vec<u8> {
 /// Fraction of the screen, from the bottom edge, where pointing reveals the grab bar.
 pub const BAR_REVEAL_ZONE: f32 = 0.3;
 /// Fraction of width/height around a corner where pointing reveals its resize handle.
-pub const CORNER_REVEAL_ZONE: f32 = 0.12;
+pub const CORNER_REVEAL_ZONE: f32 = crate::spatial::CORNER_ZONE;
 
 /// The corner `(u, v)` (each 0 or 1) a hover at `uv` is near, if any.
 pub fn corner_near(uv: (f32, f32)) -> Option<(f32, f32)> {

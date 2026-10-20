@@ -13,7 +13,7 @@ use crate::hud::DebugHud;
 use crate::openxr::{FrameLoopEngine, FramePacingMetrics, OpenXrContext};
 use crate::receiver::ClientReceiver;
 use crate::spatial::{
-    GrabStateMachine, HandGestureDetector, Handedness, InteractionEvent, InteractionInput,
+    Corner, GrabStateMachine, HandGestureDetector, Handedness, InteractionEvent, InteractionInput,
     InteractionState, ScreenTransform, SpatialLayoutStore, SpatialScreenLayout, Vec3,
 };
 
@@ -370,9 +370,20 @@ impl QuestClientRuntime {
             InteractionState::Hovering { hit, .. } => Some(hit.uv),
             _ => None,
         };
-        let moving = matches!(interaction_state, InteractionState::Grabbing(_));
-        let (bar, corner) =
-            crate::openxr::overlay::window_handles(&self.screen_transform, hover_uv, moving, None);
+        let resizing = self.interaction_state_machine.resizing().map(|c| match c {
+            Corner::TopLeft => (0.0, 0.0),
+            Corner::TopRight => (1.0, 0.0),
+            Corner::BottomLeft => (0.0, 1.0),
+            Corner::BottomRight => (1.0, 1.0),
+        });
+        let moving =
+            matches!(interaction_state, InteractionState::Grabbing(_)) && resizing.is_none();
+        let (bar, corner) = crate::openxr::overlay::window_handles(
+            &self.screen_transform,
+            hover_uv,
+            moving,
+            resizing,
+        );
         self.overlay_scene.bar = bar;
         self.overlay_scene.corner = corner;
 
