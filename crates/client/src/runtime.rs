@@ -363,9 +363,18 @@ impl QuestClientRuntime {
                     })
                 })
                 .collect(),
-            border: !matches!(interaction_state, InteractionState::Idle),
-            border_active: matches!(interaction_state, InteractionState::Grabbing(_)),
+            bar: None,
+            corner: None,
         };
+        let hover_uv = match interaction_state {
+            InteractionState::Hovering { hit, .. } => Some(hit.uv),
+            _ => None,
+        };
+        let moving = matches!(interaction_state, InteractionState::Grabbing(_));
+        let (bar, corner) =
+            crate::openxr::overlay::window_handles(&self.screen_transform, hover_uv, moving, None);
+        self.overlay_scene.bar = bar;
+        self.overlay_scene.corner = corner;
 
         // If OpenXR requests not to render (should_render == false), end frame with empty layers
         if !pacing.should_render {

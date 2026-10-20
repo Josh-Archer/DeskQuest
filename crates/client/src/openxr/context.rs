@@ -101,17 +101,20 @@ impl OverlaySwapchain {
     }
 }
 
-/// Swapchains and cached textures for pointers and the screen border.
+/// Swapchains and cached textures for pointers and the window handles.
 struct OverlaySwapchains {
     ray: OverlaySwapchain,
     cursor: OverlaySwapchain,
-    border: OverlaySwapchain,
+    bar: OverlaySwapchain,
+    bar_active: OverlaySwapchain,
+    corner: OverlaySwapchain,
+    corner_active: OverlaySwapchain,
     ray_rgba: Vec<u8>,
     cursor_rgba: Vec<u8>,
-    /// Border texture and the screen share (`inner`) it was drawn for.
-    border_rgba: Option<((f32, f32), Vec<u8>)>,
-    /// When the border texture was last redrawn (rate limit while resizing).
-    border_drawn_at: Option<std::time::Instant>,
+    bar_rgba: Vec<u8>,
+    bar_active_rgba: Vec<u8>,
+    corner_rgba: Vec<u8>,
+    corner_active_rgba: Vec<u8>,
 }
 
 /// OpenXR application runtime context managing instance, session, and swapchains.
@@ -791,16 +794,25 @@ impl OpenXrContext {
             Ok(OverlaySwapchains {
                 ray: OverlaySwapchain::create(&session, swapchain_format, RAY_TEXTURE)?,
                 cursor: OverlaySwapchain::create(&session, swapchain_format, CURSOR_TEXTURE)?,
-                border: OverlaySwapchain::create(&session, swapchain_format, BORDER_TEXTURE)?,
+                bar: OverlaySwapchain::create(&session, swapchain_format, BAR_TEXTURE)?,
+                bar_active: OverlaySwapchain::create(&session, swapchain_format, BAR_TEXTURE)?,
+                corner: OverlaySwapchain::create(&session, swapchain_format, CORNER_TEXTURE)?,
+                corner_active: OverlaySwapchain::create(
+                    &session,
+                    swapchain_format,
+                    CORNER_TEXTURE,
+                )?,
                 ray_rgba: ray_rgba(),
                 cursor_rgba: cursor_rgba(),
-                border_rgba: None,
-                border_drawn_at: None,
+                bar_rgba: bar_rgba(0.28),
+                bar_active_rgba: bar_rgba(0.75),
+                corner_rgba: corner_rgba(0.35),
+                corner_active_rgba: corner_rgba(0.85),
             })
         })();
         match overlay {
             Ok(o) => self.overlay_swapchains = Some(o),
-            Err(e) => tracing::warn!(error = ?e, "pointer and border overlays unavailable"),
+            Err(e) => tracing::warn!(error = ?e, "pointer and window-handle overlays unavailable"),
         }
         self.swapchains_created = true;
         Ok(())
@@ -1181,27 +1193,14 @@ impl OpenXrContext {
                 None
             };
 
-            // Pointers and border: upload what is drawn this frame, then build its layers.
+            // Pointers and window handles: upload what is drawn (once; the compositor keeps
+            // showing a swapchain's last released image), then build their layers.
             use crate::openxr::overlay::{
-                cursor_pose, ray_quad_pose, BORDER_MARGIN_M, BORDER_TEXTURE, CURSOR_SIZE_M,
+                cursor_pose, ray_quad_pose, BAR_TEXTURE, CORNER_TEXTURE, CURSOR_SIZE_M,
                 CURSOR_TEXTURE, RAY_TEXTURE, RAY_WIDTH_M,
             };
-            let mut border_cfg = desktop_cfg.clone();
-            let border_inner = if desktop_cfg.mode == crate::config::DisplayMode::CurvedCylinder {
-                let r = desktop_cfg.cylinder_radius.max(0.1);
-                let w = r * desktop_cfg.cylinder_central_angle;
-                let h = w / desktop_cfg.cylinder_aspect_ratio.max(0.1);
-                let (bw, bh) = (w + 2.0 * BORDER_MARGIN_M, h + 2.0 * BORDER_MARGIN_M);
-                border_cfg.cylinder_central_angle = bw / r;
-                border_cfg.cylinder_aspect_ratio = bw / bh;
-                (w / bw, h / bh)
-            } else {
-                let (w, h) = desktop_cfg.quad_size;
-                let (bw, bh) = (w + 2.0 * BORDER_MARGIN_M, h + 2.0 * BORDER_MARGIN_M);
-                border_cfg.quad_size = (bw, bh);
-                (w / bw, h / bh)
-            };
-            let (mut rays_ok, mut cursor_ok, mut border_ok) = (false, false, false);
+            let (mut rays_ok, mut cursor_ok, mut bar_ok, mut corner_ok) =
+                (false, false, false, false);
             if let Some(o) = &mut self.overlay_swapchains {
                 if !overlay.pointers.is_empty() {
                     rays_ok = o.ray.ensure(vulkan_context, &o.ray_rgba);
@@ -1209,25 +1208,20 @@ impl OpenXrContext {
                         cursor_ok = o.cursor.ensure(vulkan_context, &o.cursor_rgba);
                     }
                 }
-                if overlay.border {
-                    let stale = o.border_rgba.as_ref().is_none_or(|(inner, _)| {
-                        (inner.0 - border_inner.0).abs() > 0.005
-                            || (inner.1 - border_inner.1).abs() > 0.005
-                    });
-                    let due = o
-                        .border_drawn_at
-                        .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(100));
-                    if stale && due {
-                        o.border_rgba = Some((
-                            border_inner,
-                            crate::openxr::overlay::border_rgba(border_inner),
-                        ));
-                        o.border_drawn_at = Some(std::time::Instant::now());
-                        o.border.ready = false;
-                    }
-                    if let Some((_, rgba)) = &o.border_rgba {
-                        border_ok = o.border.ensure(vulkan_context, rgba);
-                    }
+                if let Some(bar) = &overlay.bar {
+                    bar_ok = if bar.active {
+                        o.bar_active.ensure(vulkan_context, &o.bar_active_rgba)
+                    } else {
+                        o.bar.ensure(vulkan_context, &o.bar_rgba)
+                    };
+                }
+                if let Some(corner) = &overlay.corner {
+                    corner_ok = if corner.active {
+                        o.corner_active
+                            .ensure(vulkan_context, &o.corner_active_rgba)
+                    } else {
+                        o.corner.ensure(vulkan_context, &o.corner_rgba)
+                    };
                 }
             }
             let eye = self
@@ -1242,74 +1236,63 @@ impl OpenXrContext {
                 .unwrap_or(crate::spatial::Vec3::new(0.0, 1.6, 0.0));
             let ov = self.overlay_swapchains.as_ref();
             let mut pointer_layers = Vec::new();
-            if let Some(o) = ov.filter(|_| rays_ok) {
-                for p in &overlay.pointers {
-                    pointer_layers.push(crate::openxr::layers::build_overlay_quad(
-                        space,
-                        &o.ray.swapchain,
-                        RAY_TEXTURE,
-                        openxr::Posef::from(ray_quad_pose(p, eye)),
-                        (RAY_WIDTH_M, p.length.max(0.01)),
-                    ));
+            if let Some(o) = ov {
+                if bar_ok {
+                    if let Some(bar) = &overlay.bar {
+                        let sc = if bar.active { &o.bar_active } else { &o.bar };
+                        pointer_layers.push(crate::openxr::layers::build_overlay_quad(
+                            space,
+                            &sc.swapchain,
+                            BAR_TEXTURE,
+                            openxr::Posef::from(bar.pose),
+                            bar.size,
+                        ));
+                    }
+                }
+                if corner_ok {
+                    if let Some(corner) = &overlay.corner {
+                        let sc = if corner.active {
+                            &o.corner_active
+                        } else {
+                            &o.corner
+                        };
+                        pointer_layers.push(crate::openxr::layers::build_overlay_quad(
+                            space,
+                            &sc.swapchain,
+                            CORNER_TEXTURE,
+                            openxr::Posef::from(corner.pose),
+                            corner.size,
+                        ));
+                    }
+                }
+                if rays_ok {
+                    for p in &overlay.pointers {
+                        pointer_layers.push(crate::openxr::layers::build_overlay_quad(
+                            space,
+                            &o.ray.swapchain,
+                            RAY_TEXTURE,
+                            openxr::Posef::from(ray_quad_pose(p, eye)),
+                            (RAY_WIDTH_M, p.length.max(0.01)),
+                        ));
+                    }
+                }
+                if cursor_ok {
+                    for p in overlay.pointers.iter().filter(|p| p.hit) {
+                        pointer_layers.push(crate::openxr::layers::build_overlay_quad(
+                            space,
+                            &o.cursor.swapchain,
+                            CURSOR_TEXTURE,
+                            openxr::Posef::from(cursor_pose(p)),
+                            (CURSOR_SIZE_M, CURSOR_SIZE_M),
+                        ));
+                    }
                 }
             }
-            if let Some(o) = ov.filter(|_| cursor_ok) {
-                for p in overlay.pointers.iter().filter(|p| p.hit) {
-                    pointer_layers.push(crate::openxr::layers::build_overlay_quad(
-                        space,
-                        &o.cursor.swapchain,
-                        CURSOR_TEXTURE,
-                        openxr::Posef::from(cursor_pose(p)),
-                        (CURSOR_SIZE_M, CURSOR_SIZE_M),
-                    ));
-                }
-            }
-            let border_quad = ov.filter(|_| {
-                border_ok && desktop_cfg.mode != crate::config::DisplayMode::CurvedCylinder
-            });
-            let border_quad = border_quad.map(|o| {
-                let mut raw = crate::openxr::layers::build_quad_layer(
-                    space,
-                    &o.border.swapchain,
-                    BORDER_TEXTURE.0,
-                    BORDER_TEXTURE.1,
-                    &border_cfg,
-                )
-                .into_raw();
-                raw.layer_flags = openxr::sys::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA;
-                unsafe { openxr::CompositionLayerQuad::from_raw(raw) }
-            });
-            let border_cyl = ov
-                .filter(|_| {
-                    border_ok
-                        && self.supports_cylinder
-                        && desktop_cfg.mode == crate::config::DisplayMode::CurvedCylinder
-                })
-                .map(|o| {
-                    let mut raw = crate::openxr::layers::build_cylinder_layer(
-                        space,
-                        &o.border.swapchain,
-                        BORDER_TEXTURE.0,
-                        BORDER_TEXTURE.1,
-                        &border_cfg,
-                    )
-                    .into_raw();
-                    raw.layer_flags =
-                        openxr::sys::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA;
-                    unsafe { openxr::CompositionLayerCylinderKHR::from_raw(raw) }
-                });
 
             let mut layers: Vec<&CompositionLayerBase<'_, Vulkan>> =
                 Vec::with_capacity(4 + pointer_layers.len());
             if let Some(ref pt) = pt_layer {
                 layers.push(pt);
-            }
-            // Drawn before the desktop, so the screen covers the border's inner area.
-            if let Some(ref b) = border_quad {
-                layers.push(b);
-            }
-            if let Some(ref b) = border_cyl {
-                layers.push(b);
             }
 
             if self.supports_cylinder

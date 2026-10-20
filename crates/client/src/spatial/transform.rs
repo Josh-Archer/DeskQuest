@@ -261,6 +261,49 @@ impl ScreenTransform {
     /// the viewer. The arc's middle is then exactly at `position`, whatever the radius, so the
     /// curvature can change without moving the screen. Used for both the compositor layer and
     /// the hit test, so what is drawn and what the pointer hits always agree.
+    /// Width and height of the visible screen in meters.
+    pub fn size_m(&self) -> (f32, f32) {
+        match self.display_mode {
+            DisplayMode::FlatQuad => self.quad_size,
+            DisplayMode::CurvedCylinder => {
+                let w = self.curve_radius * self.curve_angle;
+                (w, w / self.aspect_ratio.max(f32::EPSILON))
+            }
+        }
+    }
+
+    /// Pose on the screen surface at texture coordinates `(u, v)` (u = 0 left, v = 0 top),
+    /// facing the viewer like the screen does there. Values outside [0, 1] extend the
+    /// surface, for handles just past an edge.
+    pub fn surface_pose(&self, u: f32, v: f32) -> ScreenPose {
+        let (w, h) = self.size_m();
+        let up = self.orientation.rotate_vec(Vec3::new(0.0, 1.0, 0.0));
+        let lift = up * ((0.5 - v) * h);
+        match self.display_mode {
+            DisplayMode::FlatQuad => {
+                let right = self.orientation.rotate_vec(Vec3::new(1.0, 0.0, 0.0));
+                ScreenPose::new(
+                    self.position + right * ((u - 0.5) * w) + lift,
+                    self.orientation,
+                )
+            }
+            DisplayMode::CurvedCylinder => {
+                let phi = (u - 0.5) * self.curve_angle;
+                let local = Vec3::new(
+                    self.curve_radius * phi.sin(),
+                    0.0,
+                    -self.curve_radius * phi.cos(),
+                );
+                let axis = self.cylinder_axis_pose();
+                let turn = Quat::from_axis_angle(Vec3::new(0.0, 1.0, 0.0), -phi);
+                ScreenPose::new(
+                    axis.position + axis.orientation.rotate_vec(local) + lift,
+                    self.orientation * turn,
+                )
+            }
+        }
+    }
+
     pub fn cylinder_axis_pose(&self) -> ScreenPose {
         let back = self
             .orientation

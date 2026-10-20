@@ -23,6 +23,25 @@ pub const CURSOR_SIZE_M: f32 = 0.025;
 /// Border margin around the screen on each side, in meters.
 pub const BORDER_MARGIN_M: f32 = 0.06;
 
+/// Grab bar texture size (a soft pill).
+pub const BAR_TEXTURE: (u32, u32) = (256, 32);
+/// Grab bar size in meters, and its gap below the screen's bottom edge.
+pub const BAR_SIZE_M: (f32, f32) = (0.24, 0.02);
+pub const BAR_GAP_M: f32 = 0.035;
+/// Corner handle texture size (an L-shaped arc for the top-left corner, rotated for others).
+pub const CORNER_TEXTURE: (u32, u32) = (64, 64);
+/// Corner handle size in meters.
+pub const CORNER_SIZE_M: f32 = 0.07;
+
+/// A handle (grab bar or corner) to draw this frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HandleVisual {
+    pub pose: ScreenPose,
+    pub size: (f32, f32),
+    /// Brighter: hovered or in use.
+    pub active: bool,
+}
+
 /// One pointer to draw this frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PointerVisual {
@@ -39,10 +58,11 @@ pub struct PointerVisual {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct OverlayScene {
     pub pointers: Vec<PointerVisual>,
-    /// Show the soft border: a pointer hovers or grabs the screen.
-    pub border: bool,
-    /// Brighter border while grabbing.
-    pub border_active: bool,
+    /// Grab bar under the screen, shown only when pointing near the bottom edge or moving it,
+    /// like Horizon's own windows.
+    pub bar: Option<HandleVisual>,
+    /// Resize handle at the hovered (or dragged) corner.
+    pub corner: Option<HandleVisual>,
 }
 
 fn put(px: &mut [u8], w: u32, x: u32, y: u32, rgb: [u8; 3], a: f32) {
@@ -129,6 +149,116 @@ pub fn border_rgba(inner: (f32, f32)) -> Vec<u8> {
         }
     }
     px
+}
+
+/// Horizon-style grab bar: a soft white pill. `alpha` is the opacity of its body.
+pub fn bar_rgba(alpha: f32) -> Vec<u8> {
+    let (w, h) = BAR_TEXTURE;
+    let mut px = vec![0u8; (w * h * 4) as usize];
+    let r = h as f32 / 2.0;
+    for y in 0..h {
+        for x in 0..w {
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            // Distance to the pill's centre segment, minus its radius.
+            let cx = fx.clamp(r, w as f32 - r);
+            let d = ((fx - cx).powi(2) + (fy - r).powi(2)).sqrt() - (r - 1.5);
+            put(
+                &mut px,
+                w,
+                x,
+                y,
+                [255, 255, 255],
+                alpha * (1.0 - smoothstep(-1.5, 1.0, d)),
+            );
+        }
+    }
+    px
+}
+
+/// Corner handle for the top-left corner: a soft quarter-round "L" hugging the corner.
+pub fn corner_rgba(alpha: f32) -> Vec<u8> {
+    let (w, h) = CORNER_TEXTURE;
+    let mut px = vec![0u8; (w * h * 4) as usize];
+    let s = w as f32;
+    let (outer, thickness) = (0.62 * s, 0.13 * s);
+    for y in 0..h {
+        for x in 0..w {
+            // Arc centred at (outer, outer) from the corner, covering the top-left quadrant.
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let (dx, dy) = (outer - fx, outer - fy);
+            let in_quadrant = dx >= -1.0 && dy >= -1.0;
+            let dist = (dx.max(0.0).powi(2) + dy.max(0.0).powi(2)).sqrt();
+            let band = (dist - (outer - thickness * 0.5)).abs() - thickness * 0.5;
+            let a = if in_quadrant {
+                1.0 - smoothstep(-1.0, 1.5, band)
+            } else {
+                0.0
+            };
+            put(&mut px, w, x, y, [255, 255, 255], alpha * a);
+        }
+    }
+    px
+}
+
+/// Fraction of the screen, from the bottom edge, where pointing reveals the grab bar.
+pub const BAR_REVEAL_ZONE: f32 = 0.3;
+/// Fraction of width/height around a corner where pointing reveals its resize handle.
+pub const CORNER_REVEAL_ZONE: f32 = 0.12;
+
+/// The corner `(u, v)` (each 0 or 1) a hover at `uv` is near, if any.
+pub fn corner_near(uv: (f32, f32)) -> Option<(f32, f32)> {
+    let pick = |t: f32| {
+        if t <= CORNER_REVEAL_ZONE {
+            Some(0.0)
+        } else if t >= 1.0 - CORNER_REVEAL_ZONE {
+            Some(1.0)
+        } else {
+            None
+        }
+    };
+    Some((pick(uv.0)?, pick(uv.1)?))
+}
+
+/// Horizon-style window handles for `screen`: nothing by default, the grab bar when pointing
+/// at the lower part of the screen or while moving it, a corner handle when pointing near a
+/// corner or while resizing from it. `hover_uv` is where a pointer hits the screen.
+pub fn window_handles(
+    screen: &crate::spatial::ScreenTransform,
+    hover_uv: Option<(f32, f32)>,
+    moving: bool,
+    resizing_corner: Option<(f32, f32)>,
+) -> (Option<HandleVisual>, Option<HandleVisual>) {
+    let bar = (moving || hover_uv.is_some_and(|uv| uv.1 >= 1.0 - BAR_REVEAL_ZONE)).then(|| {
+        let edge = screen.surface_pose(0.5, 1.0);
+        let up = edge.orientation.rotate_vec(Vec3::new(0.0, 1.0, 0.0));
+        let drop = BAR_GAP_M + BAR_SIZE_M.1 * 0.5;
+        HandleVisual {
+            pose: ScreenPose::new(edge.position - up * drop, edge.orientation),
+            size: BAR_SIZE_M,
+            active: moving,
+        }
+    });
+    let corner = resizing_corner
+        .map(|c| (c, true))
+        .or_else(|| hover_uv.and_then(corner_near).map(|c| (c, false)))
+        .map(|((cu, cv), active)| {
+            let at = screen.surface_pose(cu, cv);
+            // The texture draws the top-left corner; turn it about the screen normal.
+            let roll = match (cu > 0.5, cv > 0.5) {
+                (false, false) => 0.0,
+                (true, false) => -std::f32::consts::FRAC_PI_2,
+                (true, true) => std::f32::consts::PI,
+                (false, true) => std::f32::consts::FRAC_PI_2,
+            };
+            let normal = at.orientation.rotate_vec(Vec3::new(0.0, 0.0, 1.0));
+            let spin = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), roll);
+            HandleVisual {
+                pose: ScreenPose::new(at.position + normal * 0.002, at.orientation * spin),
+                size: (CORNER_SIZE_M, CORNER_SIZE_M),
+                active,
+            }
+        });
+    (bar, corner)
 }
 
 /// Rotation whose local X, Y, Z axes map to the given orthonormal world axes.
@@ -262,6 +392,40 @@ mod tests {
     }
 
     #[test]
+    fn handles_stay_hidden_until_pointing_near_an_edge_or_corner() {
+        let screen = crate::spatial::ScreenTransform::default();
+        assert_eq!(window_handles(&screen, None, false, None), (None, None));
+        let (bar, corner) = window_handles(&screen, Some((0.5, 0.4)), false, None);
+        assert!(
+            bar.is_none() && corner.is_none(),
+            "middle of the screen shows nothing"
+        );
+        let (bar, corner) = window_handles(&screen, Some((0.5, 0.9)), false, None);
+        assert!(bar.is_some() && corner.is_none());
+        let (bar, _) = window_handles(&screen, None, true, None);
+        assert!(bar.unwrap().active, "the bar shows, brighter, while moving");
+        let (_, corner) = window_handles(&screen, Some((0.95, 0.05)), false, None);
+        assert!(corner.is_some_and(|c| !c.active));
+        let (_, corner) = window_handles(&screen, None, false, Some((1.0, 1.0)));
+        assert!(corner.unwrap().active);
+    }
+
+    #[test]
+    fn the_bar_sits_below_the_bottom_edge_and_corners_at_the_corners() {
+        let screen = crate::spatial::ScreenTransform::default();
+        let (_, h) = screen.size_m();
+        let (bar, _) = window_handles(&screen, None, true, None);
+        let bar = bar.unwrap();
+        assert!(bar.pose.position.y < screen.position.y - h * 0.5);
+        let (_, corner) = window_handles(&screen, None, false, Some((0.0, 0.0)));
+        let corner = corner.unwrap();
+        assert!(corner.pose.position.y > screen.position.y + h * 0.49);
+        assert!(corner.pose.position.x < screen.position.x);
+        assert_eq!(corner_near((0.5, 0.05)), None);
+        assert_eq!(corner_near((0.03, 0.97)), Some((0.0, 1.0)));
+    }
+
+    #[test]
     fn textures_have_the_declared_sizes_and_transparent_centres() {
         assert_eq!(
             ray_rgba().len(),
@@ -272,10 +436,20 @@ mod tests {
         let centre = (((ch / 2) * cw + cw / 2) * 4 + 3) as usize;
         assert!(cursor[centre] > 200, "cursor centre is opaque");
         assert_eq!(cursor[3], 0, "cursor corner is transparent");
+        let bar = bar_rgba(0.5);
+        let (bw, bh) = BAR_TEXTURE;
+        let mid = (((bh / 2) * bw + bw / 2) * 4 + 3) as usize;
+        assert!(bar[mid] > 100, "bar body is visible");
+        assert_eq!(bar[3], 0, "bar corner is transparent");
+        let corner = corner_rgba(0.6);
+        let (kw, _) = CORNER_TEXTURE;
+        assert_eq!(
+            corner[((63 * kw + 63) * 4 + 3) as usize],
+            0,
+            "far corner is empty"
+        );
         let border = border_rgba((0.9, 0.85));
         let (bw, bh) = BORDER_TEXTURE;
-        let mid = (((bh / 2) * bw + bw / 2) * 4 + 3) as usize;
-        assert_eq!(border[mid], 0, "border is transparent over the screen");
         let ring = (((bh / 2) * bw + (bw as f32 * 0.02) as u32) * 4 + 3) as usize;
         assert!(border[ring] > 15, "border ring is faintly visible");
         assert!(border[ring] < 120, "border stays mostly transparent");
