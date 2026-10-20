@@ -35,6 +35,9 @@ build() {
   cd "linux-quest-${pkgver}"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
+  # The vendored Opus CMake project declares a pre-3.5 policy version. Arch's
+  # current CMake removes that compatibility unless a minimum is supplied.
+  export CMAKE_POLICY_VERSION_MINIMUM=3.5
   cargo build --frozen --release -p linux-quest-host --features mdns
 }
 
