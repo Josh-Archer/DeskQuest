@@ -257,7 +257,7 @@ impl UinputInjector {
                 // Clipboard sync is handled out-of-band by compositor/clipboard protocols.
                 tracing::debug!("Clipboard sync received on uinput injector; ignoring for evdev");
             }
-            InputEvent::KeyframeRequest => {
+            InputEvent::KeyframeRequest | InputEvent::NetworkFeedback(_) => {
                 // Video control, routed to the video sender by the host input receiver.
             }
         }

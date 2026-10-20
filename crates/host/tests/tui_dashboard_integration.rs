@@ -114,6 +114,7 @@ fn test_ratatui_render_all_dashboard_components() {
                 refresh_rate: 90,
                 fps: 89.8,
                 bitrate_mbps: 120.5,
+                target_bitrate_mbps: 125.0,
                 codec: "AV1".into(),
                 is_virtual: true,
             },
@@ -125,6 +126,7 @@ fn test_ratatui_render_all_dashboard_components() {
                 refresh_rate: 72,
                 fps: 71.9,
                 bitrate_mbps: 35.0,
+                target_bitrate_mbps: 35.0,
                 codec: "AV1".into(),
                 is_virtual: true,
             },
@@ -198,7 +200,7 @@ fn test_ratatui_render_all_dashboard_components() {
     assert!(rendered.contains("Quest-Virtual-Center"));
     assert!(rendered.contains("3840x2160"));
     assert!(rendered.contains("89.8"));
-    assert!(rendered.contains("120.5 Mbps"));
+    assert!(rendered.contains("120.5/125.0"));
     assert!(rendered.contains("Quest-Virtual-Left"));
     assert!(rendered.contains("1920x1080"));
 
@@ -281,6 +283,7 @@ async fn test_display_host_snapshot_generation() {
             refresh_rate: m.refresh_rate,
             fps: m.refresh_rate as f32,
             bitrate_mbps: 75.0,
+            target_bitrate_mbps: 75.0,
             codec: "AV1".into(),
             is_virtual: m.is_virtual,
         })

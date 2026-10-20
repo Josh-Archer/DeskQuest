@@ -196,6 +196,28 @@ pub enum InputEvent {
     TextCommit {
         text: String,
     },
+    /// Periodic receive-side network quality report from the client, used by the host's
+    /// adaptive bitrate controller. Not an input event for the injector: the host input
+    /// receiver hands it to the congestion controller.
+    NetworkFeedback(NetworkFeedback),
+}
+
+/// Sentinel for [`NetworkFeedback::focused_stream`] when the client has no focused panel.
+pub const NO_FOCUSED_STREAM: u16 = u16::MAX;
+
+/// Receive-side measurements over the client's last reporting window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkFeedback {
+    /// Datagrams lost after FEC recovery, in tenths of a percent of those expected.
+    pub loss_permille: u16,
+    /// Growth of one-way delay in microseconds per second (positive: queues are building).
+    pub delay_trend_us_per_s: i32,
+    /// Smoothed inter-arrival jitter in microseconds.
+    pub jitter_us: u32,
+    /// Video payload rate the client actually received, in kbit/s.
+    pub received_kbps: u32,
+    /// Stream id of the panel the user is looking at, or [`NO_FOCUSED_STREAM`].
+    pub focused_stream: u16,
 }
 
 impl InputEvent {
@@ -253,6 +275,14 @@ impl InputEvent {
                 dst.put_u8(9);
                 dst.put_u32(text.len() as u32);
                 dst.put_slice(text.as_bytes());
+            }
+            InputEvent::NetworkFeedback(f) => {
+                dst.put_u8(10);
+                dst.put_u16(f.loss_permille);
+                dst.put_i32(f.delay_trend_us_per_s);
+                dst.put_u32(f.jitter_us);
+                dst.put_u32(f.received_kbps);
+                dst.put_u16(f.focused_stream);
             }
         }
     }
@@ -393,6 +423,21 @@ impl InputEvent {
                     .to_owned();
                 src.advance(text_len);
                 Ok(InputEvent::TextCommit { text })
+            }
+            10 => {
+                if src.len() < 16 {
+                    return Err(ProtocolError::BufferTooShort {
+                        required: 16,
+                        found: src.len(),
+                    });
+                }
+                Ok(InputEvent::NetworkFeedback(NetworkFeedback {
+                    loss_permille: src.get_u16(),
+                    delay_trend_us_per_s: src.get_i32(),
+                    jitter_us: src.get_u32(),
+                    received_kbps: src.get_u32(),
+                    focused_stream: src.get_u16(),
+                }))
             }
             other => Err(ProtocolError::DeserializationError(format!(
                 "Invalid event tag: {other}"
@@ -545,6 +590,21 @@ mod tests {
     }
 
     #[test]
+    fn truncated_network_feedback_is_rejected() {
+        let mut buf = bytes::BytesMut::new();
+        InputEvent::NetworkFeedback(NetworkFeedback {
+            loss_permille: 1,
+            delay_trend_us_per_s: 2,
+            jitter_us: 3,
+            received_kbps: 4,
+            focused_stream: NO_FOCUSED_STREAM,
+        })
+        .encode(&mut buf);
+        let mut short = &buf[..buf.len() - 1];
+        assert!(InputEvent::decode(&mut short).is_err());
+    }
+
+    #[test]
     fn test_element_state_conversion() {
         assert_eq!(ElementState::try_from(1).unwrap(), ElementState::Pressed);
         assert_eq!(ElementState::try_from(2).unwrap(), ElementState::Released);
@@ -576,6 +636,13 @@ mod tests {
     fn test_input_event_roundtrips() {
         let events = vec![
             InputEvent::MouseMoveRelative { dx: -120, dy: 450 },
+            InputEvent::NetworkFeedback(NetworkFeedback {
+                loss_permille: 37,
+                delay_trend_us_per_s: -2500,
+                jitter_us: 1800,
+                received_kbps: 28_400,
+                focused_stream: 2,
+            }),
             InputEvent::MouseMoveAbsolute {
                 x: 1920,
                 y: 1080,

@@ -41,6 +41,7 @@ pub struct DebugHud {
     hud_width: u32,
     hud_height: u32,
     input_latency_us: u64,
+    received_kbps: u32,
 }
 
 impl Default for DebugHud {
@@ -69,6 +70,7 @@ impl DebugHud {
             hud_width,
             hud_height,
             input_latency_us: 0,
+            received_kbps: 0,
         }
     }
 
@@ -130,10 +132,15 @@ impl DebugHud {
         self.input_latency_us = latency_us;
     }
 
+    /// Records the video rate actually arriving from the host, in kbit/s.
+    pub fn set_received_kbps(&mut self, kbps: u32) {
+        self.received_kbps = kbps;
+    }
+
     /// Formats the HUD telemetry summary text.
     pub fn formatted_text(&self) -> String {
         format!(
-            "FPS: {:.1} / {:.0}Hz\nM2P: {:.1}ms | Dec: {:.1}ms\nInput: {:.2}ms\nCodec: {}\nPackets: {} | FEC: {} | Loss: {}",
+            "FPS: {:.1} / {:.0}Hz\nM2P: {:.1}ms | Dec: {:.1}ms\nInput: {:.2}ms\nCodec: {}\nPackets: {} | FEC: {} | Loss: {}\nRx: {:.1} Mbps",
             self.last_snapshot.fps,
             self.last_snapshot.target_fps,
             self.last_snapshot.motion_to_photon_ms,
@@ -143,6 +150,7 @@ impl DebugHud {
             self.last_snapshot.packets_received,
             self.last_snapshot.fec_recovered,
             self.last_snapshot.packets_lost,
+            self.received_kbps as f32 / 1000.0,
         )
     }
 
@@ -225,8 +233,10 @@ mod tests {
 
         hud.update(&config, &pacing, &stats, 100, 5, 0);
         hud.set_input_latency_us(1250);
+        hud.set_received_kbps(28_400);
 
         let text = hud.formatted_text();
+        assert!(text.contains("Rx: 28.4 Mbps"));
         assert!(text.contains("M2P: 12.1ms"));
         assert!(text.contains("Dec: 2.4ms"));
         assert!(text.contains("Input: 1.25ms"));

@@ -241,7 +241,7 @@ fn render_virtual_displays(frame: &mut Frame, area: Rect, model: &DashboardModel
         Cell::from("Resolution").style(Style::default().fg(Color::Yellow)),
         Cell::from("Target").style(Style::default().fg(Color::Yellow)),
         Cell::from("FPS").style(Style::default().fg(Color::Yellow)),
-        Cell::from("Bitrate").style(Style::default().fg(Color::Yellow)),
+        Cell::from("Act/Tgt Mbps").style(Style::default().fg(Color::Yellow)),
         Cell::from("Codec").style(Style::default().fg(Color::Yellow)),
     ])
     .bottom_margin(1);
@@ -262,7 +262,10 @@ fn render_virtual_displays(frame: &mut Frame, area: Rect, model: &DashboardModel
                 Cell::from(format!("{}x{}", disp.width, disp.height)),
                 Cell::from(format!("{} Hz", disp.refresh_rate)),
                 Cell::from(format!("{:.1}", disp.fps)).style(Style::default().fg(fps_color)),
-                Cell::from(format!("{:.1} Mbps", disp.bitrate_mbps)),
+                Cell::from(format!(
+                    "{:.1}/{:.1}",
+                    disp.bitrate_mbps, disp.target_bitrate_mbps
+                )),
                 Cell::from(disp.codec.clone()).style(Style::default().fg(Color::Cyan)),
             ])
         })
@@ -632,6 +635,7 @@ mod tests {
                     refresh_rate: 90,
                     fps: 89.9,
                     bitrate_mbps: 78.4,
+                    target_bitrate_mbps: 78.4,
                     codec: "AV1".into(),
                     is_virtual: true,
                 },
@@ -643,6 +647,7 @@ mod tests {
                     refresh_rate: 60,
                     fps: 59.9,
                     bitrate_mbps: 34.2,
+                    target_bitrate_mbps: 34.2,
                     codec: "AV1".into(),
                     is_virtual: true,
                 },

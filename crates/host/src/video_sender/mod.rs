@@ -43,6 +43,7 @@ use tokio::sync::{watch, Notify};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use crate::congestion::StreamRate;
 use crate::link_status::SharedLinkTracker;
 
 pub use packetizer::{
@@ -61,6 +62,13 @@ const MIN_PACING_WAIT: Duration = Duration::from_millis(1);
 /// were paced over longer than that, missing packets would be released before the parity that
 /// could rebuild them. So the pacing rate is raised, if needed, until one block fits in this.
 const MAX_BLOCK_SPAN: Duration = Duration::from_millis(2);
+
+/// Shortest time between two live encoder bitrate changes. Rate-control reconfiguration is not
+/// free, and the controller already limits how fast it moves.
+const MIN_BITRATE_APPLY_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Width of the window the achieved video rate is averaged over.
+const RATE_WINDOW: Duration = Duration::from_millis(500);
 
 /// Consecutive capture failures after which capturing stops (with one error log).
 const MAX_CONSECUTIVE_CAPTURE_ERRORS: u32 = 50;
@@ -107,6 +115,10 @@ pub struct VideoSenderConfig {
     /// Set by the host input receiver when the client asks for a keyframe; the send loop
     /// clears it and forces an IDR. `None` ignores client requests.
     pub keyframe_requests: Option<Arc<AtomicBool>>,
+    /// Target bitrate and FEC ratio set live by the congestion controller. The sender applies
+    /// them before each frame and reports the rate it achieved. `None` keeps the encoder and
+    /// FEC settings fixed.
+    pub rate: Option<Arc<StreamRate>>,
 }
 
 impl Default for VideoSenderConfig {
@@ -121,6 +133,7 @@ impl Default for VideoSenderConfig {
             fallback_fps: 60,
             min_keyframe_interval: Duration::from_millis(250),
             keyframe_requests: None,
+            rate: None,
         }
     }
 }
@@ -185,6 +198,39 @@ pub struct FramePipeline<E: VideoEncoder, K: DatagramSink> {
     last_keyframe_request: Option<Instant>,
     /// An IDR was requested and no keyframe has been planned since.
     keyframe_pending: bool,
+    applied_kbps: Option<u32>,
+    last_bitrate_apply: Option<Instant>,
+    rate_window: RateWindow,
+}
+
+/// Measures the video payload rate (FEC parity excluded) over fixed windows.
+#[derive(Debug)]
+struct RateWindow {
+    started: Option<Instant>,
+    payload_bytes: u64,
+}
+
+impl RateWindow {
+    fn new() -> Self {
+        Self {
+            started: None,
+            payload_bytes: 0,
+        }
+    }
+
+    /// Adds `payload_bytes` sent at `now`; returns kbit/s when a window just closed.
+    fn record(&mut self, payload_bytes: u64, now: Instant) -> Option<u32> {
+        let started = *self.started.get_or_insert(now);
+        self.payload_bytes += payload_bytes;
+        let elapsed = now.saturating_duration_since(started);
+        if elapsed < RATE_WINDOW {
+            return None;
+        }
+        let kbps = (self.payload_bytes * 8) as f64 / elapsed.as_secs_f64() / 1000.0;
+        self.started = Some(now);
+        self.payload_bytes = 0;
+        Some(kbps.round().min(f64::from(u32::MAX)) as u32)
+    }
 }
 
 /// Why an IDR is being requested.
@@ -216,7 +262,38 @@ impl<E: VideoEncoder, K: DatagramSink> FramePipeline<E, K> {
             epoch: Instant::now(),
             last_keyframe_request: None,
             keyframe_pending: false,
+            applied_kbps: None,
+            last_bitrate_apply: None,
+            rate_window: RateWindow::new(),
         }
+    }
+
+    /// Applies the congestion controller's current target to the encoder and packetizer.
+    fn apply_rate(&mut self, rate: &StreamRate, now: Instant) {
+        let target = rate.target_kbps();
+        let due = self
+            .last_bitrate_apply
+            .is_none_or(|t| now.saturating_duration_since(t) >= MIN_BITRATE_APPLY_INTERVAL);
+        if target > 0 && self.applied_kbps != Some(target) && due {
+            if self.encoder.set_bitrate(target) {
+                debug!(
+                    stream = self.cfg.stream_id,
+                    kbps = target,
+                    "encoder bitrate changed"
+                );
+            } else if self.applied_kbps.is_some() {
+                // Remember the attempt so an encoder that cannot retune is asked once per
+                // change, not on every frame.
+                debug!(
+                    stream = self.cfg.stream_id,
+                    kbps = target,
+                    "encoder cannot retune live"
+                );
+            }
+            self.applied_kbps = Some(target);
+            self.last_bitrate_apply = Some(now);
+        }
+        self.packetizer.set_parity_ratio(rate.fec_ratio());
     }
 
     pub fn encoder(&self) -> &E {
@@ -274,6 +351,9 @@ impl<E: VideoEncoder, K: DatagramSink> FramePipeline<E, K> {
         newer_frame_waiting: &(dyn Fn() -> bool + Sync),
     ) -> Result<Option<FrameReport>, VideoSendError> {
         let frame_in = Instant::now();
+        if let Some(rate) = self.cfg.rate.clone() {
+            self.apply_rate(&rate, frame_in);
+        }
         let encoded = self.encoder.encode(raw).await?;
         let Some(mut plan) = self.packetizer.plan(&encoded)? else {
             return Ok(None);
@@ -377,6 +457,17 @@ impl<E: VideoEncoder, K: DatagramSink> FramePipeline<E, K> {
                 // Some of the frame never left the host; FEC may or may not cover it, and
                 // the encoder cannot know. Resynchronize the decoder with an IDR.
                 self.request_keyframe(Instant::now(), KeyframeReason::SendFailure);
+            }
+        }
+        if let Some(rate) = &self.cfg.rate {
+            let source = (report.datagrams - report.parity_datagrams) as u64;
+            let payload = if report.datagrams == 0 {
+                0
+            } else {
+                report.bytes as u64 * source / report.datagrams as u64
+            };
+            if let Some(kbps) = self.rate_window.record(payload, Instant::now()) {
+                rate.set_actual_kbps(kbps);
             }
         }
         report.latency = frame_in.elapsed();

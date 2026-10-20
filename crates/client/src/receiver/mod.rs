@@ -1,5 +1,6 @@
 //! Streaming receiver integrating jitter buffer, FEC recovery, and frame reassembly.
 
+pub mod feedback;
 pub mod loss_recovery;
 
 use std::collections::BTreeMap;
@@ -22,6 +23,8 @@ pub struct ClientReceiver {
     reassembler: FrameReassembler,
     packets_received: u64,
     stream_restarts_seen: u64,
+    feedback: feedback::FeedbackEstimator,
+    focused_stream: Option<u16>,
 }
 
 impl ClientReceiver {
@@ -41,7 +44,22 @@ impl ClientReceiver {
             reassembler: FrameReassembler::new(16),
             packets_received: 0,
             stream_restarts_seen: 0,
+            feedback: feedback::FeedbackEstimator::new(Instant::now()),
+            focused_stream: None,
         }
+    }
+
+    /// Sets the stream id of the panel the user is looking at, reported to the host so it can
+    /// give that panel the larger share of the bitrate.
+    pub fn set_focused_stream(&mut self, stream: Option<u16>) {
+        self.focused_stream = stream;
+    }
+
+    /// The next network quality report for the host's bitrate controller, if one is due.
+    pub fn poll_feedback(&mut self, now: Instant) -> Option<linux_quest_protocol::NetworkFeedback> {
+        let lost = self.packets_lost_count();
+        self.feedback
+            .poll(now, self.packets_received, lost, self.focused_stream)
     }
 
     /// Creates an isolated receiver for one protocol stream id.
@@ -60,6 +78,8 @@ impl ClientReceiver {
             return;
         }
         self.packets_received += 1;
+        self.feedback
+            .observe_packet(packet.header.timestamp_us, packet.payload.len(), now);
         self.jitter_buffer.ingest_packet(packet, now);
         let restarts = self.jitter_buffer.stats().stream_restarts;
         if restarts != self.stream_restarts_seen {
@@ -215,6 +235,35 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use linux_quest_protocol::video::{VideoChunkMeta, VideoCodec};
+
+    #[test]
+    fn receiver_reports_feedback_with_focus_to_the_host() {
+        use linux_quest_protocol::packet::{PacketHeader, PacketType};
+        let config = ClientConfig::default();
+        let mut receiver = ClientReceiver::new(&config);
+        receiver.set_focused_stream(Some(2));
+        let t0 = Instant::now();
+        assert!(receiver.poll_feedback(t0).is_none());
+
+        let payload = Bytes::from(vec![0u8; 1_000]);
+        for i in 0..250u32 {
+            let sent_us = u64::from(i) * 1_000;
+            let header = PacketHeader::new(PacketType::VideoFrameChunk, 0, i, sent_us, &payload);
+            receiver.ingest_packet(
+                Packet::new(header, payload.clone()),
+                t0 + Duration::from_micros(sent_us + 2_000),
+            );
+        }
+        let fb = receiver
+            .poll_feedback(t0 + Duration::from_millis(252))
+            .expect("a report is due after 200 ms of traffic");
+        assert_eq!(fb.focused_stream, 2);
+        assert_eq!(fb.loss_permille, 0);
+        assert!(fb.received_kbps > 7_000, "{}", fb.received_kbps);
+        assert!(receiver
+            .poll_feedback(t0 + Duration::from_millis(260))
+            .is_none());
+    }
 
     #[test]
     fn test_client_receiver_ingest_and_reassemble() {

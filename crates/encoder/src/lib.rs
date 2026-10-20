@@ -126,6 +126,13 @@ pub trait VideoEncoder: Send + Sync {
     async fn encode(&mut self, frame: &RawFrame) -> Result<EncodedFrame, EncoderError>;
     fn request_keyframe(&mut self);
     fn invalidate_reference_picture(&mut self, pts_us: u64);
+
+    /// Changes the target bitrate of a running encoder without restarting it. Returns whether
+    /// the backend applied it; the default (and any backend that cannot retune live) returns
+    /// `false` and keeps its configured rate.
+    fn set_bitrate(&mut self, _kbps: u32) -> bool {
+        false
+    }
 }
 
 /// Software mock encoder for testing chunking, rate control, and RPI loops.
@@ -162,6 +169,11 @@ impl VideoEncoder for MockVideoEncoder {
         self.frame_counter = 0;
         self.force_keyframe = true;
         Ok(())
+    }
+
+    fn set_bitrate(&mut self, kbps: u32) -> bool {
+        self.config.bitrate_kbps = kbps;
+        true
     }
 
     async fn encode(&mut self, frame: &RawFrame) -> Result<EncodedFrame, EncoderError> {
@@ -504,6 +516,10 @@ impl VideoEncoder for AutoVideoEncoder {
     fn invalidate_reference_picture(&mut self, pts_us: u64) {
         self.inner.invalidate_reference_picture(pts_us);
     }
+
+    fn set_bitrate(&mut self, kbps: u32) -> bool {
+        self.inner.set_bitrate(kbps)
+    }
 }
 
 #[cfg(test)]
@@ -511,6 +527,18 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use nvenc::{NV_ENC_CODEC_AV1_GUID, NV_ENC_CODEC_HEVC_GUID};
+
+    #[tokio::test]
+    async fn live_bitrate_change_is_applied_by_mock_and_auto_encoders() {
+        let mut mock = MockVideoEncoder::new(EncoderConfig::default());
+        assert!(mock.set_bitrate(12_000));
+        assert_eq!(mock.config.bitrate_kbps, 12_000);
+
+        let mut auto =
+            AutoVideoEncoder::with_preference(EncoderConfig::default(), BackendPreference::Mock);
+        auto.init(EncoderConfig::default()).await.unwrap();
+        assert!(auto.set_bitrate(8_000));
+    }
 
     #[tokio::test]
     async fn test_mock_encoder_chunking() {

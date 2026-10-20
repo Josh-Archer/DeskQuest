@@ -164,6 +164,12 @@ impl Packetizer {
         }
     }
 
+    /// Changes the parity ratio for blocks planned from now on. Plans already made keep the
+    /// parity they were built with.
+    pub fn set_parity_ratio(&mut self, ratio: f64) {
+        self.fec.parity_ratio = ratio.clamp(0.0, 1.0);
+    }
+
     /// Sequence number the next datagram will carry.
     pub fn next_sequence(&self) -> u32 {
         self.sequence

@@ -177,7 +177,9 @@ impl InputInjector for XTestInjector {
                 self.run(&[command, &format!("keycode:{x_keycode}")])
             }
             InputEvent::TextCommit { text } => inject_committed_text(&text),
-            InputEvent::ClipboardSync { .. } | InputEvent::KeyframeRequest => Ok(()),
+            InputEvent::ClipboardSync { .. }
+            | InputEvent::KeyframeRequest
+            | InputEvent::NetworkFeedback(_) => Ok(()),
         }
     }
 
