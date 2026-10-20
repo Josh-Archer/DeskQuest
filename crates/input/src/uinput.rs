@@ -248,6 +248,11 @@ impl UinputInjector {
                 let events = [make_key_event(keycode as u16, value), make_syn_report()];
                 self.keyboard.write_events(&events)?;
             }
+            InputEvent::TextCommit { text } => {
+                // uinput is layout agnostic and cannot express Unicode text directly. Use the
+                // compositor's text injection utility for committed IME text.
+                crate::backend::inject_committed_text(&text)?;
+            }
             InputEvent::ClipboardSync { .. } => {
                 // Clipboard sync is handled out-of-band by compositor/clipboard protocols.
                 tracing::debug!("Clipboard sync received on uinput injector; ignoring for evdev");

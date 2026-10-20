@@ -33,8 +33,8 @@ pub const MIN_CURVE_RADIUS_M: f32 = 0.5;
 /// Maximum curved cylinder radius in meters (5.0m).
 pub const MAX_CURVE_RADIUS_M: f32 = 5.0;
 
-/// Default curved cylinder radius in meters (1.5m).
-pub const DEFAULT_CURVE_RADIUS_M: f32 = 1.5;
+/// Default curved cylinder radius in meters: a gentle curve, like Horizon's own windows.
+pub const DEFAULT_CURVE_RADIUS_M: f32 = 3.0;
 
 /// Minimum central arc angle in radians (0.1 rad ≈ 5.7 degrees).
 pub const MIN_CURVE_ANGLE_RAD: f32 = 0.1;
@@ -42,8 +42,8 @@ pub const MIN_CURVE_ANGLE_RAD: f32 = 0.1;
 /// Maximum central arc angle in radians (PI rad = 180 degrees).
 pub const MAX_CURVE_ANGLE_RAD: f32 = PI;
 
-/// Default central arc angle in radians (1.2 rad ≈ 68.75 degrees).
-pub const DEFAULT_CURVE_ANGLE_RAD: f32 = 1.2;
+/// Default central arc angle in radians (0.6 rad at 3 m: a 1.8 m wide screen).
+pub const DEFAULT_CURVE_ANGLE_RAD: f32 = 0.6;
 
 /// Minimum physical screen width in meters (0.2m).
 pub const MIN_SCREEN_WIDTH_M: f32 = 0.2;

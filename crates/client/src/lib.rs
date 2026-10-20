@@ -17,6 +17,7 @@ pub mod openxr;
 pub mod receiver;
 pub mod runtime;
 pub mod spatial;
+pub mod streams;
 
 #[cfg(target_os = "android")]
 pub use audio::AAudioSink;

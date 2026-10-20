@@ -230,8 +230,7 @@ impl ScreenTransform {
                 ray_intersects_quad(ray, &quad_pose, self.quad_size)
             }
             DisplayMode::CurvedCylinder => {
-                let axis_pose =
-                    ScreenPose::new(Vec3::new(0.0, self.position.y, 0.0), self.orientation);
+                let axis_pose = self.cylinder_axis_pose();
                 ray_intersects_cylinder(
                     ray,
                     &axis_pose,
