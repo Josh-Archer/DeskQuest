@@ -170,14 +170,78 @@ pub async fn start_daemon_video_sender(
     options: DaemonVideoOptions,
     keyframe_requests: Arc<AtomicBool>,
 ) -> Result<VideoSenderHandle, String> {
+    start_daemon_video_stream(link, options, 0, 0, options.bitrate_mbps, keyframe_requests).await
+}
+
+/// Starts independent capture/encode/send pipelines for the supplied active monitors. Each
+/// pipeline owns its packetizer, FEC state, pacing state, keyframe flag and stream id.
+/// Bitrate is divided evenly (remainder goes to lower ids) so the aggregate does not exceed
+/// the configured session bitrate.
+pub async fn start_daemon_video_senders(
+    link: SharedLinkTracker,
+    options: DaemonVideoOptions,
+    monitors: &[linux_quest_protocol::DisplayInfo],
+) -> Result<Vec<VideoSenderHandle>, String> {
+    if monitors.is_empty() {
+        return Err("no active monitors to stream".into());
+    }
+    if monitors.len() > usize::from(u16::MAX) {
+        return Err(format!(
+            "{} monitors exceed the protocol stream id limit",
+            monitors.len()
+        ));
+    }
+    let shares = bitrate_shares(options.bitrate_mbps, monitors.len())?;
+    let mut handles = Vec::with_capacity(monitors.len());
+    for (monitor, bitrate) in monitors.iter().zip(shares) {
+        handles.push(
+            start_daemon_video_stream(
+                link.clone(),
+                options,
+                monitor.display_id,
+                monitor.display_id,
+                bitrate,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await?,
+        );
+    }
+    Ok(handles)
+}
+
+fn bitrate_shares(total_mbps: u32, streams: usize) -> Result<Vec<u32>, String> {
+    if streams == 0 {
+        return Err("no active monitors to stream".into());
+    }
+    let count = u32::try_from(streams).map_err(|_| "monitor count exceeds bitrate allocator")?;
+    let base = total_mbps / count;
+    let remainder = total_mbps % count;
+    if base == 0 {
+        return Err(format!(
+            "{total_mbps} Mbit/s total bitrate cannot provide a positive share to {streams} monitor streams"
+        ));
+    }
+    Ok((0..count)
+        .map(|index| base + u32::from(index < remainder))
+        .collect())
+}
+
+async fn start_daemon_video_stream(
+    link: SharedLinkTracker,
+    options: DaemonVideoOptions,
+    display_id: u16,
+    stream_id: u16,
+    bitrate_mbps: u32,
+    keyframe_requests: Arc<AtomicBool>,
+) -> Result<VideoSenderHandle, String> {
     let defaults = EncoderConfig::default();
-    let capture = AutoCapture::new(0, defaults.width, defaults.height, defaults.fps);
+    let capture = AutoCapture::new(display_id, defaults.width, defaults.height, defaults.fps);
 
     let source = CaptureFrameSource::open(capture, options.test_pattern)
         .await
         .map_err(|e| format!("capture: {e}"))?;
     let geometry = encode_geometry(source.capture_info().as_ref(), &defaults);
-    let bitrate_kbps = options.bitrate_mbps.saturating_mul(1000);
+    let bitrate_kbps = bitrate_mbps.saturating_mul(1000);
     let (encoder, plan) = open_planned_encoder(options.encoder, bitrate_kbps, geometry)
         .await
         .map_err(|e| format!("encoder: {e}"))?;
@@ -185,7 +249,8 @@ pub async fn start_daemon_video_sender(
     tracing::info!(
         backend = plan.backend.name(),
         codec = ?plan.codec,
-        bitrate_mbps = options.bitrate_mbps,
+        bitrate_mbps,
+        stream_id,
         width = geometry.0,
         height = geometry.1,
         fps = geometry.2,
@@ -195,6 +260,7 @@ pub async fn start_daemon_video_sender(
         .map_err(|e| format!("UDP socket: {e}"))?;
     let config = VideoSenderConfig {
         video_port: options.video_port,
+        stream_id,
         keyframe_requests: Some(keyframe_requests),
         ..VideoSenderConfig::default()
     };
@@ -205,6 +271,13 @@ pub async fn start_daemon_video_sender(
 mod tests {
     use super::*;
     use linux_quest_capture::SyntheticCapture;
+
+    #[test]
+    fn monitor_streams_receive_independent_bitrate_shares() {
+        assert_eq!(bitrate_shares(30, 3).unwrap(), vec![10, 10, 10]);
+        assert_eq!(bitrate_shares(32, 3).unwrap(), vec![11, 11, 10]);
+        assert!(bitrate_shares(2, 3).unwrap_err().contains("positive share"));
+    }
 
     #[tokio::test]
     async fn synthetic_capture_is_refused_unless_allowed() {
