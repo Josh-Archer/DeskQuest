@@ -129,7 +129,9 @@ impl InputInjector for XTestInjector {
                 };
                 self.run(&[command, &format!("keycode:{x_keycode}")])
             }
-            InputEvent::ClipboardSync { .. } | InputEvent::KeyframeRequest => Ok(()),
+            InputEvent::ClipboardSync { .. }
+            | InputEvent::KeyframeRequest
+            | InputEvent::KeyframeRequestFor { .. } => Ok(()),
         }
     }
 

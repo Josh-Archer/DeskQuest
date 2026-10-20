@@ -219,13 +219,15 @@ pub async fn start_daemon_video_sender(
 }
 
 /// Starts independent capture/encode/send pipelines for the supplied active monitors. Each
-/// pipeline owns its packetizer, FEC state, pacing state, keyframe flag and stream id.
+/// pipeline owns its packetizer, FEC state, pacing state and stream id, and takes its own
+/// keyframe flag from `keyframe_requests`.
 /// Bitrate is divided evenly (remainder goes to lower ids) so the aggregate does not exceed
 /// the configured session bitrate.
 pub async fn start_daemon_video_senders(
     link: SharedLinkTracker,
     options: DaemonVideoOptions,
     monitors: &[linux_quest_protocol::DisplayInfo],
+    keyframe_requests: Arc<KeyframeRequests>,
 ) -> Result<Vec<VideoSenderHandle>, String> {
     if monitors.is_empty() {
         return Err("no active monitors to stream".into());
@@ -246,7 +248,7 @@ pub async fn start_daemon_video_senders(
                 monitor.display_id,
                 monitor.display_id,
                 bitrate,
-                Arc::new(AtomicBool::new(false)),
+                keyframe_requests.clone(),
             )
             .await?,
         );
@@ -277,7 +279,7 @@ async fn start_daemon_video_stream(
     display_id: u16,
     stream_id: u16,
     bitrate_mbps: u32,
-    keyframe_requests: Arc<AtomicBool>,
+    keyframe_requests: Arc<KeyframeRequests>,
 ) -> Result<VideoSenderHandle, String> {
     let defaults = EncoderConfig::default();
     let capture = AutoCapture::new(display_id, defaults.width, defaults.height, defaults.fps);
