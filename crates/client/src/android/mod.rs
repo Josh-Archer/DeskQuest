@@ -673,6 +673,30 @@ pub fn android_main(app: AndroidApp) {
             }
             None => (None, None, None, None),
         };
+    let tcp_input_source = if transport_mode == TransportMode::AdbReverseTcp {
+        let source = CombinedInputSource::new();
+        let flag = source.requester();
+        let queue = source.keyboard_queue();
+        let events = source.pointer_events();
+        Some((
+            std::sync::Arc::new(std::sync::Mutex::new(source)),
+            flag,
+            queue,
+            events,
+        ))
+    } else {
+        None
+    };
+    let (keyframe_flag, input_queue, pointer_events) = tcp_input_source
+        .as_ref()
+        .map(|(_, flag, queue, events)| {
+            (
+                Some(flag.clone()),
+                Some(queue.clone()),
+                Some(events.clone()),
+            )
+        })
+        .unwrap_or((keyframe_flag, input_queue, pointer_events));
     let ack_control: Option<crate::input_sender::InputSenderControl> =
         input_sender.as_ref().map(|s| s.control().clone());
     let receiver_ack_control = ack_control.clone();
@@ -680,19 +704,20 @@ pub fn android_main(app: AndroidApp) {
     let requester_control = ack_control.clone();
     let keyframe_requester = move || -> Option<Box<dyn Fn(u16) + Send>> {
         let flags = keyframe_flag.clone()?;
-        let control = requester_control.clone()?;
+        let control = requester_control.clone();
         Some(Box::new(move |stream_id| {
             tracing::info!(stream_id, "video lost; requesting a keyframe from the host");
             flags.raise(stream_id);
-            control.notify();
+            if let Some(control) = &control {
+                control.notify();
+            }
         }))
     };
 
     let receiver_handle = std::thread::spawn(move || {
         match transport_mode {
             crate::config::TransportMode::AdbReverseTcp => {
-                use std::io::Read;
-                let mut temp_buf = [0u8; 16384];
+                use std::io::{Read, Write};
 
                 while bg_running.load(std::sync::atomic::Ordering::Relaxed) {
                     tracing::info!(host = ?host_addr, "Attempting TCP connection to host for USB/ADB streaming");
@@ -709,64 +734,147 @@ pub fn android_main(app: AndroidApp) {
                     let _ = stream.set_nodelay(true);
                     let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
                     let mut stream = stream;
-                    let mut read_buf = Vec::with_capacity(65536);
+                    if stream
+                        .write_all(linux_quest_transport::USB_TUNNEL_HELLO)
+                        .is_err()
+                    {
+                        std::thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                    let mut response = [0u8; linux_quest_transport::USB_TUNNEL_ACCEPT.len()];
+                    if stream.read_exact(&mut response).is_err()
+                        || &response != linux_quest_transport::USB_TUNNEL_ACCEPT
+                    {
+                        tracing::warn!("Host rejected USB tunnel negotiation");
+                        std::thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                    if let Some((source, _, _, _)) = &tcp_input_source {
+                        if let Ok(writer_stream) = stream.try_clone() {
+                            let writer_source = source.clone();
+                            let writer_running = bg_running.clone();
+                            std::thread::spawn(move || {
+                                use crate::input_sender::InputSource;
+                                let mut writer_stream = writer_stream;
+                                let mut sequence = 0u32;
+                                let mut last_keepalive = std::time::Instant::now();
+                                while writer_running.load(std::sync::atomic::Ordering::Relaxed) {
+                                    let events = writer_source
+                                        .lock()
+                                        .map(|mut source| source.poll())
+                                        .unwrap_or_default();
+                                    let keepalive =
+                                        last_keepalive.elapsed() >= Duration::from_millis(100);
+                                    if !events.is_empty() || keepalive {
+                                        let now_us = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_micros()
+                                            as u64;
+                                        let payload = linux_quest_protocol::InputBatch::new(
+                                            u64::from(sequence),
+                                            now_us,
+                                        )
+                                        .with_events(events)
+                                        .encode();
+                                        let header = linux_quest_protocol::PacketHeader::new(
+                                            linux_quest_protocol::PacketType::InputEvent,
+                                            0,
+                                            sequence,
+                                            now_us,
+                                            &payload,
+                                        );
+                                        let packet =
+                                            linux_quest_protocol::Packet::new(header, payload);
+                                        let frame = linux_quest_transport::TunnelFrame::Packet(
+                                            packet.to_bytes().to_vec(),
+                                        );
+                                        let body = match bincode::serialize(&frame) {
+                                            Ok(body) => body,
+                                            Err(error) => {
+                                                tracing::warn!(%error, "Could not encode USB input frame");
+                                                break;
+                                            }
+                                        };
+                                        let Ok(len) = u32::try_from(body.len()) else {
+                                            break;
+                                        };
+                                        if writer_stream.write_all(&len.to_be_bytes()).is_err()
+                                            || writer_stream.write_all(&body).is_err()
+                                        {
+                                            break;
+                                        }
+                                        sequence = sequence.wrapping_add(1);
+                                        last_keepalive = std::time::Instant::now();
+                                    }
+                                    std::thread::sleep(Duration::from_millis(4));
+                                }
+                            });
+                        }
+                    }
 
+                    let mut read_buf = Vec::with_capacity(65536);
                     while bg_running.load(std::sync::atomic::Ordering::Relaxed) {
                         match stream.read(&mut temp_buf) {
                             Ok(0) => {
                                 tracing::info!("TCP streaming connection closed by host");
                                 break;
                             }
-                            Ok(n) => {
-                                read_buf.extend_from_slice(&temp_buf[..n]);
-                                while read_buf.len() >= linux_quest_protocol::packet::HEADER_SIZE {
-                                    let mut header_slice =
-                                        &read_buf[..linux_quest_protocol::packet::HEADER_SIZE];
-                                    match linux_quest_protocol::packet::PacketHeader::decode(
-                                        &mut header_slice,
-                                    ) {
-                                        Ok(header) => {
-                                            // Reject unreasonable packet payload lengths (> 1MB) to prevent unbounded memory growth
-                                            if header.payload_len > 1_048_576 {
-                                                read_buf.remove(0);
-                                                continue;
-                                            }
-                                            let total_size =
-                                                linux_quest_protocol::packet::HEADER_SIZE
-                                                    + header.payload_len as usize;
-                                            if read_buf.len() >= total_size {
-                                                let pkt_bytes: Vec<u8> =
-                                                    read_buf.drain(..total_size).collect();
-                                                match linux_quest_protocol::packet::Packet::from_bytes(
-                                                    &pkt_bytes,
-                                                ) {
-                                                    Ok(packet) => {
-                                                        let _ = packet_tx.try_send(packet);
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::trace!(
-                                                            error = ?e,
-                                                            "Failed to parse incoming packet from TCP"
-                                                        );
-                                                    }
-                                                }
-                                            } else {
-                                                break;
-                                            }
-                                        }
-                                        Err(_) => {
-                                            // Bad header magic / corrupt byte: discard 1 byte and resynchronize
-                                            read_buf.remove(0);
-                                        }
-                                    }
-                                }
-                            }
-                            Err(ref e)
+                            Ok(n) => read_buf.extend_from_slice(&temp_buf[..n]),
+                            Err(e)
                                 if e.kind() == std::io::ErrorKind::WouldBlock
-                                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+                                    || e.kind() == std::io::ErrorKind::TimedOut =>
+                            {
+                                continue
+                            }
                             Err(e) => {
                                 tracing::trace!(error = ?e, "TCP stream read error");
                                 break;
+                            }
+                        }
+                        loop {
+                            if read_buf.len() < 4 {
+                                break;
+                            }
+                            let frame_len =
+                                u32::from_be_bytes(read_buf[..4].try_into().unwrap()) as usize;
+                            if frame_len > linux_quest_transport::tcp_tunnel::MAX_TUNNEL_FRAME_SIZE
+                            {
+                                tracing::warn!(frame_len, "USB tunnel frame exceeds limit");
+                                read_buf.clear();
+                                break;
+                            }
+                            let frame_end = 4 + frame_len;
+                            if read_buf.len() < frame_end {
+                                break;
+                            }
+                            let body = read_buf[4..frame_end].to_vec();
+                            read_buf.drain(..frame_end);
+                            match bincode::deserialize::<linux_quest_transport::TunnelFrame>(&body)
+                            {
+                                Ok(linux_quest_transport::TunnelFrame::Packet(pkt_bytes)) => {
+                                    match linux_quest_protocol::packet::Packet::from_bytes(
+                                        &pkt_bytes,
+                                    ) {
+                                        Ok(packet) => {
+                                            let _ = packet_tx.try_send(packet);
+                                        }
+                                        Err(e) => {
+                                            tracing::trace!(error = ?e, "Invalid USB tunnel packet")
+                                        }
+                                    }
+                                }
+                                Ok(linux_quest_transport::TunnelFrame::Control(message)) => {
+                                    tracing::trace!(
+                                        ?message,
+                                        "Received USB tunnel control message"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "Invalid USB tunnel frame");
+                                    read_buf.clear();
+                                    break;
+                                }
                             }
                         }
                     }

@@ -42,8 +42,8 @@ pub struct AdbBridgeConfig {
     pub target_serial: Option<String>,
 }
 
-/// Default reverses the host control TCP port ([`DEFAULT_CONTROL_PORT`], 48444), the only TCP
-/// port the host daemon listens on.
+/// Default reverses the host tunnel/control TCP port ([`DEFAULT_CONTROL_PORT`], 48444), used for
+/// video packets, input packets, and control messages in USB ADB mode.
 impl Default for AdbBridgeConfig {
     fn default() -> Self {
         Self {

@@ -29,11 +29,11 @@
 //! [`DEFAULT_ACK_TIMEOUT`] (or a send fails) it moves to the next of at most
 //! [`MAX_TARGETS`] addresses (`host_addr` then `extra_host_ips`), and stays on one that is acked.
 //!
-//! # Not available over `adb reverse`
+//! # USB mode
 //!
-//! `adb reverse` forwards TCP only. In `TransportMode::AdbReverseTcp` this sender is not
-//! started and the client sends no input at all; carrying input over USB needs the TCP control
-//! channel, which is out of scope here.
+//! In `TransportMode::AdbReverseTcp`, the same [`CombinedInputSource`] is polled by the TCP
+//! tunnel writer and its batches are sent as `Packet` frames. UDP mode continues to use the
+//! dedicated datagram sender below.
 //!
 //! # Name clash
 //!

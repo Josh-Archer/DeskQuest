@@ -284,20 +284,55 @@ async fn start_stream_services(
     keyframe_requests: Arc<KeyframeRequests>,
     rate: Arc<RateCoordinator>,
     display_map: linux_quest_input::SharedDisplayMap,
+    tunnel_video: tokio::sync::broadcast::Sender<Vec<u8>>,
 ) -> (Option<u16>, Option<u16>) {
     let mut input_port = None;
     let mut control_port = None;
+    let mut usb_packet_handler: Option<Arc<dyn Fn(linux_quest_protocol::Packet) + Send + Sync>> =
+        None;
     let input_bind_addr =
         std::net::SocketAddr::from(([0, 0, 0, 0], linux_quest_transport::DEFAULT_INPUT_PORT));
     match HostInputReceiver::bind_auto_mapped(input_bind_addr, display_map).await {
         Ok(input_service) => {
             let mut input_service = input_service
                 .with_link_tracker(link.clone())
-                .with_keyframe_requests(keyframe_requests)
-                .with_rate_coordinator(rate);
+                .with_keyframe_requests(keyframe_requests.clone())
+                .with_rate_coordinator(rate.clone());
             input_port = input_service.local_addr().ok().map(|a| a.port());
             let running_flag = input_service.running_flag();
             let auto_injector = input_service.injector();
+            let usb_injector = auto_injector.clone();
+            let usb_keyframes = keyframe_requests.clone();
+            let usb_rate = rate.clone();
+            usb_packet_handler = Some(Arc::new(move |packet| {
+                if packet.header.packet_type != linux_quest_protocol::PacketType::InputEvent {
+                    return;
+                }
+                let Ok(batch) = linux_quest_protocol::InputBatch::decode(&packet.payload) else {
+                    return;
+                };
+                let now = std::time::Instant::now();
+                for event in batch.events {
+                    match event {
+                        linux_quest_protocol::InputEvent::KeyframeRequest => {
+                            let _ = usb_keyframes.request(0);
+                        }
+                        linux_quest_protocol::InputEvent::KeyframeRequestFor { stream_id } => {
+                            let _ = usb_keyframes.request(stream_id);
+                        }
+                        linux_quest_protocol::InputEvent::NetworkFeedback(feedback) => {
+                            usb_rate.on_feedback(&feedback, now);
+                        }
+                        event => {
+                            if let Ok(mut injector) = usb_injector.lock() {
+                                if let Err(error) = injector.inject_event(event) {
+                                    tracing::warn!(%error, "Failed to inject USB tunnel input event");
+                                }
+                            }
+                        }
+                    }
+                }
+            }));
             let mut shutdown_rx_input = shutdown_tx.subscribe();
             tokio::spawn(async move {
                 info!(
@@ -331,7 +366,12 @@ async fn start_stream_services(
         std::net::SocketAddr::from(([0, 0, 0, 0], linux_quest_transport::DEFAULT_CONTROL_PORT));
     match HostClipboardService::bind_auto(control_bind_addr).await {
         Ok(clipboard_service) => {
-            let mut clipboard_service = clipboard_service.with_link_tracker(link);
+            let mut clipboard_service = clipboard_service
+                .with_link_tracker(link)
+                .with_tunnel_video(tunnel_video);
+            if let Some(handler) = usb_packet_handler {
+                clipboard_service = clipboard_service.with_tunnel_packet_handler(handler);
+            }
             control_port = clipboard_service.local_addr().map(|a| a.port());
             let running_flag = clipboard_service.running_flag();
             let mut shutdown_rx_clipboard = shutdown_tx.subscribe();
@@ -399,9 +439,10 @@ async fn start_video(
     link: SharedLinkTracker,
     keyframe_requests: Arc<KeyframeRequests>,
     rate: Arc<RateCoordinator>,
+    tunnel_video: tokio::sync::broadcast::Sender<Vec<u8>>,
 ) -> Option<MultiVideoSenderHandle> {
     if args.no_video {
-        info!("UDP video sender disabled by --no-video");
+        info!("Video sender disabled by --no-video");
         return None;
     }
     let options = MultiStreamOptions {
@@ -419,13 +460,14 @@ async fn start_video(
         options,
         keyframe_requests,
         Some(rate),
+        Some(tunnel_video),
     )
     .await
     {
         Ok(handle) => {
             info!(
                 port = args.video_port,
-                "UDP video sender ready; it sends to the headset once its input channel is live"
+                "Video sender ready; it streams over the active headset transport"
             );
             Some(handle)
         }
@@ -558,6 +600,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             if run_tui {
                 let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+                let (usb_video_tx, _) = tokio::sync::broadcast::channel(256);
                 let shutdown_tx_clone = shutdown_tx.clone();
                 let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let shutdown_flag_clone = shutdown_flag.clone();
@@ -572,6 +615,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         false,
                     )),
                     display_map.clone(),
+                    usb_video_tx,
                 )
                 .await;
                 let adb_handle = start_adb_bridge(&daemon_args, &shutdown_tx, link.clone());
@@ -604,6 +648,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 );
 
                 let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+                let (usb_video_tx, _) = tokio::sync::broadcast::channel(256);
                 let shutdown_tx_clone = shutdown_tx.clone();
                 // systemd stops units with SIGTERM; Ctrl-C delivers SIGINT. Handle both.
                 let term_signal =
@@ -644,11 +689,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     keyframe_requests.clone(),
                     rate.clone(),
                     display_map.clone(),
+                    usb_video_tx.clone(),
                 )
                 .await;
                 let adb_handle = start_adb_bridge(&daemon_args, &shutdown_tx, link.clone());
 
-                let video = start_video(&daemon_args, link.clone(), keyframe_requests, rate).await;
+                let video = start_video(
+                    &daemon_args,
+                    link.clone(),
+                    keyframe_requests,
+                    rate,
+                    usb_video_tx,
+                )
+                .await;
 
                 // Advertise only the ports that were really bound above.
                 let listening = match (control_port, input_port) {

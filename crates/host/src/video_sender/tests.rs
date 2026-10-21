@@ -1331,7 +1331,7 @@ async fn two_streams_share_the_headset_port_with_independent_frame_ids_and_keyfr
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn usb_tunnel_peer_gets_no_udp_video() {
+async fn usb_tunnel_peer_uses_tunnel_destination() {
     let _serial = SERIAL.lock().await;
     let link = tracker_with_liveness(5_000);
     link.lock().adb_event(
@@ -1353,7 +1353,13 @@ async fn usb_tunnel_peer_gets_no_udp_video() {
         config_to(48440),
     );
     tokio::time::sleep(Duration::from_millis(150)).await;
-    assert!(sent.lock().is_empty(), "adb reverse carries no UDP video");
+    {
+        let sent = sent.lock();
+        assert!(!sent.is_empty(), "USB peer should receive video");
+        assert!(sent
+            .iter()
+            .all(|(_, destination, _)| destination.ip().is_loopback()));
+    }
     handle.stop().await;
 }
 

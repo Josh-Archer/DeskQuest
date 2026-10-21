@@ -16,8 +16,11 @@ use linux_quest_input::{
     AutoClipboardBackend, ClipboardBackend, ClipboardWatcher, ClipboardWatcherConfig,
     DEFAULT_CLIPBOARD_DEBOUNCE_DURATION, DEFAULT_CLIPBOARD_POLL_INTERVAL,
 };
+use linux_quest_protocol::Packet;
 use linux_quest_protocol::{ClipboardMessage, ClipboardSyncEngine, SyncAction};
-use linux_quest_transport::{ControlChannel, ControlMessage, TransportError};
+use linux_quest_transport::{
+    negotiate_server, recv_frame, send_frame, ControlMessage, TransportError, TunnelFrame,
+};
 
 use crate::link_status::SharedLinkTracker;
 use crate::HostError;
@@ -60,6 +63,8 @@ pub struct HostClipboardService<B: ClipboardBackend + 'static = AutoClipboardBac
     listener: Option<TcpListener>,
     peer_writers: Arc<Mutex<Vec<mpsc::UnboundedSender<ControlMessage>>>>,
     link: Option<SharedLinkTracker>,
+    tunnel_packet_handler: Option<Arc<dyn Fn(Packet) + Send + Sync>>,
+    tunnel_video: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
 }
 
 impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
@@ -88,12 +93,29 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
             listener: None,
             peer_writers: Arc::new(Mutex::new(Vec::new())),
             link: None,
+            tunnel_packet_handler: None,
+            tunnel_video: None,
         }
     }
 
     /// Reports accepted and closed control connections to the shared link tracker.
     pub fn with_link_tracker(mut self, link: SharedLinkTracker) -> Self {
         self.link = Some(link);
+        self
+    }
+
+    /// Routes packet frames from negotiated USB tunnel peers to the host's packet handler.
+    pub fn with_tunnel_packet_handler(
+        mut self,
+        handler: Arc<dyn Fn(Packet) + Send + Sync>,
+    ) -> Self {
+        self.tunnel_packet_handler = Some(handler);
+        self
+    }
+
+    /// Adds the outbound packet stream used by negotiated USB tunnel peers.
+    pub fn with_tunnel_video(mut self, video: tokio::sync::broadcast::Sender<Vec<u8>>) -> Self {
+        self.tunnel_video = Some(video);
         self
     }
 
@@ -228,41 +250,57 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
 
     fn spawn_peer_handler(&self, stream: TcpStream, peer_addr: SocketAddr) {
         let (reader, writer) = stream.into_split();
-        let mut ctrl_reader = ControlChannel::new(reader, tokio::io::sink());
-        let mut ctrl_writer = ControlChannel::new(tokio::io::empty(), writer);
+        let mut reader = reader;
+        let mut writer = writer;
 
         let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<ControlMessage>();
         self.peer_writers.lock().push(peer_tx);
 
         let sync_engine = self.sync_engine.clone();
         let backend = self.backend.clone();
-        let running = self.running.clone();
-
-        // Task sending outgoing messages to peer
-        let running_writer = running.clone();
-        tokio::spawn(async move {
-            while running_writer.load(Ordering::Relaxed) {
-                match peer_rx.recv().await {
-                    Some(msg) => {
-                        if ctrl_writer.send_message(&msg).await.is_err() {
-                            break;
-                        }
-                    }
-                    None => break,
-                }
-            }
-        });
-
-        // Task receiving incoming messages from peer; reports the close when it ends
+        let packet_handler = self.tunnel_packet_handler.clone();
+        let mut video_rx = self.tunnel_video.as_ref().map(|tx| tx.subscribe());
         let link = self.link.clone();
+        let running = self.running.clone();
         tokio::spawn(async move {
+            if let Err(error) = negotiate_server(&mut reader, &mut writer).await {
+                tracing::debug!(peer = %peer_addr, %error, "USB tunnel negotiation failed");
+                if let Some(link) = link {
+                    link.lock().control_closed(peer_addr);
+                }
+                return;
+            }
             while running.load(Ordering::Relaxed) {
-                let received = ctrl_reader.recv_message().await;
+                let received = tokio::select! {
+                    outgoing = peer_rx.recv() => match outgoing {
+                        Some(message) => {
+                            if send_frame(&mut writer, &TunnelFrame::Control(message)).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        None => break,
+                    },
+                    video = async {
+                        match video_rx.as_mut() {
+                            Some(rx) => rx.recv().await.ok(),
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if let Some(packet_bytes) = video {
+                            if send_frame(&mut writer, &TunnelFrame::Packet(packet_bytes)).await.is_err() {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    incoming = recv_frame(&mut reader) => incoming,
+                };
                 if let (Ok(_), Some(link)) = (&received, &link) {
                     link.lock().control_activity(Instant::now());
                 }
                 match received {
-                    Ok(ControlMessage::Clipboard(clip_msg)) => {
+                    Ok(TunnelFrame::Control(ControlMessage::Clipboard(clip_msg))) => {
                         let action = {
                             let mut engine = sync_engine.lock();
                             engine.process_incoming_message(clip_msg)
@@ -273,8 +311,15 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
                             let _ = b.set_text(&text);
                         }
                     }
-                    Ok(ControlMessage::Disconnect { .. }) => break,
-                    Ok(_) => {}
+                    Ok(TunnelFrame::Control(ControlMessage::Disconnect { .. })) => break,
+                    Ok(TunnelFrame::Packet(bytes)) => {
+                        if let (Some(handler), Ok(packet)) =
+                            (&packet_handler, Packet::from_bytes(&bytes))
+                        {
+                            handler(packet);
+                        }
+                    }
+                    Ok(TunnelFrame::Control(_)) => {}
                     Err(_) => break,
                 }
             }
@@ -324,7 +369,13 @@ impl HostClipboardService<AutoClipboardBackend> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use linux_quest_input::MockClipboardBackend;
+    use linux_quest_protocol::{PacketHeader, PacketType};
+    use linux_quest_transport::{
+        negotiate_client, recv_frame, send_frame, ControlMessage, TunnelFrame,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
     async fn test_control_keepalive_is_enabled_on_accepted_socket() {
@@ -363,6 +414,89 @@ mod tests {
         );
         enable_control_nodelay(&stream).unwrap();
         assert!(stream.nodelay().unwrap());
+    }
+
+    #[tokio::test]
+    async fn negotiated_usb_peer_routes_packets_and_video_frames() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let backend = Arc::new(Mutex::new(MockClipboardBackend::new()));
+        let sync = Arc::new(Mutex::new(ClipboardSyncEngine::new(7)));
+        let (outgoing, _outgoing_rx) = mpsc::unbounded_channel::<ControlMessage>();
+        let (_incoming_tx, incoming) = mpsc::unbounded_channel::<ClipboardMessage>();
+        let mut service = HostClipboardService::new(backend, sync, outgoing, incoming);
+        service.listener = Some(listener);
+        let packets = Arc::new(AtomicUsize::new(0));
+        let packet_count = packets.clone();
+        let (video_tx, _) = tokio::sync::broadcast::channel(8);
+        let link =
+            crate::link_status::new_shared_link_tracker(crate::link_status::DEFAULT_INPUT_LIVENESS);
+        let running = service.running_flag();
+        service = service
+            .with_link_tracker(link.clone())
+            .with_tunnel_packet_handler(Arc::new(move |_| {
+                packet_count.fetch_add(1, Ordering::Relaxed);
+            }))
+            .with_tunnel_video(video_tx.clone());
+        let task = tokio::spawn(async move { service.run().await.unwrap() });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+        negotiate_client(&mut reader, &mut writer).await.unwrap();
+        send_frame(
+            &mut writer,
+            &TunnelFrame::Control(ControlMessage::Heartbeat {
+                sequence: 1,
+                timestamp_us: 9,
+            }),
+        )
+        .await
+        .unwrap();
+        let packet = linux_quest_protocol::Packet::new(
+            PacketHeader::new(PacketType::InputEvent, 0, 1, 10, b"input"),
+            Bytes::from_static(b"input"),
+        );
+        send_frame(
+            &mut writer,
+            &TunnelFrame::Packet(packet.to_bytes().to_vec()),
+        )
+        .await
+        .unwrap();
+        assert!(link
+            .lock()
+            .status(std::time::Instant::now())
+            .last_seen
+            .is_some());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while packets.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let video = linux_quest_protocol::Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 2, 11, b"video"),
+            Bytes::from_static(b"video"),
+        );
+        video_tx.send(video.to_bytes().to_vec()).unwrap();
+        let TunnelFrame::Packet(bytes) =
+            tokio::time::timeout(Duration::from_secs(1), recv_frame(&mut reader))
+                .await
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("expected video packet")
+        };
+        assert_eq!(
+            linux_quest_protocol::Packet::from_bytes(&bytes)
+                .unwrap()
+                .payload,
+            Bytes::from_static(b"video")
+        );
+
+        running.store(false, Ordering::SeqCst);
+        task.abort();
     }
 
     #[test]

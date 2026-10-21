@@ -39,6 +39,45 @@ pub trait DatagramSink: Send + 'static {
     fn send(&mut self, datagram: &[u8], dest: SocketAddr) -> io::Result<()>;
 }
 
+/// Keeps the existing UDP path and sends datagrams over an active negotiated USB tunnel when
+/// the link tracker selects its loopback peer.
+pub struct HybridSink {
+    udp: UdpSink,
+    tunnel: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
+}
+
+impl HybridSink {
+    pub fn new(
+        tunnel: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
+        send_buffer: usize,
+        dscp: Dscp,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            udp: UdpSink::new(send_buffer, dscp)?,
+            tunnel,
+        })
+    }
+}
+
+impl DatagramSink for HybridSink {
+    fn send(&mut self, datagram: &[u8], dest: SocketAddr) -> io::Result<()> {
+        if dest.ip().is_loopback() {
+            return self
+                .tunnel
+                .as_ref()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotConnected, "USB tunnel is unavailable")
+                })?
+                .send(datagram.to_vec())
+                .map(|_| ())
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "USB tunnel has no active client")
+                });
+        }
+        self.udp.send(datagram, dest)
+    }
+}
+
 /// Non-blocking UDP sender with a large send buffer and a low-latency DSCP mark.
 /// The socket is unbound (the kernel picks an ephemeral source port on first send); the client
 /// filters by source IP only.
