@@ -8,6 +8,47 @@ use std::time::Instant;
 use crate::config::{ClientConfig, DisplayMode};
 use crate::decoder::DecoderStats;
 use crate::openxr::FramePacingMetrics;
+use linux_quest_protocol::{ClientTransportTelemetry, FrameLatencyBreakdown};
+
+/// Result of a completed controller shortcut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutAction {
+    /// Both thumbstick clicks pressed together.
+    ToggleHud,
+    /// Left thumbstick click alone.
+    TogglePanel,
+}
+
+/// Detects the HUD and panel shortcuts from thumbstick clicks.
+///
+/// The action is decided when all clicks are released, so pressing both sticks a frame apart
+/// still counts as the HUD combo and never also opens the panel.
+#[derive(Debug, Default)]
+pub struct ShortcutDetector {
+    left_seen: bool,
+    right_seen: bool,
+    both_seen: bool,
+}
+
+impl ShortcutDetector {
+    pub fn update(&mut self, left_click: bool, right_click: bool) -> Option<ShortcutAction> {
+        if left_click || right_click {
+            self.left_seen |= left_click;
+            self.right_seen |= right_click;
+            self.both_seen |= left_click && right_click;
+            return None;
+        }
+        let action = if self.both_seen {
+            Some(ShortcutAction::ToggleHud)
+        } else if self.left_seen {
+            Some(ShortcutAction::TogglePanel)
+        } else {
+            None
+        };
+        *self = Self::default();
+        action
+    }
+}
 
 /// Performance telemetry data collected for HUD display.
 #[derive(Debug, Clone)]
@@ -41,6 +82,8 @@ pub struct DebugHud {
     hud_width: u32,
     hud_height: u32,
     input_latency_us: u64,
+    breakdown: Option<FrameLatencyBreakdown>,
+    transport: Option<ClientTransportTelemetry>,
 }
 
 impl Default for DebugHud {
@@ -69,7 +112,19 @@ impl DebugHud {
             hud_width,
             hud_height,
             input_latency_us: 0,
+            breakdown: None,
+            transport: None,
         }
+    }
+
+    /// Records the latest per-stage latency breakdown reported by telemetry.
+    pub fn set_latency_breakdown(&mut self, breakdown: FrameLatencyBreakdown) {
+        self.breakdown = Some(breakdown);
+    }
+
+    /// Records the latest transport telemetry (bitrate, loss, FEC recoveries).
+    pub fn set_transport_telemetry(&mut self, telemetry: ClientTransportTelemetry) {
+        self.transport = Some(telemetry);
     }
 
     /// Records a new frame presentation and updates running telemetry metrics.
@@ -132,6 +187,37 @@ impl DebugHud {
 
     /// Formats the HUD telemetry summary text.
     pub fn formatted_text(&self) -> String {
+        let mut text = self.base_text();
+        if let Some(t) = &self.transport {
+            text.push_str(&format!(
+                "\nBitrate: {:.1} Mbps | Loss: {:.2}% | FEC rec: {}",
+                t.bitrate_mbps,
+                t.loss_percentage(),
+                t.fec_recoveries
+            ));
+        }
+        if let Some(b) = &self.breakdown {
+            let ms = |us: u32| us as f32 / 1000.0;
+            text.push_str(&format!(
+                "\nCap {:.1} Enc {:.1} Q {:.1} Net {:.1}\nDec {:.1} Rnd {:.1} = {:.1}ms",
+                ms(b.capture_duration_us),
+                ms(b.encode_duration_us),
+                ms(b.host_queue_duration_us),
+                ms(b.transport_duration_us),
+                ms(b.client_decode_duration_us),
+                ms(b.client_render_duration_us),
+                ms(b.capture_duration_us
+                    + b.encode_duration_us
+                    + b.host_queue_duration_us
+                    + b.transport_duration_us
+                    + b.client_decode_duration_us
+                    + b.client_render_duration_us),
+            ));
+        }
+        text
+    }
+
+    fn base_text(&self) -> String {
         format!(
             "FPS: {:.1} / {:.0}Hz\nM2P: {:.1}ms | Dec: {:.1}ms\nInput: {:.2}ms\nCodec: {}\nPackets: {} | FEC: {} | Loss: {}",
             self.last_snapshot.fps,
@@ -235,5 +321,47 @@ mod tests {
         let rgba = hud.render_to_rgba();
         assert_eq!(rgba.len(), 256 * 128 * 4);
         assert!(rgba.as_chunks::<4>().0.contains(&[255, 255, 255, 255]));
+    }
+
+    #[test]
+    fn hud_shows_stage_breakdown_bitrate_and_loss() {
+        let mut hud = DebugHud::new(256, 128);
+        let mut b = FrameLatencyBreakdown::new(1, 0);
+        b.capture_duration_us = 1000;
+        b.encode_duration_us = 2000;
+        b.host_queue_duration_us = 500;
+        b.transport_duration_us = 3000;
+        b.client_decode_duration_us = 2500;
+        b.client_render_duration_us = 1000;
+        hud.set_latency_breakdown(b);
+        hud.set_transport_telemetry(ClientTransportTelemetry {
+            bitrate_mbps: 64.0,
+            packet_loss_rate: 0.015,
+            fec_recoveries: 7,
+            ..Default::default()
+        });
+        let text = hud.formatted_text();
+        assert!(text.contains("Bitrate: 64.0 Mbps | Loss: 1.50% | FEC rec: 7"));
+        assert!(text.contains("Cap 1.0 Enc 2.0 Q 0.5 Net 3.0"));
+        assert!(text.contains("Dec 2.5 Rnd 1.0 = 10.0ms"));
+    }
+
+    #[test]
+    fn shortcut_both_sticks_toggle_hud_even_when_pressed_a_frame_apart() {
+        let mut d = ShortcutDetector::default();
+        assert_eq!(d.update(true, false), None);
+        assert_eq!(d.update(true, true), None);
+        assert_eq!(d.update(false, true), None);
+        assert_eq!(d.update(false, false), Some(ShortcutAction::ToggleHud));
+        assert_eq!(d.update(false, false), None);
+    }
+
+    #[test]
+    fn shortcut_left_alone_toggles_panel_and_right_alone_does_nothing() {
+        let mut d = ShortcutDetector::default();
+        d.update(true, false);
+        assert_eq!(d.update(false, false), Some(ShortcutAction::TogglePanel));
+        d.update(false, true);
+        assert_eq!(d.update(false, false), None);
     }
 }

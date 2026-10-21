@@ -16,6 +16,7 @@ pub mod input_sender;
 pub mod openxr;
 pub mod receiver;
 pub mod runtime;
+pub mod settings;
 pub mod spatial;
 pub mod streams;
 
@@ -41,7 +42,7 @@ pub use discovery::{
 };
 pub use error::{ClientError, ClientResult};
 pub use graphics::{ImageLayoutTransition, SwapchainTexture, VulkanContext};
-pub use hud::{DebugHud, HudSnapshot};
+pub use hud::{DebugHud, HudSnapshot, ShortcutAction, ShortcutDetector};
 pub use input::{
     android_keycode_to_evdev, android_meta_to_modifiers, AndroidKeyEvent, AndroidMotionEvent,
     CapturedEvent, ClientInputCapture, ControllerInputEvent, InputSource, MockInputSource,
@@ -58,6 +59,10 @@ pub use openxr::{
 };
 pub use receiver::ClientReceiver;
 pub use runtime::QuestClientRuntime;
+pub use settings::{
+    BitrateMode, ClientSettings, LayoutPreset as SettingsLayoutPreset, SettingsAction,
+    SettingsPanel, SettingsStore,
+};
 pub use spatial::{
     ray_intersects_cylinder, ray_intersects_quad, ArrangementBook, ArrangementBookStore,
     ControllerInputState, CylinderLayerParams, GrabSession, GrabStateMachine, HandGestureDetector,
