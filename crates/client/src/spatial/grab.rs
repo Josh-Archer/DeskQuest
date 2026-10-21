@@ -270,7 +270,7 @@ impl GrabStateMachine {
 
                 if let Some(ray) = &input.aim_ray {
                     if let Some((hit_id, hit)) =
-                        ScreenTransform::find_closest_hit(ray, screens_vec.iter().copied())
+                        ScreenTransform::find_closest_window_hit(ray, screens_vec.iter().copied())
                     {
                         self.state = InteractionState::Hovering {
                             display_id: hit_id,
@@ -302,7 +302,7 @@ impl GrabStateMachine {
                     .then_some(input.aim_ray.as_ref())
                     .flatten()
                     .and_then(|ray| {
-                        ScreenTransform::find_closest_hit(ray, screens_vec.iter().copied())
+                        ScreenTransform::find_closest_window_hit(ray, screens_vec.iter().copied())
                     });
                 // The hit that decides between move and corner resize belongs to the grabbing source.
                 let (current_display_id, current_source, grab_hit) = match takeover {
@@ -355,9 +355,10 @@ impl GrabStateMachine {
                 // If input source matches, update hover ray hit
                 if input.source == current_source {
                     if let Some(ray) = &input.aim_ray {
-                        if let Some((new_id, new_hit)) =
-                            ScreenTransform::find_closest_hit(ray, screens_vec.iter().copied())
-                        {
+                        if let Some((new_id, new_hit)) = ScreenTransform::find_closest_window_hit(
+                            ray,
+                            screens_vec.iter().copied(),
+                        ) {
                             if new_id == current_display_id {
                                 self.state = InteractionState::Hovering {
                                     display_id: new_id,
@@ -433,7 +434,7 @@ impl GrabStateMachine {
 
                     // Return to hover if ray still hits the screen, else Idle
                     if let Some(ray) = &input.aim_ray {
-                        if let Some(ray_hit) = final_transform.intersect_ray(ray) {
+                        if let Some(ray_hit) = final_transform.intersect_window(ray) {
                             self.state = InteractionState::Hovering {
                                 display_id,
                                 hit: ray_hit,

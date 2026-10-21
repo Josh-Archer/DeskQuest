@@ -145,3 +145,8 @@ fn clamp_factor_to(factor: f32, lo: f32, hi: f32) -> f32 {
         1.0
     }
 }
+
+/// How far past a screen's edges, as a fraction of its width, its window reaches: pointing there
+/// still counts as pointing at the window, as with Horizon OS windows, whose grab bar, edge
+/// handles and resize arcs sit just outside the content.
+pub const WINDOW_MARGIN_FRAC: f32 = 0.08;
