@@ -539,9 +539,9 @@ impl QuestClientRuntime {
 
         let mut pointer_latency_us = 0;
         if let Some(input) = selected_input {
-            // Desktop clicks go to the primary screen only: the host maps absolute pointer
-            // positions onto one desktop and cannot yet place them on another stream's monitor.
-            let screen_refs = [(0, &self.screen_transform)];
+            // Each position carries its stream's display id; the host rebases it onto that
+            // monitor.
+            let screen_refs = visible_screens(&self.screen_transform, &self.extra_streams);
             let secondary_down = match input.source {
                 crate::spatial::InteractionSource::Controller(Handedness::Right) => {
                     right_ctrl.as_ref().is_some_and(|c| c.thumbstick_clicked)
