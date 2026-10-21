@@ -1,5 +1,7 @@
 //! What the headset reports to the host about itself, and the screen layout and settings the
-//! host can set on it. Carried on the control channel (TCP 48444).
+//! host can set on it. Carried on the control channel: TCP 48444 over the LAN, or through the
+//! settings channel's own USB tunnel (headset port 48445, `adb reverse tcp:48445 tcp:48444`,
+//! which the daemon sets up next to the control port's).
 //!
 //! The flow, after a control connection opens:
 //!

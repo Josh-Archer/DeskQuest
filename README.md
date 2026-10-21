@@ -114,7 +114,7 @@ Hotkeys:
 - **Quest Settings**: bitrate (adaptive or fixed), preferred codec, refresh rate, curved or flat screens, the performance overlay and passthrough.
 - **Choose Screen…** shows GNOME's screen-sharing dialog so you can pick which screen or window the headset's main screen shows.
 
-Layout and settings need the headset app running and connected to the host's control port (TCP 48444, over the LAN or the USB `adb reverse` tunnel), and a daemon and APK from the same version.
+Layout and settings need the headset app running and connected to the host's control port: TCP 48444 over the LAN, or over USB through `adb reverse tcp:48445 tcp:48444`, which the daemon sets up when it manages the tunnel (with `--no-adb`, run that `adb reverse` yourself). They also need a daemon and headset app from this version; an older daemon is never contacted over USB.
 
 ```bash
 sudo apt install libgtk-4-dev libadwaita-1-dev     # build dependencies (Fedora: gtk4-devel libadwaita-devel)

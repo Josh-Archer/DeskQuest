@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use linux_quest_protocol::{HeadsetSettings, HeadsetStatus, ScreenPlacement};
 use linux_quest_transport::{
     encode_control_frame, ControlFrameReader, ControlMessage, DEFAULT_CONTROL_PORT,
+    SETTINGS_TUNNEL_PORT,
 };
 use parking_lot::Mutex;
 
@@ -67,12 +68,20 @@ impl LinkConfig {
 
 /// Where the host's control port can be reached, best first.
 ///
-/// - USB mode: the configured address (the tunnel's local end).
-/// - Wi-Fi mode: the host's LAN address, then the USB tunnel (`adb reverse tcp:48444`), which
-///   works when a firewall blocks TCP on the LAN and the cable is plugged in.
+/// - USB mode: the settings channel's own USB tunnel ([`SETTINGS_TUNNEL_PORT`]).
+/// - Wi-Fi mode: the host's LAN address, then that tunnel, which works when a firewall blocks
+///   TCP on the LAN and the cable is plugged in.
+///
+/// The tunnel is not the control port's own (`adb reverse tcp:48444`): only a host that speaks
+/// the settings channel sets up the settings tunnel, so an older host is never reached through
+/// the cable. An older host counted a loopback control connection as a USB link and paused
+/// Wi-Fi video, and could stall on it for good.
 pub fn control_candidates(config: &ClientConfig) -> Vec<SocketAddr> {
-    let tunnel = SocketAddr::from(([127, 0, 0, 1], DEFAULT_CONTROL_PORT));
+    let tunnel = SocketAddr::from(([127, 0, 0, 1], SETTINGS_TUNNEL_PORT));
     match config.transport_mode {
+        TransportMode::AdbReverseTcp if config.host_addr.ip().is_loopback() => {
+            vec![SocketAddr::new(config.host_addr.ip(), SETTINGS_TUNNEL_PORT)]
+        }
         TransportMode::AdbReverseTcp => vec![config.host_addr],
         TransportMode::Udp => {
             let mut out = Vec::new();
@@ -321,7 +330,7 @@ mod tests {
     #[test]
     fn candidates_prefer_the_lan_and_fall_back_to_the_tunnel() {
         let lan: SocketAddr = "192.168.1.20:48444".parse().unwrap();
-        let tunnel: SocketAddr = "127.0.0.1:48444".parse().unwrap();
+        let tunnel: SocketAddr = "127.0.0.1:48445".parse().unwrap();
         let udp = ClientConfig {
             transport_mode: TransportMode::Udp,
             host_addr: lan,
@@ -334,7 +343,11 @@ mod tests {
         };
         assert_eq!(control_candidates(&unset), vec![tunnel]);
         let usb = ClientConfig::default();
-        assert_eq!(control_candidates(&usb), vec![usb.host_addr]);
+        assert_eq!(
+            control_candidates(&usb),
+            vec![tunnel],
+            "never the control port's own tunnel, which an older host also has"
+        );
     }
 
     #[test]

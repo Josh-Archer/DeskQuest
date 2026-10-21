@@ -75,6 +75,13 @@ pub enum ControlMessage {
 /// Default TCP port for the out-of-band reliable signaling and control channel.
 pub const DEFAULT_CONTROL_PORT: u16 = 48444;
 
+/// Headset-side port of the USB tunnel the settings channel uses (`adb reverse tcp:48445
+/// tcp:48444`, to the host control port). Only a host that speaks the settings channel creates
+/// it, so a headset never reaches an older host's control service through the cable: an
+/// older host counted such a connection as a USB link (pausing Wi-Fi video), and its clipboard
+/// poll could stall on it.
+pub const SETTINGS_TUNNEL_PORT: u16 = 48445;
+
 /// Maximum allowed size for a control signaling message (1MB).
 pub const MAX_CONTROL_MESSAGE_SIZE: usize = 1024 * 1024;
 

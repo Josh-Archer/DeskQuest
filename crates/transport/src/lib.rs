@@ -24,7 +24,7 @@ pub use adb::{
 };
 pub use control::{
     encode_control_frame, ControlChannel, ControlError, ControlFrameReader, ControlMessage,
-    DEFAULT_CONTROL_PORT,
+    DEFAULT_CONTROL_PORT, SETTINGS_TUNNEL_PORT,
 };
 #[cfg(feature = "mdns")]
 pub use discovery::MdnsDiscoveryBackend;
