@@ -105,9 +105,43 @@ Hotkeys:
 
 ---
 
+## 🪟 Desktop App
+
+`linux-quest` is a GTK 4 / libadwaita app for GNOME. It talks only to the running daemon, over its IPC socket:
+
+- **Status**: whether the headset is connected (USB or Wi-Fi), the frame rate, latency, bitrate and packet loss, and a switch to pause the video.
+- **Screens**: the headset's screens seen from above, arranged around you. Drag a screen to move it around you, drag an end to resize it, scroll to scale it, or set its direction, distance, height, tilt, width and curve exactly. The headset applies each change as you drag. The host's virtual monitors can be added, removed, or given another resolution and refresh rate here too.
+- **Quest Settings**: bitrate (adaptive or fixed), preferred codec, refresh rate, curved or flat screens, the performance overlay and passthrough.
+- **Choose Screen…** shows GNOME's screen-sharing dialog so you can pick which screen or window the headset's main screen shows.
+
+Layout and settings need the headset app running and connected to the host's control port (TCP 48444, over the LAN or the USB `adb reverse` tunnel), and a daemon and APK from the same version.
+
+```bash
+sudo apt install libgtk-4-dev libadwaita-1-dev     # build dependencies (Fedora: gtk4-devel libadwaita-devel)
+cargo install --path crates/desktop --root ~/.local
+install -Dm644 packaging/desktop/org.linuxquest.Desktop.desktop ~/.local/share/applications/org.linuxquest.Desktop.desktop
+linux-quest
+```
+
+To try it without a headset, run the demo daemon (the real IPC server with mock hardware and a simulated headset; it binds no fixed port and never opens the screen-sharing dialog):
+
+```bash
+export LINUX_QUEST_RUNTIME_DIR=$(mktemp -d)
+cargo run -p linux-quest-desktop --example demo_daemon &
+cargo run -p linux-quest-desktop
+```
+
+---
+
 ## 🔁 Headless Background Service (systemd)
 
-To run the daemon at login without a terminal, install the systemd user unit in [`packaging/systemd/linux-quest-host.service`](packaging/systemd/linux-quest-host.service):
+To run the daemon at login without a terminal, and have it restarted if it crashes, install it as a systemd user service. `service install` writes the unit for the binary you run it from, with the daemon options after `--`:
+
+```bash
+linux-quest-host service install --enable --start -- --streams 3
+```
+
+Or install the unit in [`packaging/systemd/linux-quest-host.service`](packaging/systemd/linux-quest-host.service) by hand:
 
 ```bash
 mkdir -p ~/.config/systemd/user

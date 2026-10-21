@@ -1,0 +1,31 @@
+[package]
+name = "linux-quest-desktop"
+description = "Linux Quest desktop app: arrange the headset's screens and configure what the Quest sees"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "linux-quest"
+path = "src/main.rs"
+
+[dependencies]
+linux-quest-host = { path = "../host" }
+linux-quest-protocol = { path = "../protocol" }
+linux-quest-display = { path = "../display" }
+# GTK 4.12 and libadwaita 1.5 are the oldest this needs (Ubuntu 24.04 ships them); GNOME 50
+# has GTK 4.22 and libadwaita 1.9.
+gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "macros", "process"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# For the demo daemon example: a simulated headset and mock clipboard.
+linux-quest-client = { path = "../client" }
+linux-quest-input = { path = "../input" }
+bytes.workspace = true
+parking_lot.workspace = true

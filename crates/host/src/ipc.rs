@@ -158,8 +158,15 @@ impl IpcContext {
 /// Maximum allowed IPC payload frame size (1 Megabyte).
 pub const MAX_IPC_FRAME_SIZE: usize = 1024 * 1024;
 
-/// Returns the private runtime directory for the Linux Quest daemon.
+/// Overrides [`daemon_runtime_dir`] (for a test or demo daemon next to the real one).
+pub const RUNTIME_DIR_ENV: &str = "LINUX_QUEST_RUNTIME_DIR";
+
+/// Returns the private runtime directory for the Linux Quest daemon:
+/// `$LINUX_QUEST_RUNTIME_DIR` if set, else `$XDG_RUNTIME_DIR/linux-quest`.
 pub fn daemon_runtime_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os(RUNTIME_DIR_ENV).filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         Path::new(&runtime_dir).join("linux-quest")
     } else {

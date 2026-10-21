@@ -42,7 +42,7 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update && sudo apt-get install --no-install-recommends -y build-essential edid-decode
+          sudo apt-get update && sudo apt-get install --no-install-recommends -y build-essential edid-decode pkg-config libgtk-4-dev libadwaita-1-dev
 
 
       - name: Setup Rust toolchain

@@ -21,7 +21,8 @@ pub use handshake::{
     WINDOW_STREAM_ID_BASE,
 };
 pub use headset::{
-    HeadsetCodec, HeadsetSettings, HeadsetStats, HeadsetStatus, ScreenCurve, ScreenPlacement,
+    yaw_pitch_orientation, HeadsetCodec, HeadsetSettings, HeadsetStats, HeadsetStatus, ScreenCurve,
+    ScreenPlacement,
 };
 pub use input::{
     ElementState, InputBatch, InputEvent, KeyModifiers, MouseButton, NetworkFeedback,

@@ -104,6 +104,27 @@ impl ScreenPlacement {
         fx.atan2(fz)
     }
 
+    /// How far the screen is tilted up (radians, negative down), from its orientation.
+    pub fn pitch_rad(&self) -> f32 {
+        let [x, y, z, w] = self.orientation;
+        (2.0 * (w * x - y * z)).clamp(-1.0, 1.0).asin()
+    }
+
+    /// The same screen moved around the user to `yaw_rad` at `horizontal_distance_m`, facing
+    /// them, at the same height and tilt.
+    pub fn moved_around_user(&self, yaw_rad: f32, horizontal_distance_m: f32) -> Self {
+        let (sy, cy) = yaw_rad.sin_cos();
+        Self {
+            position: [
+                -sy * horizontal_distance_m,
+                self.position[1],
+                -cy * horizontal_distance_m,
+            ],
+            orientation: yaw_pitch_orientation(yaw_rad, self.pitch_rad()),
+            ..*self
+        }
+    }
+
     /// True when every number is finite and the size is positive.
     pub fn is_valid(&self) -> bool {
         let curve_ok = match self.curve {
@@ -121,7 +142,12 @@ impl ScreenPlacement {
     }
 }
 
-/// Rotation by `yaw` about +Y, then `pitch` about the turned X axis, as `[x, y, z, w]`.
+/// Rotation by `yaw` about +Y, then `pitch` about the turned X axis, as `[x, y, z, w]`: the
+/// orientation of a screen turned `yaw` to the left and tilted `pitch` up.
+pub fn yaw_pitch_orientation(yaw: f32, pitch: f32) -> [f32; 4] {
+    yaw_then_pitch(yaw, pitch)
+}
+
 fn yaw_then_pitch(yaw: f32, pitch: f32) -> [f32; 4] {
     let (sy, cy) = (yaw * 0.5).sin_cos();
     let (sp, cp) = (pitch * 0.5).sin_cos();
@@ -232,6 +258,18 @@ mod tests {
         assert!(s.position[1] > 1.4);
         assert!(close(s.facing_yaw_rad(), -0.3));
         assert!(close(s.horizontal_distance_m(), 0.2f32.cos()));
+    }
+
+    #[test]
+    fn moving_around_the_user_keeps_height_tilt_and_size() {
+        let s = ScreenPlacement::facing_user(1, 0.3, 0.25, 1.5, 1.2, 1.6, 0.9, ScreenCurve::Flat);
+        assert!(close(s.pitch_rad(), 0.25));
+        let moved = s.moved_around_user(-0.6, 2.0);
+        assert!(close(moved.yaw_rad(), -0.6) && close(moved.facing_yaw_rad(), -0.6));
+        assert!(close(moved.horizontal_distance_m(), 2.0));
+        assert!(close(moved.position[1], s.position[1]));
+        assert!(close(moved.pitch_rad(), 0.25));
+        assert_eq!((moved.width_m, moved.display_id), (1.6, 1));
     }
 
     #[test]

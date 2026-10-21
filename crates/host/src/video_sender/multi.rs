@@ -10,7 +10,7 @@
 //! * the destination, the headset's UDP port (48440 by default). Streams are told apart by
 //!   `PacketHeader::stream_id`, which equals the display id; stream 0 is the primary capture.
 //!
-//! Stream 0 is started by the unchanged single-stream path ([`start_daemon_video_sender`]).
+//! Stream 0 is started by the unchanged single-stream path ([`start_daemon_video_sender`](super::daemon::start_daemon_video_sender)).
 //! Streams 1.. are synthetic test patterns for now, one tint per display, until virtual
 //! monitors provide real captures for them.
 
@@ -181,7 +181,7 @@ impl MultiVideoSenderHandle {
 }
 
 /// Starts the daemon's video streams: stream 0 exactly as a single-stream daemon does
-/// ([`start_daemon_video_sender`]), then `options.streams - 1` synthetic test-pattern streams.
+/// ([`start_daemon_video_sender`](super::daemon::start_daemon_video_sender)), then `options.streams - 1` synthetic test-pattern streams.
 ///
 /// Returns `Err(reason)` only when stream 0 cannot start, as the single-stream path does. An
 /// extra stream that cannot start (for example the GPU is out of encoder sessions) is logged and
