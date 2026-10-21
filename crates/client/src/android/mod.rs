@@ -30,9 +30,7 @@ pub(crate) fn activity_jobject() -> *mut std::ffi::c_void {
 use std::net::{IpAddr, SocketAddr};
 
 use crate::config::{ClientConfig, TransportMode};
-use crate::input_sender::{
-    input_sender_config, InputSenderThread, PointerInputSource, SharedInputEvents,
-};
+use crate::input_sender::{input_sender_config, CombinedInputSource, InputSenderThread};
 use crate::runtime::QuestClientRuntime;
 
 /// Source IPs that UDP video datagrams must come from, or `None` to accept any source.
@@ -87,14 +85,17 @@ pub fn udp_config_warning(config: &ClientConfig) -> Option<String> {
 ///
 /// Only `Udp` mode sends: `adb reverse` forwards TCP only, so in `AdbReverseTcp` mode the client
 /// sends no input (and no keepalive) at all. See `crate::input_sender` for the design.
-/// Starts the UDP input/keepalive sender (Udp mode only). Returns it with the flag that, once
-/// raised (then [`crate::input_sender::InputSenderControl::notify`]), sends a keyframe request.
+/// Returns the sender with the flag that, once raised (then
+/// [`crate::input_sender::InputSenderControl::notify`]), sends a keyframe request, plus the
+/// keyboard queue (physical/IME events) and the pointer queue (XR controller/hand events)
+/// that feed it.
 pub fn start_input_sender(
     config: &ClientConfig,
 ) -> Option<(
     InputSenderThread,
     std::sync::Arc<std::sync::atomic::AtomicBool>,
-    SharedInputEvents,
+    crate::input_sender::InputEventQueue,
+    crate::input_sender::SharedInputEvents,
 )> {
     let Some(sender_config) = input_sender_config(config) else {
         match config.transport_mode {
@@ -111,14 +112,12 @@ pub fn start_input_sender(
         return None;
     };
     tracing::info!(targets = ?sender_config.targets, "starting UDP input/keepalive sender");
-    let events = SharedInputEvents::default();
-    let keyframe_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let source = PointerInputSource {
-        events: events.clone(),
-        keyframe: keyframe_flag.clone(),
-    };
+    let source = CombinedInputSource::new();
+    let keyframe_flag = source.requester();
+    let keyboard_queue = source.keyboard_queue();
+    let pointer_events = source.pointer_events();
     match InputSenderThread::spawn(sender_config, Box::new(source)) {
-        Ok(sender) => Some((sender, keyframe_flag, events)),
+        Ok(sender) => Some((sender, keyframe_flag, keyboard_queue, pointer_events)),
         Err(e) => {
             tracing::warn!(error = ?e, "failed to start UDP input sender");
             None
@@ -211,6 +210,329 @@ fn system_property(name: &str) -> Option<String> {
     // SAFETY: the call NUL-terminates the value inside `buf`.
     let value = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
     Some(value.to_string_lossy().into_owned())
+}
+
+#[cfg(target_os = "android")]
+fn pump_android_keyboard_events(
+    app: &AndroidApp,
+    queue: &crate::input_sender::InputEventQueue,
+    sender: Option<&crate::input_sender::InputSenderControl>,
+    virtual_keyboard_visible: &mut bool,
+    last_virtual_text: &mut String,
+) {
+    use android_activity::{input::InputEvent, InputStatus};
+    use linux_quest_protocol::{ElementState, InputEvent as ProtocolEvent};
+
+    let Ok(mut events) = app.input_events_iter() else {
+        return;
+    };
+    let mut queued = false;
+    while events.next(|event| match event {
+        InputEvent::KeyEvent(key) => {
+            let modifiers = crate::input::android_meta_to_modifiers(key.meta_state().0 as i32);
+            let keycode: u32 = key.key_code().into();
+            let action: u32 = key.action().into();
+            if keycode == crate::input::keycodes::AKEYCODE_K as u32 && modifiers.is_meta() {
+                if action == 0 && key.repeat_count() == 0 {
+                    if *virtual_keyboard_visible {
+                        set_android_ime_visible(app, false);
+                        last_virtual_text.clear();
+                    } else {
+                        set_android_ime_visible(app, true);
+                        last_virtual_text.clear();
+                    }
+                    *virtual_keyboard_visible = !*virtual_keyboard_visible;
+                }
+                return InputStatus::Handled;
+            }
+            if configured_escape_chord().is_some_and(|(chord_modifiers, chord_key)| {
+                keycode == chord_key && modifiers.contains(chord_modifiers)
+            }) {
+                if action == 0 {
+                    set_android_ime_visible(app, false);
+                    *virtual_keyboard_visible = false;
+                    last_virtual_text.clear();
+                }
+                return InputStatus::Handled;
+            }
+            let reserved_system_shortcut = modifiers.is_alt()
+                && keycode == crate::input::keycodes::AKEYCODE_TAB as u32
+                || modifiers.is_ctrl()
+                    && modifiers.is_alt()
+                    && ((crate::input::keycodes::AKEYCODE_F1
+                        ..=crate::input::keycodes::AKEYCODE_F12)
+                        .contains(&(keycode as i32)));
+            if reserved_system_shortcut {
+                return InputStatus::Unhandled;
+            }
+            let state = match action {
+                0 => ElementState::Pressed,
+                1 => ElementState::Released,
+                _ => return InputStatus::Unhandled,
+            };
+            if let Some(keycode) = crate::input::android_keycode_to_evdev(keycode as i32) {
+                queue.push(ProtocolEvent::KeyboardKey {
+                    keycode,
+                    state,
+                    modifiers,
+                });
+                queued = true;
+                InputStatus::Handled
+            } else {
+                InputStatus::Unhandled
+            }
+        }
+        // Android's IME reports committed UTF-8 text separately from physical key events.
+        InputEvent::TextEvent(state) if !state.text.is_empty() => {
+            queue.push(ProtocolEvent::TextCommit {
+                text: state.text.clone(),
+            });
+            queued = true;
+            InputStatus::Handled
+        }
+        _ => InputStatus::Unhandled,
+    }) {}
+    if *virtual_keyboard_visible {
+        if let Some(text) = android_ime_committed_text(app) {
+            queued |= queue_committed_text_delta(last_virtual_text, &text, queue);
+        }
+    }
+    if queued {
+        if let Some(sender) = sender {
+            sender.notify();
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+fn with_ime_bridge<R>(
+    app: &AndroidApp,
+    call: impl FnOnce(
+        &mut jni::JNIEnv<'_>,
+        &jni::objects::JObject<'_>,
+        &jni::objects::JClass<'_>,
+    ) -> jni::errors::Result<R>,
+) -> jni::errors::Result<R> {
+    use jni::objects::{JClass, JObject};
+    use std::mem::ManuallyDrop;
+
+    let vm = unsafe { jni::JavaVM::from_raw(app.vm_as_ptr().cast())? };
+    let mut env = vm.attach_current_thread()?;
+    // AndroidApp owns this global reference; do not delete it when the wrapper drops.
+    let activity = ManuallyDrop::new(unsafe { JObject::from_raw(app.activity_as_ptr().cast()) });
+    let loader = env
+        .call_method(
+            &*activity,
+            "getClassLoader",
+            "()Ljava/lang/ClassLoader;",
+            &[],
+        )?
+        .l()?;
+    let class_name = env.new_string("com.linuxquest.client.ImeBridge")?;
+    let class = env
+        .call_method(
+            &loader,
+            "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[(&class_name).into()],
+        )?
+        .l()?;
+    let class = JClass::from(class);
+    call(&mut env, &activity, &class)
+}
+
+#[cfg(target_os = "android")]
+fn set_android_ime_visible(app: &AndroidApp, visible: bool) {
+    let result = with_ime_bridge(app, |env, activity, class| {
+        env.call_static_method(
+            class,
+            "setVisible",
+            "(Landroid/app/Activity;Z)V",
+            &[activity.into(), visible.into()],
+        )?;
+        Ok(())
+    });
+    if let Err(error) = result {
+        tracing::warn!(?error, "failed to show or hide the Android text input");
+    }
+}
+
+#[cfg(target_os = "android")]
+fn android_ime_committed_text(app: &AndroidApp) -> Option<String> {
+    with_ime_bridge(app, |env, activity, class| {
+        let value = env
+            .call_static_method(
+                class,
+                "committedText",
+                "(Landroid/app/Activity;)Ljava/lang/String;",
+                &[activity.into()],
+            )?
+            .l()?;
+        let value = jni::objects::JString::from(value);
+        let text: String = env.get_string(&value)?.into();
+        Ok(text)
+    })
+    .map_err(|error| tracing::warn!(?error, "failed to read committed Android IME text"))
+    .ok()
+}
+
+#[cfg(any(target_os = "android", test))]
+fn queue_committed_text_delta(
+    previous: &mut String,
+    current: &str,
+    queue: &crate::input_sender::InputEventQueue,
+) -> bool {
+    use linux_quest_protocol::{ElementState, InputEvent, KeyModifiers};
+
+    if previous == current {
+        return false;
+    }
+    let old: Vec<char> = previous.chars().collect();
+    let new: Vec<char> = current.chars().collect();
+    let common = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    for _ in common..old.len() {
+        for state in [ElementState::Pressed, ElementState::Released] {
+            queue.push(InputEvent::KeyboardKey {
+                keycode: crate::input::keycodes::KEY_BACKSPACE,
+                state,
+                modifiers: KeyModifiers::empty(),
+            });
+        }
+    }
+    if common < new.len() {
+        queue.push(InputEvent::TextCommit {
+            text: new[common..].iter().collect(),
+        });
+    }
+    previous.clear();
+    previous.push_str(current);
+    true
+}
+
+/// Escape chord format is modifier names followed by an Android key name, for example
+/// `CTRL+ALT+ESC` or `META+BACK`. Invalid values disable the chord instead of capturing keys.
+#[cfg(target_os = "android")]
+fn configured_escape_chord() -> Option<(linux_quest_protocol::KeyModifiers, u32)> {
+    configured_escape_chord_from(
+        system_property("debug.linuxquest.keyboard_escape_chord")
+            .or_else(|| std::env::var("LINUX_QUEST_KEYBOARD_ESCAPE_CHORD").ok())
+            .as_deref(),
+    )
+}
+
+#[cfg(any(target_os = "android", test))]
+fn configured_escape_chord_from(
+    configured: Option<&str>,
+) -> Option<(linux_quest_protocol::KeyModifiers, u32)> {
+    use linux_quest_protocol::KeyModifiers;
+    let chord = configured.unwrap_or("CTRL+ALT+ESC");
+    let mut parts = chord.split('+').map(str::trim);
+    let (mut modifiers, key) = (KeyModifiers::empty(), parts.next_back()?);
+    for modifier in parts {
+        let flag = match modifier.to_ascii_uppercase().as_str() {
+            "CTRL" | "CONTROL" => KeyModifiers::CTRL,
+            "ALT" => KeyModifiers::ALT,
+            "SHIFT" => KeyModifiers::SHIFT,
+            "META" | "SUPER" => KeyModifiers::META,
+            _ => return None,
+        };
+        modifiers.insert(flag);
+    }
+    if modifiers == KeyModifiers::empty() {
+        return None;
+    }
+    let key = match key.to_ascii_uppercase().as_str() {
+        "ESC" | "ESCAPE" => crate::input::keycodes::AKEYCODE_ESCAPE as u32,
+        "BACK" => crate::input::keycodes::AKEYCODE_BACK as u32,
+        "F1" => crate::input::keycodes::AKEYCODE_F1 as u32,
+        "F2" => crate::input::keycodes::AKEYCODE_F2 as u32,
+        "F3" => crate::input::keycodes::AKEYCODE_F3 as u32,
+        "F4" => crate::input::keycodes::AKEYCODE_F4 as u32,
+        "F5" => crate::input::keycodes::AKEYCODE_F5 as u32,
+        "F6" => crate::input::keycodes::AKEYCODE_F6 as u32,
+        "F7" => crate::input::keycodes::AKEYCODE_F7 as u32,
+        "F8" => crate::input::keycodes::AKEYCODE_F8 as u32,
+        "F9" => crate::input::keycodes::AKEYCODE_F9 as u32,
+        "F10" => crate::input::keycodes::AKEYCODE_F10 as u32,
+        "F11" => crate::input::keycodes::AKEYCODE_F11 as u32,
+        "F12" => crate::input::keycodes::AKEYCODE_F12 as u32,
+        _ => return None,
+    };
+    Some((modifiers, key))
+}
+
+#[cfg(test)]
+mod keyboard_shortcut_tests {
+    use super::{configured_escape_chord_from, queue_committed_text_delta};
+    use crate::input::keycodes;
+    use crate::input_sender::InputSource;
+    use linux_quest_protocol::{ElementState, InputEvent, KeyModifiers};
+
+    #[test]
+    fn escape_chord_defaults_and_accepts_android_property_syntax() {
+        assert_eq!(
+            configured_escape_chord_from(None),
+            Some((
+                KeyModifiers::CTRL | KeyModifiers::ALT,
+                keycodes::AKEYCODE_ESCAPE as u32,
+            ))
+        );
+        assert_eq!(
+            configured_escape_chord_from(Some("super + back")),
+            Some((KeyModifiers::META, keycodes::AKEYCODE_BACK as u32))
+        );
+    }
+
+    #[test]
+    fn invalid_or_unmodified_escape_chords_are_disabled() {
+        assert_eq!(configured_escape_chord_from(Some("ESC")), None);
+        assert_eq!(configured_escape_chord_from(Some("CTRL+F13")), None);
+        assert_eq!(
+            configured_escape_chord_from(Some("CTRL+ALT+ESC+SHIFT")),
+            None
+        );
+    }
+
+    #[test]
+    fn ime_commits_unicode_and_turns_edits_into_backspaces() {
+        let mut source = crate::input_sender::KeyframeRequestSource::new();
+        let queue = source.input_queue();
+        let mut previous = String::new();
+        assert!(queue_committed_text_delta(
+            &mut previous,
+            "naïve 東京",
+            &queue
+        ));
+        assert!(!queue_committed_text_delta(
+            &mut previous,
+            "naïve 東京",
+            &queue
+        ));
+        assert!(queue_committed_text_delta(
+            &mut previous,
+            "naïve 東",
+            &queue
+        ));
+
+        assert_eq!(
+            source.poll(),
+            vec![
+                InputEvent::TextCommit {
+                    text: "naïve 東京".into()
+                },
+                InputEvent::KeyboardKey {
+                    keycode: keycodes::KEY_BACKSPACE,
+                    state: ElementState::Pressed,
+                    modifiers: KeyModifiers::empty(),
+                },
+                InputEvent::KeyboardKey {
+                    keycode: keycodes::KEY_BACKSPACE,
+                    state: ElementState::Released,
+                    modifiers: KeyModifiers::empty(),
+                },
+            ]
+        );
+    }
 }
 
 /// The default config with the `debug.linuxquest.*` overrides applied (see
@@ -340,12 +662,16 @@ pub fn android_main(app: AndroidApp) {
 
     // Input/keepalive sender (Udp mode only). The receiver below acks it for each accepted
     // host datagram so it stays on the host address that works.
-    let (input_sender, keyframe_flag, pointer_events) = match start_input_sender(&config) {
-        Some((sender, flag, events)) => (Some(sender), Some(flag), Some(events)),
-        None => (None, None, None),
-    };
+    let (input_sender, keyframe_flag, input_queue, pointer_events) =
+        match start_input_sender(&config) {
+            Some((sender, flag, queue, events)) => {
+                (Some(sender), Some(flag), Some(queue), Some(events))
+            }
+            None => (None, None, None, None),
+        };
     let ack_control: Option<crate::input_sender::InputSenderControl> =
         input_sender.as_ref().map(|s| s.control().clone());
+    let receiver_ack_control = ack_control.clone();
     // Raises the keyframe request on the input channel and sends it right away.
     let requester_control = ack_control.clone();
     let keyframe_requester = move || -> Option<Box<dyn Fn() + Send>> {
@@ -358,8 +684,6 @@ pub fn android_main(app: AndroidApp) {
         }))
     };
 
-    // The receiver thread acks with its own handle; `ack_control` is still needed below.
-    let receiver_ack = ack_control.clone();
     let receiver_handle = std::thread::spawn(move || {
         match transport_mode {
             crate::config::TransportMode::AdbReverseTcp => {
@@ -475,7 +799,7 @@ pub fn android_main(app: AndroidApp) {
                             }
                             match linux_quest_protocol::packet::Packet::from_bytes(&buf[..len]) {
                                 Ok(packet) => {
-                                    if let Some(control) = &receiver_ack {
+                                    if let Some(control) = &receiver_ack_control {
                                         control.ack();
                                     }
                                     let _ = packet_tx.try_send(packet);
@@ -502,6 +826,8 @@ pub fn android_main(app: AndroidApp) {
     // the ready state" before that), and swapchains only once the session is running.
     // See `lifecycle` for the pure decision logic; every transition logs with tag `lq-lifecycle`.
     let mut lifecycle = AppLifecycle::new();
+    let mut virtual_keyboard_visible = false;
+    let mut last_virtual_text = String::new();
     if app.native_window().is_some() {
         lifecycle.on_event(LifecycleEvent::InitWindow);
     }
@@ -537,6 +863,18 @@ pub fn android_main(app: AndroidApp) {
                 }
             },
         );
+
+        // Drain Bluetooth/USB keyboard input on the NativeActivity thread and forward it through
+        // the same low-latency UDP input channel used by the host injector.
+        if let Some(queue) = &input_queue {
+            pump_android_keyboard_events(
+                &app,
+                queue,
+                ack_control.as_ref(),
+                &mut virtual_keyboard_visible,
+                &mut last_virtual_text,
+            );
+        }
 
         // Ingest any received transport packets (dropped until the runtime exists)
         while let Ok(pkt) = packet_rx.try_recv() {
