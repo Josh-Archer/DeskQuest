@@ -152,6 +152,17 @@ impl ScreenTransform {
         self.position.z = -cos_yaw * cos_tilt * self.distance;
     }
 
+    /// Places the screen on the viewing sphere at the given yaw, tilt (radians) and distance
+    /// (meters), facing the user. All three are clamped to the ergonomic limits.
+    pub fn place_at(&mut self, yaw: f32, tilt: f32, distance: f32) {
+        self.yaw = clamp_yaw(yaw);
+        self.tilt = clamp_tilt(tilt);
+        self.distance = clamp_distance(distance);
+        self.orientation = Quat::from_euler(self.tilt, self.yaw, self.roll);
+        self.update_position_from_distance_and_angles();
+        self.clamp();
+    }
+
     /// Translates the 3D position by `delta` in meters, clamping to comfortable ergonomic bounds.
     pub fn translate(&mut self, delta: Vec3) {
         self.position += delta;

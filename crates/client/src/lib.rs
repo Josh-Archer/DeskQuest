@@ -59,10 +59,11 @@ pub use openxr::{
 pub use receiver::ClientReceiver;
 pub use runtime::QuestClientRuntime;
 pub use spatial::{
-    ray_intersects_cylinder, ray_intersects_quad, ControllerInputState, CylinderLayerParams,
-    GrabSession, GrabStateMachine, HandGestureDetector, HandGestureState, HandJoint, HandJointData,
-    HandTrackingData, Handedness, InteractionEvent, InteractionInput, InteractionSource,
-    InteractionState, QuadLayerParams, Quat, Ray, RayHit, ScreenPose, ScreenTransform,
+    ray_intersects_cylinder, ray_intersects_quad, ArrangementBook, ArrangementBookStore,
+    ControllerInputState, CylinderLayerParams, GrabSession, GrabStateMachine, HandGestureDetector,
+    HandGestureState, HandJoint, HandJointData, HandTrackingData, Handedness, HostPlacement,
+    InteractionEvent, InteractionInput, InteractionSource, InteractionState, LayoutPreset,
+    PanelArrangement, QuadLayerParams, Quat, Ray, RayHit, ScreenPose, ScreenTransform,
     SpatialLayoutStore, SpatialScreenLayout, Vec3, CURRENT_LAYOUT_VERSION,
     DEFAULT_GRAB_RELEASE_THRESHOLD_M, DEFAULT_GRAB_START_THRESHOLD_M,
     DEFAULT_PINCH_RELEASE_THRESHOLD_M, DEFAULT_PINCH_START_THRESHOLD_M, HAND_JOINT_COUNT,
