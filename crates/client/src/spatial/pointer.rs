@@ -76,17 +76,26 @@ impl PointerInput {
             .as_ref()
             .and_then(|ray| ScreenTransform::find_closest_hit(ray, screens.iter().copied()));
         if let Some((display_id, hit)) = hit {
+            // Closing the fingers shifts the hand's aim ray, which would drag the cursor off the
+            // target as the click lands. Hold the last position until the pinch has lasted past
+            // the click dead zone (a drag); a short pinch then clicks where the user aimed.
+            let pinch_pending = input.is_selecting
+                && input.source.is_hand()
+                && self.filtered_uv.is_some()
+                && !matches!(self.held_button, Some((_, _, true)));
             let uv = if input.source.is_hand() {
                 self.filter(hit.uv)
             } else {
                 self.filtered_uv = None;
                 hit.uv
             };
-            out.push(InputEvent::MouseMoveAbsolute {
-                x: (uv.0.clamp(0.0, 1.0) * u16::MAX as f32).round() as u32,
-                y: (uv.1.clamp(0.0, 1.0) * u16::MAX as f32).round() as u32,
-                display_id: display_id.min(u16::MAX as u32) as u16,
-            });
+            if !pinch_pending {
+                out.push(InputEvent::MouseMoveAbsolute {
+                    x: (uv.0.clamp(0.0, 1.0) * u16::MAX as f32).round() as u32,
+                    y: (uv.1.clamp(0.0, 1.0) * u16::MAX as f32).round() as u32,
+                    display_id: display_id.min(u16::MAX as u32) as u16,
+                });
+            }
             if scroll.0.abs() > 0.001 || scroll.1.abs() > 0.001 {
                 out.push(InputEvent::MouseScrollHiRes {
                     delta_x: scroll.0 * self.bindings.scroll_scale,
@@ -270,6 +279,115 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn hand_pinch_holds_the_cursor_until_it_becomes_a_drag() {
+        let screen = ScreenTransform::for_display(0);
+        let mut pointer = PointerInput::default();
+        let start = Instant::now();
+        let hand = InteractionSource::Hand(Handedness::Right);
+        let moved = |events: &[InputEvent]| {
+            events
+                .iter()
+                .any(|e| matches!(e, InputEvent::MouseMoveAbsolute { .. }))
+        };
+
+        // Aiming (no pinch yet) tracks the ray.
+        let aim = pointer.update(
+            &input(hand, false),
+            false,
+            (0.0, 0.0),
+            &[(0, &screen)],
+            start,
+        );
+        assert!(moved(&aim));
+
+        // Pinch onset: the cursor stays put, for the whole dead zone.
+        let onset = pointer.update(
+            &input(hand, true),
+            false,
+            (0.0, 0.0),
+            &[(0, &screen)],
+            start + Duration::from_millis(16),
+        );
+        assert!(!moved(&onset));
+        let pending = pointer.update(
+            &input(hand, true),
+            false,
+            (0.0, 0.0),
+            &[(0, &screen)],
+            start + Duration::from_millis(60),
+        );
+        assert!(!moved(&pending));
+
+        // Past the dead zone the press goes out and the cursor follows again (drag).
+        let drag = pointer.update(
+            &input(hand, true),
+            false,
+            (0.0, 0.0),
+            &[(0, &screen)],
+            start + Duration::from_millis(120),
+        );
+        assert!(drag.iter().any(|e| matches!(
+            e,
+            InputEvent::MouseButton {
+                state: ElementState::Pressed,
+                ..
+            }
+        )));
+        let held = pointer.update(
+            &input(hand, true),
+            false,
+            (0.0, 0.0),
+            &[(0, &screen)],
+            start + Duration::from_millis(140),
+        );
+        assert!(moved(&held));
+    }
+
+    #[test]
+    fn controller_pointer_is_not_frozen_while_the_trigger_is_pending() {
+        let screen = ScreenTransform::for_display(0);
+        let mut pointer = PointerInput::default();
+        let start = Instant::now();
+        let controller = InteractionSource::Controller(Handedness::Right);
+        pointer.update(
+            &input(controller, false),
+            false,
+            (0.0, 0.0),
+            &[(0, &screen)],
+            start,
+        );
+        let pressed = pointer.update(
+            &input(controller, true),
+            false,
+            (0.0, 0.0),
+            &[(0, &screen)],
+            start + Duration::from_millis(16),
+        );
+        assert!(pressed
+            .iter()
+            .any(|e| matches!(e, InputEvent::MouseMoveAbsolute { .. })));
+    }
+
+    #[test]
+    fn pointer_targets_the_screen_that_was_hit_among_several() {
+        // Display 0 sits well off to the side; the ray only reaches the screen sent as id 1.
+        let mut aside = ScreenTransform::for_display(0);
+        aside.position.x += 5.0;
+        let ahead = ScreenTransform::for_display(0);
+        let mut pointer = PointerInput::default();
+        let events = pointer.update(
+            &input(InteractionSource::Controller(Handedness::Right), false),
+            false,
+            (0.0, 0.0),
+            &[(0, &aside), (1, &ahead)],
+            Instant::now(),
+        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, InputEvent::MouseMoveAbsolute { display_id: 1, .. })));
     }
 
     #[test]
