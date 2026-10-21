@@ -315,6 +315,22 @@ impl ScreenTransform {
         }
     }
 
+    /// This screen grown by `margin` meters past every edge, with the same centre and
+    /// curvature.
+    pub fn with_margin(&self, margin: f32) -> ScreenTransform {
+        let (w, h) = self.size_m();
+        let (w, h) = (w + 2.0 * margin, h + 2.0 * margin);
+        let mut out = self.clone();
+        match self.display_mode {
+            DisplayMode::FlatQuad => out.quad_size = (w, h),
+            DisplayMode::CurvedCylinder => {
+                out.curve_angle = w / self.curve_radius.max(1e-3);
+                out.aspect_ratio = w / h;
+            }
+        }
+        out
+    }
+
     pub fn cylinder_axis_pose(&self) -> ScreenPose {
         let back = self
             .orientation
