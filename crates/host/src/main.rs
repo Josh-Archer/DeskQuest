@@ -23,6 +23,7 @@ use linux_quest_host::{
     daemon_socket_path, run_ipc_server, send_daemon_request, DaemonRequest, DaemonResponse,
     HostClipboardService, HostInputReceiver, MultiDisplayHost,
 };
+use linux_quest_input::InputInjector as _;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -282,12 +283,13 @@ async fn start_stream_services(
     link: SharedLinkTracker,
     keyframe_requests: Arc<KeyframeRequests>,
     rate: Arc<RateCoordinator>,
+    display_map: linux_quest_input::SharedDisplayMap,
 ) -> (Option<u16>, Option<u16>) {
     let mut input_port = None;
     let mut control_port = None;
     let input_bind_addr =
         std::net::SocketAddr::from(([0, 0, 0, 0], linux_quest_transport::DEFAULT_INPUT_PORT));
-    match HostInputReceiver::bind_auto(input_bind_addr).await {
+    match HostInputReceiver::bind_auto_mapped(input_bind_addr, display_map).await {
         Ok(input_service) => {
             let mut input_service = input_service
                 .with_link_tracker(link.clone())
@@ -363,6 +365,35 @@ async fn start_stream_services(
 
 /// Starts the UDP video sender unless `--no-video`. When it cannot run (no real capture backend,
 /// no hardware encoder), logs exactly one line and returns `None`; the daemon keeps running.
+/// Keeps `map` in step with the virtual monitors so pointer positions on a non-primary stream
+/// land on the right monitor. Polled because monitors come and go through the IPC server.
+fn spawn_display_map_refresh(
+    host: Arc<MultiDisplayHost>,
+    map: linux_quest_input::SharedDisplayMap,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            let regions = host.list_monitors().await.into_iter().map(|m| {
+                (
+                    m.id as u16,
+                    linux_quest_input::DisplayRegion {
+                        x: m.x,
+                        y: m.y,
+                        width: m.width,
+                        height: m.height,
+                    },
+                )
+            });
+            let next = linux_quest_input::DisplayMap::from_regions(regions);
+            if let Ok(mut current) = map.write() {
+                *current = next;
+            }
+        }
+    });
+}
+
 async fn start_video(
     args: &DaemonArgs,
     link: SharedLinkTracker,
@@ -522,6 +553,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let host = Arc::new(MultiDisplayHost::create_auto().await?);
             let run_tui = daemon_args.tui || cli.tui;
             let link = new_shared_link_tracker(DEFAULT_INPUT_LIVENESS);
+            let display_map = linux_quest_input::SharedDisplayMap::default();
+            spawn_display_map_refresh(host.clone(), display_map.clone());
 
             if run_tui {
                 let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
@@ -538,6 +571,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         daemon_args.bitrate.saturating_mul(1000),
                         false,
                     )),
+                    display_map.clone(),
                 )
                 .await;
                 let adb_handle = start_adb_bridge(&daemon_args, &shutdown_tx, link.clone());
@@ -609,6 +643,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     link.clone(),
                     keyframe_requests.clone(),
                     rate.clone(),
+                    display_map.clone(),
                 )
                 .await;
                 let adb_handle = start_adb_bridge(&daemon_args, &shutdown_tx, link.clone());

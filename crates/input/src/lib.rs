@@ -7,6 +7,7 @@ pub mod auto;
 pub mod backend;
 pub mod clipboard;
 pub mod device;
+pub mod display_map;
 pub mod error;
 pub mod uinput;
 
@@ -24,6 +25,7 @@ pub use device::{
     MockDeviceState, MockUinputDeviceFile, RawInputEvent, RealDeviceOpener, RealUinputDeviceFile,
     UinputDeviceFile, UinputDeviceOpener, DEFAULT_UINPUT_PATH,
 };
+pub use display_map::{DisplayMap, DisplayMappedInjector, DisplayRegion, SharedDisplayMap};
 pub use error::InputError;
 use linux_quest_protocol::InputEvent;
 pub use uinput::{mouse_button_to_evdev, MockUinputDevices, UinputConfig, UinputInjector};

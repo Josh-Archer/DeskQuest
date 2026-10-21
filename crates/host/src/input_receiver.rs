@@ -157,6 +157,31 @@ impl HostInputReceiver<linux_quest_input::AutoInputInjector> {
         Self::new(receiver, injector)
     }
 
+    /// Like [`Self::bind_auto`], but absolute moves tagged with a non-primary display id are
+    /// rebased through `map` onto that display's place in the host desktop.
+    pub async fn bind_auto_mapped(
+        bind_addr: SocketAddr,
+        map: linux_quest_input::SharedDisplayMap,
+    ) -> Result<
+        HostInputReceiver<
+            linux_quest_input::DisplayMappedInjector<linux_quest_input::AutoInputInjector>,
+        >,
+        HostError,
+    > {
+        let socket = tokio::net::UdpSocket::bind(bind_addr)
+            .await
+            .map_err(|e| HostError::Transport(TransportError::Io(e)))?;
+        let receiver = InputChannelReceiver::new(socket, None, true);
+        let injector = linux_quest_input::DisplayMappedInjector::new(
+            linux_quest_input::AutoInputInjector::new(),
+            map,
+        );
+        Ok(HostInputReceiver::new(
+            receiver,
+            Arc::new(Mutex::new(injector)),
+        ))
+    }
+
     /// Binds a UDP socket to `bind_addr` and initializes a `HostInputReceiver` with `AutoInputInjector`.
     pub async fn bind_auto(bind_addr: SocketAddr) -> Result<Self, HostError> {
         let socket = tokio::net::UdpSocket::bind(bind_addr)
