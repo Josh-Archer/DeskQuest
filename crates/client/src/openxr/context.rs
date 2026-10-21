@@ -101,20 +101,44 @@ impl OverlaySwapchain {
     }
 }
 
-/// Swapchains and cached textures for pointers and the window handles.
+/// An overlay swapchain and the image it shows.
+struct OverlayTexture {
+    chain: OverlaySwapchain,
+    rgba: Vec<u8>,
+}
+
+impl OverlayTexture {
+    fn create(
+        session: &Session<Vulkan>,
+        format: u32,
+        size: (u32, u32),
+        rgba: Vec<u8>,
+    ) -> ClientResult<Self> {
+        Ok(Self {
+            chain: OverlaySwapchain::create(session, format, size)?,
+            rgba,
+        })
+    }
+
+    /// Uploads the image unless it already shows; false if it is not ready this frame.
+    fn ensure(&mut self, vulkan: &VulkanContext) -> bool {
+        self.chain.ensure(vulkan, &self.rgba)
+    }
+
+    fn swapchain(&self) -> &Swapchain<Vulkan> {
+        &self.chain.swapchain
+    }
+}
+
+/// Swapchains and cached textures for pointers, the window handles (each in an idle and an
+/// active look) and the rounded-corner mask.
 struct OverlaySwapchains {
-    ray: OverlaySwapchain,
-    cursor: OverlaySwapchain,
-    bar: OverlaySwapchain,
-    bar_active: OverlaySwapchain,
-    corner: OverlaySwapchain,
-    corner_active: OverlaySwapchain,
-    ray_rgba: Vec<u8>,
-    cursor_rgba: Vec<u8>,
-    bar_rgba: Vec<u8>,
-    bar_active_rgba: Vec<u8>,
-    corner_rgba: Vec<u8>,
-    corner_active_rgba: Vec<u8>,
+    ray: OverlayTexture,
+    cursor: OverlayTexture,
+    mask: OverlayTexture,
+    bar: [OverlayTexture; 2],
+    edge: [OverlayTexture; 2],
+    corner: [OverlayTexture; 2],
 }
 
 /// The swapchain and placement of the screen for a video stream other than the primary one.
@@ -133,39 +157,31 @@ enum DesktopLayer<'a> {
 }
 
 impl<'a> DesktopLayer<'a> {
-    /// A cylinder layer when the screen is curved and the runtime supports it, else a quad.
-    /// `settings` (super-sampling and sharpening) is chained when given.
+    /// A cylinder layer when the screen is curved and the runtime supports it, else a quad,
+    /// with `next` chained (layer settings, alpha blending) and `flags` added.
     fn build(
         space: &'a Space,
         swapchain: &'a Swapchain<Vulkan>,
         (width, height): (u32, u32),
         cfg: &crate::openxr::layers::DesktopLayerConfig,
         cylinder_supported: bool,
-        settings: Option<&'a openxr::sys::CompositionLayerSettingsFB>,
+        next: *const std::ffi::c_void,
+        flags: openxr::CompositionLayerFlags,
     ) -> Self {
-        let next = settings.map(|s| s as *const _ as *const std::ffi::c_void);
         if cylinder_supported && cfg.mode == crate::config::DisplayMode::CurvedCylinder {
-            let layer =
-                crate::openxr::layers::build_cylinder_layer(space, swapchain, width, height, cfg);
-            Self::Cylinder(match next {
-                Some(next) => {
-                    let mut raw = layer.into_raw();
-                    raw.next = next;
-                    unsafe { openxr::CompositionLayerCylinderKHR::from_raw(raw) }
-                }
-                None => layer,
-            })
+            let mut raw =
+                crate::openxr::layers::build_cylinder_layer(space, swapchain, width, height, cfg)
+                    .into_raw();
+            raw.next = next;
+            raw.layer_flags |= flags;
+            Self::Cylinder(unsafe { openxr::CompositionLayerCylinderKHR::from_raw(raw) })
         } else {
-            let layer =
-                crate::openxr::layers::build_quad_layer(space, swapchain, width, height, cfg);
-            Self::Quad(match next {
-                Some(next) => {
-                    let mut raw = layer.into_raw();
-                    raw.next = next;
-                    unsafe { openxr::CompositionLayerQuad::from_raw(raw) }
-                }
-                None => layer,
-            })
+            let mut raw =
+                crate::openxr::layers::build_quad_layer(space, swapchain, width, height, cfg)
+                    .into_raw();
+            raw.next = next;
+            raw.layer_flags |= flags;
+            Self::Quad(unsafe { openxr::CompositionLayerQuad::from_raw(raw) })
         }
     }
 
@@ -204,6 +220,10 @@ pub struct OpenXrContext {
     supports_cylinder: bool,
     desktop_swapchain_is_surface: bool,
     supports_layer_settings: bool,
+    /// XR_FB_composition_layer_alpha_blend: screens get rounded corners.
+    supports_alpha_blend: bool,
+    /// Most composition layers the runtime takes in one frame.
+    max_layers: usize,
     should_exit: Arc<AtomicBool>,
     timespec_converter: Option<openxr::raw::ConvertTimespecTimeKHR>,
     passthrough: Box<dyn PassthroughBackend>,
@@ -247,6 +267,8 @@ impl OpenXrContext {
             supports_cylinder: true,
             desktop_swapchain_is_surface: false,
             supports_layer_settings: false,
+            supports_alpha_blend: false,
+            max_layers: 16,
             should_exit: Arc::new(AtomicBool::new(false)),
             timespec_converter: None,
             passthrough: Box::new(MockPassthroughBackend::new(true, config.enable_passthrough)),
@@ -316,6 +338,12 @@ impl OpenXrContext {
 
         if available_exts.fb_composition_layer_settings {
             required_exts.fb_composition_layer_settings = true;
+        }
+
+        // Rounded screen corners blend each screen by a mask's destination alpha.
+        let supports_alpha_blend = available_exts.fb_composition_layer_alpha_blend;
+        if supports_alpha_blend {
+            required_exts.fb_composition_layer_alpha_blend = true;
         }
 
         if available_exts.khr_convert_timespec_time {
@@ -394,6 +422,16 @@ impl OpenXrContext {
         let system = instance
             .system(FormFactor::HEAD_MOUNTED_DISPLAY)
             .map_err(|e| ClientError::OpenXr(format!("Failed to query HMD system: {e:?}")))?;
+        let max_layers = instance
+            .system_properties(system)
+            .map(|p| p.graphics_properties.max_layer_count as usize)
+            .unwrap_or(16)
+            .max(1);
+        tracing::info!(
+            max_layers,
+            rounded_corners = supports_alpha_blend,
+            "OpenXR composition limits"
+        );
 
         let vk_reqs = instance
             .graphics_requirements::<Vulkan>(system)
@@ -668,6 +706,8 @@ impl OpenXrContext {
             supports_cylinder,
             desktop_swapchain_is_surface: false,
             supports_layer_settings: available_exts.fb_composition_layer_settings,
+            supports_alpha_blend,
+            max_layers,
             should_exit: Arc::new(AtomicBool::new(false)),
             timespec_converter,
             passthrough,
@@ -794,23 +834,23 @@ impl OpenXrContext {
         // Pointers and border are optional: without them the desktop still works.
         let overlay = (|| -> ClientResult<OverlaySwapchains> {
             use crate::openxr::overlay::*;
+            let tex = |size, rgba| OverlayTexture::create(&session, swapchain_format, size, rgba);
             Ok(OverlaySwapchains {
-                ray: OverlaySwapchain::create(&session, swapchain_format, RAY_TEXTURE)?,
-                cursor: OverlaySwapchain::create(&session, swapchain_format, CURSOR_TEXTURE)?,
-                bar: OverlaySwapchain::create(&session, swapchain_format, BAR_TEXTURE)?,
-                bar_active: OverlaySwapchain::create(&session, swapchain_format, BAR_TEXTURE)?,
-                corner: OverlaySwapchain::create(&session, swapchain_format, CORNER_TEXTURE)?,
-                corner_active: OverlaySwapchain::create(
-                    &session,
-                    swapchain_format,
-                    CORNER_TEXTURE,
-                )?,
-                ray_rgba: ray_rgba(),
-                cursor_rgba: cursor_rgba(),
-                bar_rgba: bar_rgba(0.28),
-                bar_active_rgba: bar_rgba(0.75),
-                corner_rgba: corner_rgba(0.35),
-                corner_active_rgba: corner_rgba(0.85),
+                ray: tex(RAY_TEXTURE, ray_rgba())?,
+                cursor: tex(CURSOR_TEXTURE, cursor_rgba())?,
+                mask: tex(MASK_TEXTURE, mask_rgba())?,
+                bar: [
+                    tex(BAR_TEXTURE, bar_rgba(0.55))?,
+                    tex(BAR_TEXTURE, bar_rgba(0.95))?,
+                ],
+                edge: [
+                    tex(EDGE_TEXTURE, edge_rgba(0.6))?,
+                    tex(EDGE_TEXTURE, edge_rgba(1.0))?,
+                ],
+                corner: [
+                    tex(CORNER_TEXTURE, corner_rgba(0.75))?,
+                    tex(CORNER_TEXTURE, corner_rgba(1.0))?,
+                ],
             })
         })();
         match overlay {
@@ -1343,35 +1383,34 @@ impl OpenXrContext {
                 None
             };
 
-            // Pointers and window handles: upload what is drawn (once; the compositor keeps
-            // showing a swapchain's last released image), then build their layers.
+            // Pointers, window handles and the corner mask: upload what is drawn (once; the
+            // compositor keeps showing a swapchain's last released image), then build layers.
             use crate::openxr::overlay::{
                 cursor_pose, ray_quad_pose, BAR_TEXTURE, CORNER_TEXTURE, CURSOR_SIZE_M,
-                CURSOR_TEXTURE, RAY_TEXTURE, RAY_WIDTH_M,
+                CURSOR_TEXTURE, EDGE_TEXTURE, MASK_TEXTURE, RAY_TEXTURE, RAY_WIDTH_M,
             };
-            let (mut rays_ok, mut cursor_ok, mut bar_ok, mut corner_ok) =
-                (false, false, false, false);
+            let chrome = [
+                (overlay.chrome.bar, BAR_TEXTURE),
+                (overlay.chrome.edge, EDGE_TEXTURE),
+                (overlay.chrome.corner, CORNER_TEXTURE),
+            ];
+            let (mut rays_ok, mut cursor_ok, mut mask_ok) = (false, false, false);
+            let mut chrome_ok = [false; 3];
             if let Some(o) = &mut self.overlay_swapchains {
                 if !overlay.pointers.is_empty() {
-                    rays_ok = o.ray.ensure(vulkan_context, &o.ray_rgba);
+                    rays_ok = o.ray.ensure(vulkan_context);
                     if overlay.pointers.iter().any(|p| p.hit) {
-                        cursor_ok = o.cursor.ensure(vulkan_context, &o.cursor_rgba);
+                        cursor_ok = o.cursor.ensure(vulkan_context);
                     }
                 }
-                if let Some(bar) = &overlay.bar {
-                    bar_ok = if bar.active {
-                        o.bar_active.ensure(vulkan_context, &o.bar_active_rgba)
-                    } else {
-                        o.bar.ensure(vulkan_context, &o.bar_rgba)
-                    };
+                if self.supports_alpha_blend {
+                    mask_ok = o.mask.ensure(vulkan_context);
                 }
-                if let Some(corner) = &overlay.corner {
-                    corner_ok = if corner.active {
-                        o.corner_active
-                            .ensure(vulkan_context, &o.corner_active_rgba)
-                    } else {
-                        o.corner.ensure(vulkan_context, &o.corner_rgba)
-                    };
+                let looks = [&mut o.bar, &mut o.edge, &mut o.corner];
+                for ((ok, (handle, _)), look) in chrome_ok.iter_mut().zip(&chrome).zip(looks) {
+                    if let Some(h) = handle {
+                        *ok = look[usize::from(h.active)].ensure(vulkan_context);
+                    }
                 }
             }
             let eye = self
@@ -1387,31 +1426,15 @@ impl OpenXrContext {
             let ov = self.overlay_swapchains.as_ref();
             let mut pointer_layers = Vec::new();
             if let Some(o) = ov {
-                if bar_ok {
-                    if let Some(bar) = &overlay.bar {
-                        let sc = if bar.active { &o.bar_active } else { &o.bar };
+                let looks = [&o.bar, &o.edge, &o.corner];
+                for ((ok, (handle, size_px)), look) in chrome_ok.iter().zip(&chrome).zip(looks) {
+                    if let (true, Some(h)) = (ok, handle) {
                         pointer_layers.push(crate::openxr::layers::build_overlay_quad(
                             space,
-                            &sc.swapchain,
-                            BAR_TEXTURE,
-                            openxr::Posef::from(bar.pose),
-                            bar.size,
-                        ));
-                    }
-                }
-                if corner_ok {
-                    if let Some(corner) = &overlay.corner {
-                        let sc = if corner.active {
-                            &o.corner_active
-                        } else {
-                            &o.corner
-                        };
-                        pointer_layers.push(crate::openxr::layers::build_overlay_quad(
-                            space,
-                            &sc.swapchain,
-                            CORNER_TEXTURE,
-                            openxr::Posef::from(corner.pose),
-                            corner.size,
+                            look[usize::from(h.active)].swapchain(),
+                            *size_px,
+                            openxr::Posef::from(h.pose),
+                            h.size,
                         ));
                     }
                 }
@@ -1419,7 +1442,7 @@ impl OpenXrContext {
                     for p in &overlay.pointers {
                         pointer_layers.push(crate::openxr::layers::build_overlay_quad(
                             space,
-                            &o.ray.swapchain,
+                            o.ray.swapchain(),
                             RAY_TEXTURE,
                             openxr::Posef::from(ray_quad_pose(p, eye)),
                             (RAY_WIDTH_M, p.length.max(0.01)),
@@ -1430,7 +1453,7 @@ impl OpenXrContext {
                     for p in overlay.pointers.iter().filter(|p| p.hit) {
                         pointer_layers.push(crate::openxr::layers::build_overlay_quad(
                             space,
-                            &o.cursor.swapchain,
+                            o.cursor.swapchain(),
                             CURSOR_TEXTURE,
                             openxr::Posef::from(cursor_pose(p)),
                             (CURSOR_SIZE_M, CURSOR_SIZE_M),
@@ -1439,27 +1462,71 @@ impl OpenXrContext {
                 }
             }
 
-            // The primary screen first, then one per extra stream, then pointers and handles
-            // over them, then the HUD on top.
-            let settings = self.supports_layer_settings.then_some(&layer_settings);
-            let mut desktop_layers = vec![DesktopLayer::build(
-                space,
-                desktop_sc,
-                (stream_width, stream_height),
-                &desktop_cfg,
-                self.supports_cylinder,
-                settings,
-            )];
-            for screen in self.extra_screens.values() {
-                if let Some(sc) = &screen.swapchain {
-                    desktop_layers.push(DesktopLayer::build(
+            // Each screen, primary first: with rounded corners, a mask layer of the same shape
+            // first sets the destination alpha (leaving the colour), and the screen is blended
+            // by it, so its corners show what is behind. Pointers and handles go over the
+            // screens, then the HUD on top.
+            use openxr::sys::BlendFactorFB as F;
+            let settings_next = if self.supports_layer_settings {
+                &layer_settings as *const _ as *const std::ffi::c_void
+            } else {
+                std::ptr::null()
+            };
+            let mask_blend = openxr::sys::CompositionLayerAlphaBlendFB {
+                ty: openxr::sys::CompositionLayerAlphaBlendFB::TYPE,
+                next: std::ptr::null_mut(),
+                src_factor_color: F::ZERO,
+                dst_factor_color: F::ONE,
+                src_factor_alpha: F::ONE,
+                dst_factor_alpha: F::ZERO,
+            };
+            let screen_blend = openxr::sys::CompositionLayerAlphaBlendFB {
+                ty: openxr::sys::CompositionLayerAlphaBlendFB::TYPE,
+                next: settings_next as *mut std::ffi::c_void,
+                src_factor_color: F::DST_ALPHA,
+                dst_factor_color: F::ONE_MINUS_DST_ALPHA,
+                src_factor_alpha: F::ZERO,
+                dst_factor_alpha: F::ONE,
+            };
+            let rounded = mask_ok && ov.is_some();
+            let source_alpha = openxr::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA;
+            let screens = std::iter::once((desktop_sc, (stream_width, stream_height), desktop_cfg))
+                .chain(self.extra_screens.values().filter_map(|screen| {
+                    let sc = screen.swapchain.as_ref()?;
+                    Some((sc, screen.size, screen.transform.to_desktop_layer_config()))
+                }));
+            let mut desktop_layers = Vec::new();
+            for (sc, size, cfg) in screens {
+                match ov.filter(|_| rounded) {
+                    Some(o) => {
+                        desktop_layers.push(DesktopLayer::build(
+                            space,
+                            o.mask.swapchain(),
+                            MASK_TEXTURE,
+                            &cfg,
+                            self.supports_cylinder,
+                            &mask_blend as *const _ as *const std::ffi::c_void,
+                            source_alpha,
+                        ));
+                        desktop_layers.push(DesktopLayer::build(
+                            space,
+                            sc,
+                            size,
+                            &cfg,
+                            self.supports_cylinder,
+                            &screen_blend as *const _ as *const std::ffi::c_void,
+                            source_alpha,
+                        ));
+                    }
+                    None => desktop_layers.push(DesktopLayer::build(
                         space,
                         sc,
-                        screen.size,
-                        &screen.transform.to_desktop_layer_config(),
+                        size,
+                        &cfg,
                         self.supports_cylinder,
-                        settings,
-                    ));
+                        settings_next,
+                        openxr::CompositionLayerFlags::EMPTY,
+                    )),
                 }
             }
 
@@ -1477,6 +1544,8 @@ impl OpenXrContext {
             if let Some(ref hud) = hud_layer {
                 layers.push(hud);
             }
+            // Past the runtime's limit, drop overlays from the top rather than fail the frame.
+            layers.truncate(self.max_layers);
             stream
                 .end(display_time, blend_mode, &layers)
                 .map_err(|e| ClientError::OpenXr(format!("end_frame failed: {e:?}")))?;

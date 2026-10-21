@@ -1,6 +1,7 @@
 //! 3D pointing rays and ray intersection algorithms for flat quad and curved cylinder screens.
 
 use crate::config::DisplayMode;
+use crate::spatial::limits::WINDOW_MARGIN_FRAC;
 use crate::spatial::pose::{ScreenPose, Vec3};
 use crate::spatial::transform::ScreenTransform;
 
@@ -242,30 +243,47 @@ impl ScreenTransform {
         }
     }
 
+    /// Like [`Self::intersect_ray`], for the screen's whole window: it reaches
+    /// [`WINDOW_MARGIN_FRAC`] of the width past every edge, where the grab bar, edge handles and
+    /// resize arcs are. A hit in that margin has a `uv` outside `[0, 1]`.
+    pub fn intersect_window(&self, ray: &Ray) -> Option<RayHit> {
+        let (w, h) = self.size_m();
+        let margin = WINDOW_MARGIN_FRAC * w;
+        let mut hit = self.with_margin(margin).intersect_ray(ray)?;
+        let (u, v) = hit.uv;
+        hit.uv = (
+            (u * (w + 2.0 * margin) - margin) / w,
+            (v * (h + 2.0 * margin) - margin) / h,
+        );
+        Some(hit)
+    }
+
+    /// Finds the closest window (screen plus its handle margin) the ray points at.
+    pub fn find_closest_window_hit<'a>(
+        ray: &Ray,
+        screens: impl IntoIterator<Item = (u32, &'a ScreenTransform)>,
+    ) -> Option<(u32, RayHit)> {
+        closest(screens, |screen| screen.intersect_window(ray))
+    }
+
     /// Finds the closest screen intersected by the pointing ray among a set of screens.
     pub fn find_closest_hit<'a>(
         ray: &Ray,
         screens: impl IntoIterator<Item = (u32, &'a ScreenTransform)>,
     ) -> Option<(u32, RayHit)> {
-        let mut best: Option<(u32, RayHit)> = None;
-
-        for (id, screen) in screens {
-            if let Some(hit) = screen.intersect_ray(ray) {
-                match &best {
-                    Some((_, current_best)) => {
-                        if hit.distance < current_best.distance {
-                            best = Some((id, hit));
-                        }
-                    }
-                    None => {
-                        best = Some((id, hit));
-                    }
-                }
-            }
-        }
-
-        best
+        closest(screens, |screen| screen.intersect_ray(ray))
     }
+}
+
+/// The nearest of `screens` that `hit` reports a hit on.
+fn closest<'a>(
+    screens: impl IntoIterator<Item = (u32, &'a ScreenTransform)>,
+    hit: impl Fn(&ScreenTransform) -> Option<RayHit>,
+) -> Option<(u32, RayHit)> {
+    screens
+        .into_iter()
+        .filter_map(|(id, screen)| hit(screen).map(|h| (id, h)))
+        .min_by(|a, b| a.1.distance.total_cmp(&b.1.distance))
 }
 
 #[cfg(test)]

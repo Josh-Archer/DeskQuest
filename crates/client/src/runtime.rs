@@ -490,7 +490,7 @@ impl QuestClientRuntime {
                 .iter()
                 .map(|i| {
                     i.aim_ray.as_ref().and_then(|r| {
-                        ScreenTransform::find_closest_hit(r, screens.iter().copied())
+                        ScreenTransform::find_closest_window_hit(r, screens.iter().copied())
                             .map(|(_, hit)| hit)
                     })
                 })
@@ -630,8 +630,7 @@ impl QuestClientRuntime {
                     })
                 })
                 .collect(),
-            bar: None,
-            corner: None,
+            chrome: Default::default(),
         };
         let hover_uv = match interaction_state {
             InteractionState::Hovering { hit, .. } => Some(hit.uv),
@@ -654,10 +653,8 @@ impl QuestClientRuntime {
             .ok()
             .and_then(|id| self.extra_streams.get(&id))
             .map_or(&self.screen_transform, |s| &s.transform);
-        let (bar, corner) =
-            crate::openxr::overlay::window_handles(handle_screen, hover_uv, moving, resizing);
-        self.overlay_scene.bar = bar;
-        self.overlay_scene.corner = corner;
+        self.overlay_scene.chrome =
+            crate::openxr::overlay::window_chrome(handle_screen, hover_uv, moving, resizing);
 
         // If OpenXR requests not to render (should_render == false), end frame with empty layers
         if !pacing.should_render {
