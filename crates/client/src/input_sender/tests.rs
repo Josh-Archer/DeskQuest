@@ -12,7 +12,7 @@ use super::*;
 #[test]
 fn pointer_events_and_keyframe_requests_share_the_sender_source() {
     let events = SharedInputEvents::default();
-    let keyframe = Arc::new(AtomicBool::new(false));
+    let keyframe = KeyframeRequestFlags::default();
     let mut source = PointerInputSource {
         events: events.clone(),
         keyframe: keyframe.clone(),
@@ -23,10 +23,17 @@ fn pointer_events_and_keyframe_requests_share_the_sender_source() {
         display_id: 3,
     };
     events.push(movement.clone());
-    keyframe.store(true, Ordering::Release);
+    keyframe.raise(0);
+    keyframe.raise(1);
 
-    assert_eq!(source.poll(), vec![movement, InputEvent::KeyframeRequest]);
-    assert!(!keyframe.load(Ordering::Acquire));
+    assert_eq!(
+        source.poll(),
+        vec![
+            movement,
+            InputEvent::KeyframeRequest,
+            InputEvent::KeyframeRequestFor { stream_id: 1 },
+        ]
+    );
     assert!(events.last_queue_latency_us() <= 1_000_000);
     assert!(source.poll().is_empty());
 }
@@ -522,4 +529,23 @@ async fn input_sender_latency() {
         samples.last().unwrap()
     );
     sender.stop().await;
+}
+
+#[test]
+fn keyframe_requests_are_per_stream() {
+    let mut source = KeyframeRequestSource::new();
+    let flags = source.requester();
+    assert!(source.poll().is_empty());
+    flags.raise(2);
+    flags.raise(0);
+    flags.raise(2);
+    flags.raise(40); // no such stream bit: ignored
+    assert_eq!(
+        source.poll(),
+        vec![
+            InputEvent::KeyframeRequest,
+            InputEvent::KeyframeRequestFor { stream_id: 2 },
+        ]
+    );
+    assert!(source.poll().is_empty());
 }

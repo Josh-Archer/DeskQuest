@@ -40,7 +40,7 @@ fn test_client_runtime_lifecycle_with_av1() {
     };
     let chunk = VideoChunk::new(meta, Bytes::from(av1_frame_data));
     let chunk_bytes = chunk.serialize().unwrap();
-    let header = PacketHeader::new(PacketType::VideoFrameChunk, 1, 1, 10_000, &chunk_bytes);
+    let header = PacketHeader::new(PacketType::VideoFrameChunk, 0, 1, 10_000, &chunk_bytes);
     let packet = Packet::new(header, chunk_bytes);
 
     let arrival = Instant::now();
@@ -99,7 +99,7 @@ fn test_client_runtime_lifecycle_with_hevc() {
     };
     let chunk = VideoChunk::new(meta, Bytes::from(hevc_frame_data));
     let chunk_bytes = chunk.serialize().unwrap();
-    let header = PacketHeader::new(PacketType::VideoFrameChunk, 1, 1, 20_000, &chunk_bytes);
+    let header = PacketHeader::new(PacketType::VideoFrameChunk, 0, 1, 20_000, &chunk_bytes);
     let packet = Packet::new(header, chunk_bytes);
 
     let arrival = Instant::now();
