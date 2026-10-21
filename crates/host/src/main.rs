@@ -55,8 +55,8 @@ enum Commands {
     /// Launch interactive terminal status dashboard
     Dashboard(DashboardArgs),
 
-    /// Show a system tray icon with connection status and service controls
-    /// (requires a build with `--features tray`)
+    /// Show a system tray icon with the headset's status, pause and resume, Choose Screen,
+    /// and a shortcut to the desktop app
     Tray(TrayArgs),
 
     /// Install or remove the systemd user service that runs the daemon at login and restarts
@@ -713,21 +713,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
         Commands::Tray(args) => {
-            #[cfg(feature = "tray")]
-            {
-                let interval = Duration::from_millis(args.interval_ms.max(500));
-                linux_quest_host::tray::run_tray(IpcTelemetrySource, interval).await?;
-            }
-            #[cfg(not(feature = "tray"))]
-            {
-                let _ = args;
-                eprintln!("This build has no tray support.");
-                eprintln!("Rebuild with the `tray` feature:");
-                eprintln!(
-                    "  cargo install --path crates/host --bin linux-quest-host --features tray"
-                );
-                std::process::exit(2);
-            }
+            let interval = Duration::from_millis(args.interval_ms.max(500));
+            linux_quest_host::tray::run_tray(IpcTelemetrySource, interval).await?;
         }
         Commands::Daemon(daemon_args) => {
             let preference = daemon_args

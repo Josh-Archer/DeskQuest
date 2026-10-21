@@ -3,14 +3,62 @@
 //! The controller is generic over the telemetry source, the tray host (the D-Bus
 //! layer) and the command runner, so the whole flow is tested with mocks.
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tracing::{debug, info, warn};
 
-use super::commands::{dashboard_command, restart_command, CommandRunner};
+use super::commands::{app_command, dashboard_command, restart_command, CommandRunner};
 use super::model::{ConnectionState, TrayAction, TrayView};
+use crate::ipc::{DaemonRequest, DaemonResponse, DaemonStatus};
 use crate::tui::TelemetrySource;
+
+/// The daemon requests the tray makes besides polling its snapshot. A trait so the controller
+/// is tested without a daemon.
+#[async_trait]
+pub trait DaemonControl: Send + Sync {
+    /// The daemon's own status. An older daemon does not have it and fails.
+    async fn status(&self) -> Result<DaemonStatus, String>;
+    async fn set_streaming(&self, enabled: bool) -> Result<(), String>;
+    /// Shows GNOME's screen-share dialog and waits for the user's answer (minutes at most).
+    async fn choose_screen(&self) -> Result<(), String>;
+}
+
+/// [`DaemonControl`] over the daemon's IPC socket.
+pub struct IpcDaemonControl;
+
+async fn ipc(req: DaemonRequest) -> Result<DaemonResponse, String> {
+    match crate::ipc::send_daemon_request(req).await {
+        Ok(DaemonResponse::Error(e)) => Err(e),
+        Ok(resp) => Ok(resp),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[async_trait]
+impl DaemonControl for IpcDaemonControl {
+    async fn status(&self) -> Result<DaemonStatus, String> {
+        match ipc(DaemonRequest::Status).await? {
+            DaemonResponse::Status(status) => Ok(*status),
+            other => Err(format!("unexpected answer {other:?}")),
+        }
+    }
+
+    async fn set_streaming(&self, enabled: bool) -> Result<(), String> {
+        ipc(DaemonRequest::SetStreaming { enabled })
+            .await
+            .map(|_| ())
+    }
+
+    async fn choose_screen(&self) -> Result<(), String> {
+        ipc(DaemonRequest::ChooseScreen).await.map(|_| ())
+    }
+}
+
+/// After a status request fails (an older daemon), it is not asked again for this long.
+const STATUS_RETRY: Duration = Duration::from_secs(60);
 
 /// The side that actually shows the icon (the D-Bus layer in production).
 #[async_trait]
@@ -93,6 +141,11 @@ pub struct TrayController<S, H, R> {
     host_failing: bool,
     poll_timeout: Duration,
     action_timeout: Duration,
+    daemon: Option<Arc<dyn DaemonControl>>,
+    /// The screen picker is open (set by the task that waits for it).
+    choosing: Arc<AtomicBool>,
+    /// The daemon failed the status request; not asked again until then.
+    status_unsupported_until: Option<Instant>,
 }
 
 impl<S, H, R> TrayController<S, H, R>
@@ -111,6 +164,43 @@ where
             host_failing: false,
             poll_timeout: POLL_TIMEOUT,
             action_timeout: ACTION_TIMEOUT,
+            daemon: None,
+            choosing: Arc::new(AtomicBool::new(false)),
+            status_unsupported_until: None,
+        }
+    }
+
+    /// Enables the daemon actions (pause, choose screen) and the status details.
+    pub fn with_daemon_control(mut self, daemon: Arc<dyn DaemonControl>) -> Self {
+        self.daemon = Some(daemon);
+        self
+    }
+
+    /// The view last shown.
+    pub fn current_view(&self) -> Option<&TrayView> {
+        self.last_published.as_ref()
+    }
+
+    /// The daemon's status, unless it is an older one that does not answer it.
+    async fn daemon_status(&mut self) -> Option<DaemonStatus> {
+        let daemon = self.daemon.clone()?;
+        if self
+            .status_unsupported_until
+            .is_some_and(|until| Instant::now() < until)
+        {
+            return None;
+        }
+        match tokio::time::timeout(self.poll_timeout, daemon.status()).await {
+            Ok(Ok(status)) => {
+                self.status_unsupported_until = None;
+                Some(status)
+            }
+            Ok(Err(err)) => {
+                debug!(error = %err, "daemon has no status request (older version?)");
+                self.status_unsupported_until = Some(Instant::now() + STATUS_RETRY);
+                None
+            }
+            Err(_) => None,
         }
     }
 
@@ -124,19 +214,25 @@ where
 
     /// Polls the daemon once and publishes the view if it changed (or was never shown).
     pub async fn refresh(&mut self) {
-        let state =
-            match tokio::time::timeout(self.poll_timeout, self.source.fetch_snapshot()).await {
-                Ok(Ok(snapshot)) => ConnectionState::from_snapshot(&snapshot),
-                Err(_elapsed) => {
-                    debug!(timeout = ?self.poll_timeout, "daemon status poll timed out");
-                    ConnectionState::DaemonOffline
-                }
-                Ok(Err(err)) => {
-                    debug!(error = %err, "daemon status unavailable");
-                    ConnectionState::DaemonOffline
-                }
-            };
-        let view = TrayView::for_state(state);
+        let view = match tokio::time::timeout(self.poll_timeout, self.source.fetch_snapshot()).await
+        {
+            Ok(Ok(snapshot)) => {
+                let status = self.daemon_status().await;
+                TrayView::from_daemon(
+                    &snapshot,
+                    status.as_ref(),
+                    self.choosing.load(Ordering::SeqCst),
+                )
+            }
+            Err(_elapsed) => {
+                debug!(timeout = ?self.poll_timeout, "daemon status poll timed out");
+                TrayView::for_state(ConnectionState::DaemonOffline)
+            }
+            Ok(Err(err)) => {
+                debug!(error = %err, "daemon status unavailable");
+                TrayView::for_state(ConnectionState::DaemonOffline)
+            }
+        };
         if self.last_published.as_ref() == Some(&view) {
             return;
         }
@@ -167,6 +263,59 @@ where
     /// Runs a menu action. Failures are logged and do not stop the tray.
     pub async fn handle(&mut self, action: TrayAction) -> Flow {
         match action {
+            TrayAction::OpenApp => {
+                let cmd = app_command(&self.config.host_exe, |p| p.exists());
+                let spawned =
+                    tokio::time::timeout(self.action_timeout, self.runner.spawn_detached(&cmd))
+                        .await
+                        .unwrap_or_else(|_| Err("timed out starting the app".to_string()));
+                if let Err(err) = spawned {
+                    warn!(
+                        error = %err,
+                        "could not open the Linux Quest app; install it with \
+                         `cargo install --path crates/desktop`"
+                    );
+                }
+                Flow::Continue
+            }
+            TrayAction::ToggleStreaming => {
+                let current = self
+                    .last_published
+                    .as_ref()
+                    .and_then(|v| v.streaming_enabled);
+                if let (Some(daemon), Some(enabled)) = (self.daemon.clone(), current) {
+                    match tokio::time::timeout(self.action_timeout, daemon.set_streaming(!enabled))
+                        .await
+                    {
+                        Ok(Ok(())) => {
+                            info!(streaming = !enabled, "streaming toggled from the tray")
+                        }
+                        Ok(Err(err)) => warn!(error = %err, "could not change streaming"),
+                        Err(_) => warn!("changing streaming timed out"),
+                    }
+                    self.refresh().await;
+                }
+                Flow::Continue
+            }
+            TrayAction::ChooseScreen => {
+                let Some(daemon) = self.daemon.clone() else {
+                    return Flow::Continue;
+                };
+                if self.choosing.swap(true, Ordering::SeqCst) {
+                    return Flow::Continue;
+                }
+                // The user may take minutes in the dialog; the tray keeps running meanwhile.
+                let choosing = self.choosing.clone();
+                tokio::spawn(async move {
+                    match daemon.choose_screen().await {
+                        Ok(()) => info!("screen chosen from the tray"),
+                        Err(err) => warn!(error = %err, "no screen chosen"),
+                    }
+                    choosing.store(false, Ordering::SeqCst);
+                });
+                self.refresh().await;
+                Flow::Continue
+            }
             TrayAction::OpenDashboard => {
                 let cmd = dashboard_command(self.config.terminal.as_deref(), &self.config.host_exe);
                 let spawned =
@@ -459,6 +608,147 @@ mod tests {
         .await
         .expect("actions must time out");
         assert_eq!(flow, (Flow::Continue, Flow::Continue));
+    }
+
+    /// A daemon whose status the test sets, recording what it is asked.
+    #[derive(Default)]
+    struct MockDaemon {
+        status: Mutex<Option<DaemonStatus>>,
+        status_calls: std::sync::atomic::AtomicU32,
+        streaming: Mutex<Vec<bool>>,
+        choose_calls: std::sync::atomic::AtomicU32,
+        /// Released by the test to "answer" the screen picker.
+        picked: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl DaemonControl for MockDaemon {
+        async fn status(&self) -> Result<DaemonStatus, String> {
+            self.status_calls.fetch_add(1, Ordering::SeqCst);
+            self.status
+                .lock()
+                .clone()
+                .ok_or_else(|| "unknown request".to_string())
+        }
+        async fn set_streaming(&self, enabled: bool) -> Result<(), String> {
+            self.streaming.lock().push(enabled);
+            if let Some(status) = self.status.lock().as_mut() {
+                status.streaming_enabled = enabled;
+            }
+            Ok(())
+        }
+        async fn choose_screen(&self) -> Result<(), String> {
+            self.choose_calls.fetch_add(1, Ordering::SeqCst);
+            self.picked.notified().await;
+            Ok(())
+        }
+    }
+
+    fn new_daemon_status() -> DaemonStatus {
+        DaemonStatus {
+            version: "test".into(),
+            uptime_secs: 1,
+            streaming_enabled: true,
+            video_streams: 1,
+            capture: crate::ipc::DaemonCapture::Screen,
+            can_choose_screen: true,
+            bitrate_mbps: 30,
+            adaptive_bitrate: true,
+            link: ClientConnectionMode::Wifi,
+            headset_connected: false,
+            display_backend: "mock".into(),
+        }
+    }
+
+    fn wifi_source(polls: usize) -> ScriptedSource {
+        ScriptedSource(vec![Some(ClientConnectionMode::Wifi); polls].into())
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_go_to_the_daemon_and_show_at_once() {
+        let daemon = Arc::new(MockDaemon::default());
+        *daemon.status.lock() = Some(new_daemon_status());
+        let host = MockHost::default();
+        let published = host.published.clone();
+        let mut c = TrayController::new(wifi_source(4), host, MockRunner::default(), config(None))
+            .with_daemon_control(daemon.clone());
+        c.refresh().await;
+        assert_eq!(c.current_view().unwrap().streaming_enabled, Some(true));
+
+        assert_eq!(c.handle(TrayAction::ToggleStreaming).await, Flow::Continue);
+        assert_eq!(*daemon.streaming.lock(), vec![false]);
+        assert_eq!(c.current_view().unwrap().streaming_enabled, Some(false));
+        assert_eq!(
+            published.lock().last().unwrap().detail.as_deref(),
+            Some("Streaming paused")
+        );
+        c.handle(TrayAction::ToggleStreaming).await;
+        assert_eq!(*daemon.streaming.lock(), vec![false, true]);
+    }
+
+    #[tokio::test]
+    async fn choose_screen_runs_in_the_background_and_only_once_at_a_time() {
+        let daemon = Arc::new(MockDaemon::default());
+        *daemon.status.lock() = Some(new_daemon_status());
+        let mut c = TrayController::new(
+            wifi_source(6),
+            MockHost::default(),
+            MockRunner::default(),
+            config(None),
+        )
+        .with_daemon_control(daemon.clone());
+        c.refresh().await;
+        // The handler returns while the picker is still open.
+        assert_eq!(c.handle(TrayAction::ChooseScreen).await, Flow::Continue);
+        assert!(c.current_view().unwrap().choosing_screen);
+        c.handle(TrayAction::ChooseScreen).await;
+        tokio::task::yield_now().await;
+        assert_eq!(daemon.choose_calls.load(Ordering::SeqCst), 1);
+
+        daemon.picked.notify_one();
+        for _ in 0..100 {
+            if !c.choosing.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        c.refresh().await;
+        assert!(!c.current_view().unwrap().choosing_screen);
+    }
+
+    #[tokio::test]
+    async fn an_older_daemon_is_not_asked_for_its_status_every_poll() {
+        let daemon = Arc::new(MockDaemon::default());
+        let mut c = TrayController::new(
+            wifi_source(3),
+            MockHost::default(),
+            MockRunner::default(),
+            config(None),
+        )
+        .with_daemon_control(daemon.clone());
+        c.refresh().await;
+        c.refresh().await;
+        assert_eq!(daemon.status_calls.load(Ordering::SeqCst), 1);
+        let view = c.current_view().unwrap();
+        assert_eq!(view.state, ConnectionState::Wifi);
+        assert_eq!(view.streaming_enabled, None, "no pause item for it");
+    }
+
+    #[tokio::test]
+    async fn open_app_starts_the_desktop_app() {
+        let runner = MockRunner::default();
+        let calls = runner.calls.clone();
+        let mut c = TrayController::new(
+            ScriptedSource(VecDeque::new()),
+            MockHost::default(),
+            runner,
+            config(None),
+        );
+        assert_eq!(c.handle(TrayAction::OpenApp).await, Flow::Continue);
+        let calls = calls.lock();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "detached");
+        assert!(calls[0].1.program.ends_with("linux-quest"));
     }
 
     #[test]

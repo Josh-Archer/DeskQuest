@@ -55,6 +55,7 @@ package() {
   install -Dm644 "packaging/udev/99-uinput.rules" "${pkgdir}/usr/lib/udev/rules.d/99-uinput.rules"
   install -Dm644 "packaging/modules-load/linux-quest.conf" "${pkgdir}/usr/lib/modules-load.d/linux-quest.conf"
   install -Dm644 "packaging/systemd/linux-quest-host.service" "${pkgdir}/usr/lib/systemd/user/linux-quest-host.service"
+  install -Dm644 "packaging/systemd/linux-quest-tray.service" "${pkgdir}/usr/lib/systemd/user/linux-quest-tray.service"
   install -Dm644 "LICENSE-MIT" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-MIT"
   install -Dm644 "LICENSE-APACHE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-APACHE"
 }

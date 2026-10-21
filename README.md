@@ -164,16 +164,16 @@ Install a locally built Flatpak bundle with `flatpak install --user ./linux-ques
 The APK is debug-signed for sideloading; connect a Quest with Developer Mode enabled
 and run `scripts/install-quest.sh <path-to-apk>`.
 
-### Optional tray icon
+### Tray icon
 
-`linux-quest-host tray` shows connection state in the system tray, with Open dashboard, Restart service and Quit. It is a separate process, and it is off by default, so build it with the `tray` feature:
+`linux-quest-host tray` shows the headset's status in the system tray: how it is connected and what is streaming, with Pause/Resume Streaming, Choose Screen…, Open Linux Quest (the desktop app; also a left click), Open Dashboard, Restart Service and Quit. It is part of every build and runs as its own process:
 
 ```bash
-cargo install --path crates/host --bin linux-quest-host --features tray --root ~/.local
 linux-quest-host tray
+linux-quest-host service install --tray --enable --start   # or start it with every login
 ```
 
-It needs a StatusNotifierItem host (KDE Plasma, GNOME with the AppIndicator extension, or a bar with a tray module). It can start before or after the daemon, and the systemd unit above does not change. The ordering, a sample user unit and known limitations are in [`packaging/README.md`](packaging/README.md#optional-tray-icon).
+It needs a StatusNotifierItem host: KDE Plasma, a bar with a tray module, or on GNOME the AppIndicator extension (`gnome-extensions enable ubuntu-appindicators@ubuntu.com` on Ubuntu). It can start before or after the daemon. Details are in [`packaging/README.md`](packaging/README.md#tray-icon).
 
 ---
 

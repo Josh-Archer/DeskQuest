@@ -53,6 +53,24 @@ pub fn dashboard_command(terminal_env: Option<&str>, host_exe: &str) -> LaunchCo
     }
 }
 
+/// Name of the desktop app's binary.
+pub const APP_BINARY: &str = "linux-quest";
+
+/// Starts the desktop app: the `linux-quest` next to `host_exe` when there is one (a cargo
+/// build or an install puts both in one directory), else the one on `$PATH`. `exists` is
+/// injected for testing.
+pub fn app_command(host_exe: &str, exists: impl Fn(&std::path::Path) -> bool) -> LaunchCommand {
+    let sibling = std::path::Path::new(host_exe)
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(APP_BINARY))
+        .filter(|path| exists(path));
+    LaunchCommand {
+        program: sibling.map_or_else(|| APP_BINARY.to_string(), |path| path.display().to_string()),
+        args: Vec::new(),
+    }
+}
+
 /// Queues a restart of the user service.
 ///
 /// `--no-block` returns once systemd has accepted the job. A blocking restart would
@@ -179,6 +197,23 @@ mod tests {
         let cmd = dashboard_command(Some("kitty 'oops"), "/h");
         assert_eq!(cmd.program, FALLBACK_TERMINAL);
         assert_eq!(cmd.args, ["-e", "/h", "dashboard"].map(String::from));
+    }
+
+    #[test]
+    fn the_app_next_to_the_host_binary_wins_over_path() {
+        let cmd = app_command("/home/u/.local/bin/linux-quest-host", |p| {
+            p == std::path::Path::new("/home/u/.local/bin/linux-quest")
+        });
+        assert_eq!(cmd.program, "/home/u/.local/bin/linux-quest");
+        assert!(cmd.args.is_empty());
+        assert_eq!(
+            app_command("/usr/bin/linux-quest-host", |_| false).program,
+            "linux-quest"
+        );
+        assert_eq!(
+            app_command("linux-quest-host", |_| true).program,
+            "linux-quest"
+        );
     }
 
     #[test]
