@@ -634,6 +634,10 @@ pub fn android_main(app: AndroidApp) {
         .try_init();
 
     tracing::info!("linux-quest Quest client starting up on Android / Horizon OS");
+    // Opt-in, once-per-second export of the existing HUD and decoder counters.
+    // Keep this separate from optical motion-to-photon measurements.
+    let validation_metrics = system_property("debug.linuxquest.metrics").as_deref() == Some("1");
+    let mut next_metrics = std::time::Instant::now() + Duration::from_secs(1);
     ACTIVITY.store(app.activity_as_ptr(), std::sync::atomic::Ordering::Release);
 
     // android-activity initialises `ndk_context` (JavaVM + activity) before calling
@@ -959,6 +963,10 @@ pub fn android_main(app: AndroidApp) {
                 if let Some(rt) = runtime.as_mut() {
                     if let Err(e) = rt.step_frame() {
                         tracing::warn!(error = ?e, "Error stepping client frame");
+                    }
+                    if validation_metrics && std::time::Instant::now() >= next_metrics {
+                        tracing::info!("LQ_METRICS {}", rt.validation_metrics());
+                        next_metrics = std::time::Instant::now() + Duration::from_secs(1);
                     }
                 }
             }

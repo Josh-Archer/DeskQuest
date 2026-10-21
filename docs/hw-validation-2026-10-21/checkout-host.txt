@@ -1,0 +1,8 @@
+2026-10-21T13:24:25.188502Z  INFO linux_quest_host: Linux Quest host daemon starting backend="GNOME Mutter (D-Bus)"
+2026-10-21T13:24:41.321971Z  INFO linux_quest_capture::screencast::stream: screencast: negotiated Bgrx 3840x2160 @ 60 fps via SHM
+2026-10-21T13:24:41.375453Z  INFO linux_quest_capture::screencast::stream: screencast: first frame 3840x2160 stride 15360 via SHM
+2026-10-21T13:24:41.463672Z  INFO linux_quest_encoder::nvenc: NVIDIA NVENC hardware session successfully initialized codec=Av1 preset="P1 (Ultra Low Latency)" rc="CBR" bitrate_kbps=30000 width=3840 height=2160 fps=60
+2026-10-21T13:24:41.463698Z  INFO linux_quest_host::video_sender::daemon: UDP video sender encoder chosen backend="nvenc" codec=Av1 bitrate_kbps=30000 stream_id=0 width=3840 height=2160 fps=60
+2026-10-21T13:24:41.463728Z  INFO linux_quest_host: UDP video sender ready; it sends to the headset once its input channel is live port=48440
+2026-10-21T13:26:19.176893Z  INFO linux_quest_host: Shutdown signal received; stopping daemon...
+2026-10-21T13:26:19.260636Z  INFO linux_quest_host: Daemon stopped cleanly.

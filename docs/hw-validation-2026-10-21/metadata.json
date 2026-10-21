@@ -1,0 +1,26 @@
+{
+  "utc": "2026-10-21T13:29:07.078678+00:00",
+  "commit": "c8b9edf52a073638f07c01b2e89a1867d6e80d1d",
+  "dirty": "M .gitignore\n M crates/client/src/android/mod.rs\n M crates/client/src/runtime.rs\n?? scripts/hw-validate.sh\n?? scripts/hw_validate.py\n?? scripts/test_hw_validate.py",
+  "mode": "wifi",
+  "host_pid": 2913794,
+  "logical_cpus": 24,
+  "kernel": "Linux 7.0.0-38-generic",
+  "host_exe_sha256": "1a1d6f87ef2cf3dea193f5d87919841ed1da03a3e9ede4194820a8d5422e6171",
+  "gpu": "NVIDIA GeForce RTX 5080, 615.71.09",
+  "model": "Quest 3",
+  "fingerprint": "oculus/eureka/eureka:14/UP1A.231005.007.A1/52433670048800520:user/abl_signing_keys:release,amss_signing_keys:release,release-keys",
+  "seconds_requested": 60,
+  "warmup_seconds": 0,
+  "observe_only": true,
+  "client_pid": "8867",
+  "client_pid_after": "8867",
+  "wifi_link": [
+    "Wi-Fi standard: 6",
+    "RSSI: -46",
+    "Link speed: 2401Mbps",
+    "Frequency: 6295MHz"
+  ],
+  "provenance_warning": "Read-only observation of another session; host waiting for portal; not an end-to-end streaming benchmark of this branch.",
+  "wifi_link_note": "Frequency read separately from dumpsys wifi during preflight; not a repeated sample."
+}
