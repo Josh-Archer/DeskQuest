@@ -194,8 +194,14 @@ pub enum InputEvent {
     /// Always means stream 0 (the primary screen); [`InputEvent::KeyframeRequestFor`] names any
     /// other stream.
     KeyframeRequest,
+    /// Text committed by an IME or virtual keyboard. Kept separate from key presses so Unicode
+    /// input does not depend on the host keyboard layout. Wire tag 9.
+    TextCommit {
+        text: String,
+    },
     /// Like [`InputEvent::KeyframeRequest`] but for the video stream `stream_id` (the same value
-    /// as the stream's `PacketHeader::stream_id`, which is also its display id). Wire tag 9.
+    /// as the stream's `PacketHeader::stream_id`, which is also its display id). Wire tag 10:
+    /// tag 9 was taken by [`InputEvent::TextCommit`], merged first.
     KeyframeRequestFor {
         stream_id: u16,
     },
@@ -252,8 +258,13 @@ impl InputEvent {
             InputEvent::KeyframeRequest => {
                 dst.put_u8(8);
             }
-            InputEvent::KeyframeRequestFor { stream_id } => {
+            InputEvent::TextCommit { text } => {
                 dst.put_u8(9);
+                dst.put_u32(text.len() as u32);
+                dst.put_slice(text.as_bytes());
+            }
+            InputEvent::KeyframeRequestFor { stream_id } => {
+                dst.put_u8(10);
                 dst.put_u16(*stream_id);
             }
         }
@@ -377,6 +388,26 @@ impl InputEvent {
             }
             8 => Ok(InputEvent::KeyframeRequest),
             9 => {
+                if src.len() < 4 {
+                    return Err(ProtocolError::BufferTooShort {
+                        required: 4,
+                        found: src.len(),
+                    });
+                }
+                let text_len = src.get_u32() as usize;
+                if src.len() < text_len {
+                    return Err(ProtocolError::BufferTooShort {
+                        required: text_len,
+                        found: src.len(),
+                    });
+                }
+                let text = std::str::from_utf8(&src[..text_len])
+                    .map_err(|e| ProtocolError::DeserializationError(e.to_string()))?
+                    .to_owned();
+                src.advance(text_len);
+                Ok(InputEvent::TextCommit { text })
+            }
+            10 => {
                 if src.len() < 2 {
                     return Err(ProtocolError::BufferTooShort {
                         required: 2,
@@ -596,6 +627,9 @@ mod tests {
                 content: b"clipboard text content".to_vec(),
             },
             InputEvent::KeyframeRequest,
+            InputEvent::TextCommit {
+                text: "héllo 🥐".into(),
+            },
             InputEvent::KeyframeRequestFor { stream_id: 0 },
             InputEvent::KeyframeRequestFor { stream_id: 2 },
             InputEvent::KeyframeRequestFor {
@@ -626,19 +660,19 @@ mod tests {
         );
         assert!(slice.is_empty());
 
-        // Tag 9 carries the stream id as a big-endian u16.
+        // Tag 10 carries the stream id as a big-endian u16 (tag 9 is TextCommit).
         let mut buf = bytes::BytesMut::new();
         InputEvent::KeyframeRequestFor { stream_id: 0x0102 }.encode(&mut buf);
-        assert_eq!(&buf[..], &[9, 0x01, 0x02]);
-        let mut slice = &[9u8, 0x00, 0x02][..];
+        assert_eq!(&buf[..], &[10, 0x01, 0x02]);
+        let mut slice = &[10u8, 0x00, 0x02][..];
         assert_eq!(
             InputEvent::decode(&mut slice).unwrap(),
             InputEvent::KeyframeRequestFor { stream_id: 2 }
         );
         assert!(slice.is_empty());
 
-        // A truncated tag 9 is an error, not a panic or a stream 0 request.
-        for truncated in [&[9u8][..], &[9u8, 0x01][..]] {
+        // A truncated tag 10 is an error, not a panic or a stream 0 request.
+        for truncated in [&[10u8][..], &[10u8, 0x01][..]] {
             let mut slice = truncated;
             assert!(InputEvent::decode(&mut slice).is_err());
         }

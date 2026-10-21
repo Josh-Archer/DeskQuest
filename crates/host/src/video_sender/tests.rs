@@ -1225,7 +1225,7 @@ async fn two_streams_share_the_headset_port_with_independent_frame_ids_and_keyfr
     assert_eq!(probe0.keyframes.lock().clone(), vec![1]);
     assert_eq!(probe1.keyframes.lock().clone(), vec![1]);
 
-    // The client lost stream 1 only (wire tag 9): only stream 1 emits another keyframe.
+    // The client lost stream 1 only (wire tag 10): only stream 1 emits another keyframe.
     tokio::time::sleep(Duration::from_millis(100)).await;
     client_asks(
         &mut client,

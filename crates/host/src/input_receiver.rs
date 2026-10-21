@@ -181,16 +181,19 @@ mod tests {
                 state: ElementState::Pressed,
                 modifiers: KeyModifiers::empty(),
             },
+            InputEvent::TextCommit {
+                text: "résumé 東京".into(),
+            },
         ];
 
         sender.send_events(events.clone(), 100_000).await.unwrap();
 
         let count = host_receiver.step().await.unwrap();
-        assert_eq!(count, 3);
+        assert_eq!(count, 4);
 
         let binding = injector.lock().unwrap();
         let received = &binding.received_events;
-        assert_eq!(received.len(), 3);
+        assert_eq!(received.len(), 4);
         assert_eq!(*received, events);
     }
     #[tokio::test]
