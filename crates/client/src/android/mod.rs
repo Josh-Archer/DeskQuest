@@ -684,8 +684,6 @@ pub fn android_main(app: AndroidApp) {
         }))
     };
 
-    // The receiver thread acks with its own handle; `ack_control` is still needed below.
-    let receiver_ack = ack_control.clone();
     let receiver_handle = std::thread::spawn(move || {
         match transport_mode {
             crate::config::TransportMode::AdbReverseTcp => {
