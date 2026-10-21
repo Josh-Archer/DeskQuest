@@ -219,6 +219,8 @@ pub struct OpenXrContext {
     session_running: Arc<AtomicBool>,
     supports_cylinder: bool,
     desktop_swapchain_is_surface: bool,
+    /// Pixel size of the primary screen's swapchain, which its layer shows in full.
+    desktop_size: (u32, u32),
     supports_layer_settings: bool,
     /// XR_FB_composition_layer_alpha_blend: screens get rounded corners.
     supports_alpha_blend: bool,
@@ -266,6 +268,7 @@ impl OpenXrContext {
             session_running: Arc::new(AtomicBool::new(true)),
             supports_cylinder: true,
             desktop_swapchain_is_surface: false,
+            desktop_size: (config.stream_width, config.stream_height),
             supports_layer_settings: false,
             supports_alpha_blend: false,
             max_layers: 16,
@@ -705,6 +708,7 @@ impl OpenXrContext {
             session_running: Arc::new(AtomicBool::new(false)),
             supports_cylinder,
             desktop_swapchain_is_surface: false,
+            desktop_size: (config.stream_width, config.stream_height),
             supports_layer_settings: available_exts.fb_composition_layer_settings,
             supports_alpha_blend,
             max_layers,
@@ -825,6 +829,7 @@ impl OpenXrContext {
 
         self.desktop_swapchain = desktop_swapchain;
         self.desktop_swapchain_is_surface = desktop_swapchain_is_surface;
+        self.desktop_size = (config.stream_width, config.stream_height);
         #[cfg(target_os = "android")]
         {
             self.surface_window = surface_window;
@@ -1004,6 +1009,42 @@ impl OpenXrContext {
         self.extra_screens
             .get(&stream_id)
             .and_then(|s| s.surface_window.as_ref())
+    }
+
+    /// Pixel size of the primary screen's swapchain.
+    pub fn desktop_size(&self) -> (u32, u32) {
+        self.desktop_size
+    }
+
+    /// Re-creates the primary screen's surface swapchain at `size`, the size its stream
+    /// decodes to. The compositor reads a surface swapchain's image rect in the decoded
+    /// buffer's pixels, so a 1080p swapchain fed 4K frames shows only their top-left quarter.
+    /// Release the decoder bound to the old surface first. Only a surface swapchain (or a
+    /// simulated context) is resized; a regular one keeps its size.
+    pub fn resize_desktop_surface(&mut self, size: (u32, u32)) -> ClientResult<()> {
+        if size == self.desktop_size {
+            return Ok(());
+        }
+        if self.is_simulated {
+            self.desktop_size = size;
+            return Ok(());
+        }
+        #[cfg(target_os = "android")]
+        if self.desktop_swapchain_is_surface {
+            let session = self
+                .session
+                .clone()
+                .ok_or_else(|| ClientError::OpenXr("Session not initialized".into()))?;
+            let pfn = self.android_surface_pfn.ok_or_else(|| {
+                ClientError::OpenXr("XR_KHR_android_surface_swapchain is not available".into())
+            })?;
+            let (swapchain, window) =
+                self.create_surface_swapchain(&session, pfn, size.0, size.1)?;
+            self.surface_window = Some(window);
+            self.desktop_swapchain = Some(swapchain);
+            self.desktop_size = size;
+        }
+        Ok(())
     }
 
     /// Whether stream `stream_id` has its own screen.
@@ -1291,8 +1332,7 @@ impl OpenXrContext {
             return Ok(());
         }
 
-        let stream_width = config.stream_width;
-        let stream_height = config.stream_height;
+        let (stream_width, stream_height) = self.desktop_size;
 
         if let (Some(space), Some(desktop_sc)) = (&self.stage_space, &mut self.desktop_swapchain) {
             // Under XR_KHR_android_surface_swapchain, AMediaCodec is the producer.

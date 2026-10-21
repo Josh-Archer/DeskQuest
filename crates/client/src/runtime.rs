@@ -36,6 +36,8 @@ struct ExtraStream {
     transform: ScreenTransform,
     /// After a failed screen or decoder creation, when to try again.
     retry_at: Option<Instant>,
+    /// Whether a decoded frame has been shown on its screen yet (logged once).
+    shown: bool,
 }
 
 /// Where stream `stream_id`'s screen starts, in screens beside the primary: 1 to the right,
@@ -144,16 +146,7 @@ impl QuestClientRuntime {
         let decoder = if swapchains_ready {
             Self::build_decoder(&config, &openxr_context)?
         } else {
-            let placeholder = ClientConfig {
-                force_mock_decoder: true,
-                ..config.clone()
-            };
-            create_decoder(
-                &placeholder,
-                config.stream_width,
-                config.stream_height,
-                None,
-            )?
+            Self::placeholder_decoder(&config)?
         };
 
         let receiver = ClientReceiver::new(&config);
@@ -324,7 +317,13 @@ impl QuestClientRuntime {
                     }
                 }
                 if let Some(frame) = latest {
-                    let _ = decoder.release_output_buffer_at_time(frame.buffer_index, display_ns);
+                    let shown = decoder
+                        .release_output_buffer_at_time(frame.buffer_index, display_ns)
+                        .is_ok();
+                    if shown && !stream.shown {
+                        stream.shown = true;
+                        tracing::info!(stream_id = id, "first decoded frame shown on its screen");
+                    }
                 }
             }
         }
@@ -362,12 +361,54 @@ impl QuestClientRuntime {
             let _ = openxr_context;
             None
         };
+        let (width, height) = openxr_context.desktop_size();
+        create_decoder(config, width, height, surface_ptr)
+    }
+
+    /// A decoder bound to no surface, standing in while the real one cannot exist.
+    fn placeholder_decoder(config: &ClientConfig) -> ClientResult<Box<dyn HardwareVideoDecoder>> {
+        let placeholder = ClientConfig {
+            force_mock_decoder: true,
+            ..config.clone()
+        };
         create_decoder(
-            config,
+            &placeholder,
             config.stream_width,
             config.stream_height,
-            surface_ptr,
+            None,
         )
+    }
+
+    /// Sizes the primary screen to what its stream decodes to: a new surface swapchain and a
+    /// decoder bound to it. The swapchain is made before any video arrives, at the configured
+    /// size, which a 4K desktop does not match.
+    fn resize_primary_screen(&mut self, size: (u32, u32)) {
+        let from = self.openxr_context.desktop_size();
+        // The old decoder renders into the old surface: release it first.
+        match Self::placeholder_decoder(&self.config) {
+            Ok(placeholder) => self.decoder = placeholder,
+            Err(e) => {
+                tracing::warn!(error = ?e, "cannot resize the primary screen");
+                return;
+            }
+        }
+        let resized = self.openxr_context.resize_desktop_surface(size);
+        if let Err(e) = &resized {
+            tracing::warn!(error = ?e, "could not resize the primary screen; keeping its size");
+        }
+        match Self::build_decoder(&self.config, &self.openxr_context) {
+            Ok(decoder) => {
+                self.decoder = decoder;
+                if resized.is_ok() {
+                    tracing::info!(
+                        from = ?from,
+                        to = ?self.openxr_context.desktop_size(),
+                        "primary screen sized to its stream"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(error = ?e, "no decoder for the primary screen"),
+        }
     }
 
     /// Whether the swapchains (and the decoder bound to their surface) exist.
@@ -508,25 +549,28 @@ impl QuestClientRuntime {
             self.interaction_state_machine.state(),
             InteractionState::Grabbing(_)
         );
+        // A hand or controller that stops pointing (put down, out of view, lost tracking) must
+        // be reported as such: otherwise the hover or grab it started never ends, and no other
+        // input can take over. Picking up the controllers after a hand hovered did exactly that.
+        let stopped_pointing = |source| InteractionInput {
+            source,
+            aim_ray: None,
+            grab_pose: None,
+            is_grabbing: false,
+            is_selecting: false,
+            thumbstick: (0.0, 0.0),
+        };
         let selected_input = match active_source {
-            // The grabbing hand or controller lost tracking (no ray, no pose): treat that as a
-            // release. Otherwise the grab would never see one and would stick forever.
-            Some(src) if grabbing => {
-                pointing
-                    .iter()
-                    .find(|inp| inp.source == src)
-                    .cloned()
-                    .or(Some(InteractionInput {
-                        source: src,
-                        aim_ray: None,
-                        grab_pose: None,
-                        is_grabbing: false,
-                        is_selecting: false,
-                        thumbstick: (0.0, 0.0),
-                    }))
-            }
+            // For a grab, that is a release.
+            Some(src) if grabbing => pointing
+                .iter()
+                .find(|inp| inp.source == src)
+                .copied()
+                .or(Some(stopped_pointing(src))),
+            // For a hover, it ends it, so the next frame picks whatever points now.
             Some(src) => squeezing_on_screen
-                .or_else(|| pointing.iter().find(|inp| inp.source == src).copied()),
+                .or_else(|| pointing.iter().find(|inp| inp.source == src).copied())
+                .or(Some(stopped_pointing(src))),
             None => squeezing_on_screen.or_else(|| {
                 pointing
                     .iter()
@@ -678,6 +722,14 @@ impl QuestClientRuntime {
                 {
                     continue;
                 }
+                let size = (frame.meta.width, frame.meta.height);
+                if frame.meta.is_keyframe
+                    && size.0 > 0
+                    && size.1 > 0
+                    && size != self.openxr_context.desktop_size()
+                {
+                    self.resize_primary_screen(size);
+                }
                 if let Err(e) = self.decoder.queue_input_buffer(
                     &frame.bitstream,
                     frame.meta.pts_us,
@@ -793,6 +845,7 @@ impl QuestClientRuntime {
                             .cloned()
                             .unwrap_or_else(|| primary.beside(extra_screen_slot(stream_id))),
                         retry_at: None,
+                        shown: false,
                     }
                 })
                 .receiver
@@ -1381,6 +1434,89 @@ mod tests {
             ),
             "{:?}",
             runtime.interaction_state()
+        );
+    }
+
+    #[test]
+    fn a_hover_ends_when_its_hand_stops_pointing_so_a_controller_can_take_over() {
+        use crate::openxr::{MockHandTrackingBackend, MockInteractionBackend};
+        use crate::spatial::{ControllerInputState, InteractionSource, Quat, ScreenPose};
+        let mut runtime = QuestClientRuntime::new(ClientConfig::default()).unwrap();
+        let at_screen = Vec3::new(0.0, runtime.screen_transform().position.y, -0.4);
+
+        // The left hand points at the screen first, as when putting the headset on.
+        let mut hands = MockHandTrackingBackend::new(true);
+        hands.simulate_open_hand(Handedness::Left, at_screen, Vec3::new(0.0, 0.0, -1.0));
+        runtime
+            .openxr_context_mut()
+            .set_hand_tracking_backend(Box::new(hands));
+        runtime.step_frame().unwrap();
+        assert!(matches!(
+            runtime.interaction_state(),
+            InteractionState::Hovering {
+                source: InteractionSource::Hand(Handedness::Left),
+                ..
+            }
+        ));
+
+        // Then the controllers are picked up: the hand is gone, a controller points.
+        runtime
+            .openxr_context_mut()
+            .set_hand_tracking_backend(Box::new(MockHandTrackingBackend::new(true)));
+        let mut controllers = MockInteractionBackend::new();
+        controllers.set_controller_state(
+            Handedness::Right,
+            Some(ControllerInputState {
+                aim_pose: Some(ScreenPose::new(at_screen, Quat::IDENTITY)),
+                grip_pose: Some(ScreenPose::new(at_screen, Quat::IDENTITY)),
+                ..Default::default()
+            }),
+        );
+        runtime
+            .openxr_context_mut()
+            .set_interaction_backend(Box::new(controllers));
+        runtime.step_frame().unwrap();
+        runtime.step_frame().unwrap();
+        assert!(
+            matches!(
+                runtime.interaction_state(),
+                InteractionState::Hovering {
+                    source: InteractionSource::Controller(Handedness::Right),
+                    ..
+                }
+            ),
+            "{:?}",
+            runtime.interaction_state()
+        );
+    }
+
+    #[test]
+    fn the_primary_screen_takes_its_streams_size() {
+        let mut runtime = QuestClientRuntime::new(ClientConfig::default()).unwrap();
+        assert_eq!(runtime.openxr_context().desktop_size(), (1920, 1080));
+        let arrival = Instant::now();
+        let mut packet = video_packet(0, 1, true);
+        let mut chunk = VideoChunk::deserialize(&packet.payload).unwrap();
+        chunk.meta.width = 3840;
+        chunk.meta.height = 2160;
+        let bytes = chunk.serialize().unwrap();
+        packet.header = linux_quest_protocol::packet::PacketHeader::new(
+            packet.header.packet_type,
+            0,
+            1,
+            16_666,
+            &bytes,
+        );
+        packet.payload = bytes;
+        runtime.ingest_packet(packet, arrival);
+        runtime
+            .step_frame_at(arrival + Duration::from_millis(10))
+            .unwrap();
+        assert_eq!(runtime.openxr_context().desktop_size(), (3840, 2160));
+        assert_eq!(
+            runtime.decoder_stats().frames_queued,
+            1,
+            "the keyframe goes to the new decoder"
         );
     }
 }
