@@ -162,7 +162,7 @@ impl LinkTracker {
 }
 
 impl LinkTracker {
-    /// Destination selected for video at `now`; loopback selects the negotiated USB tunnel.
+    /// Destination selected for video at `now`; unspecified selects the negotiated USB tunnel.
     ///
     /// Video flows to a peer whose last activity, control or input keepalive, is
     /// within the liveness timeout. When the headset goes silent this returns `None` after
@@ -178,7 +178,9 @@ impl LinkTracker {
             return None;
         }
         match status.transport {
-            Some(LinkTransport::UsbAdb) => Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            // Unspecified is an internal route marker consumed by HybridSink. Real destinations
+            // on 127.0.0.0/8 remain regular UDP destinations.
+            Some(LinkTransport::UsbAdb) => Some(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
             Some(LinkTransport::Wifi) => status.peer.map(|peer| peer.ip().to_canonical()),
             None => None,
         }
@@ -428,8 +430,8 @@ mod tests {
         let now = Instant::now();
         assert_eq!(
             usb_tracker(now).video_peer(now),
-            Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
-            "the USB tunnel is represented by a loopback destination"
+            Some(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            "the USB tunnel uses the explicit sink route marker"
         );
 
         let mut t = LinkTracker::new(LIVENESS);

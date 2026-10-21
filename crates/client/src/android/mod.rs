@@ -29,6 +29,19 @@ pub(crate) fn activity_jobject() -> *mut std::ffi::c_void {
 
 use std::net::{IpAddr, SocketAddr};
 
+/// Terminates the cloned per-connection input writer before its source can be reused by a new
+/// connection. Shutting down both socket directions wakes a writer blocked in socket I/O.
+#[cfg(any(target_os = "android", test))]
+fn shutdown_tcp_input_writer(
+    stream: &std::net::TcpStream,
+    writer: Option<std::thread::JoinHandle<()>>,
+) {
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    if let Some(writer) = writer {
+        let _ = writer.join();
+    }
+}
+
 use crate::config::{ClientConfig, TransportMode};
 use crate::input_sender::{
     input_sender_config, CombinedInputSource, InputSenderThread, KeyframeRequestFlags,
@@ -566,7 +579,23 @@ fn launch_config() -> (ClientConfig, bool) {
 /// takes priority over LAN discovery.
 #[cfg(target_os = "android")]
 fn usb_tunnel_present(config: &ClientConfig) -> bool {
-    std::net::TcpStream::connect_timeout(&config.host_addr, Duration::from_millis(300)).is_ok()
+    use std::io::{Read, Write};
+    let Ok(mut stream) =
+        std::net::TcpStream::connect_timeout(&config.host_addr, Duration::from_millis(300))
+    else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
+    if stream
+        .write_all(linux_quest_transport::USB_TUNNEL_HELLO)
+        .is_err()
+    {
+        return false;
+    }
+    let mut response = [0u8; linux_quest_transport::USB_TUNNEL_ACCEPT.len()];
+    stream.read_exact(&mut response).is_ok()
+        && response == *linux_quest_transport::USB_TUNNEL_ACCEPT
 }
 
 /// Finds a host over mDNS and points `config` at it. Blocks for at most a few seconds. The
@@ -749,11 +778,12 @@ pub fn android_main(app: AndroidApp) {
                         std::thread::sleep(Duration::from_millis(500));
                         continue;
                     }
+                    let mut input_writer = None;
                     if let Some((source, _, _, _)) = &tcp_input_source {
                         if let Ok(writer_stream) = stream.try_clone() {
                             let writer_source = source.clone();
                             let writer_running = bg_running.clone();
-                            std::thread::spawn(move || {
+                            input_writer = Some(std::thread::spawn(move || {
                                 use crate::input_sender::InputSource;
                                 let mut writer_stream = writer_stream;
                                 let mut sequence = 0u32;
@@ -809,7 +839,7 @@ pub fn android_main(app: AndroidApp) {
                                     }
                                     std::thread::sleep(Duration::from_millis(4));
                                 }
-                            });
+                            }));
                         }
                     }
 
@@ -879,6 +909,9 @@ pub fn android_main(app: AndroidApp) {
                             }
                         }
                     }
+                    // Closing both directions wakes the cloned writer socket immediately, so it
+                    // cannot keep sending keepalives or consume events after reconnect.
+                    shutdown_tcp_input_writer(&stream, input_writer);
                 }
             }
             crate::config::TransportMode::Udp => {
@@ -1111,6 +1144,28 @@ pub fn simulated_android_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_shutdown_joins_the_previous_input_writer() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let writer_stream = stream.try_clone().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut writer_stream = writer_stream;
+            started_tx.send(()).unwrap();
+            while writer_stream.write_all(b"keepalive").is_ok() {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        shutdown_tcp_input_writer(&stream, Some(writer));
+        drop(peer);
+    }
 
     #[test]
     fn udp_filter_uses_host_ip_only_in_udp_mode() {

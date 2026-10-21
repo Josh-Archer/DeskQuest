@@ -40,7 +40,7 @@ pub trait DatagramSink: Send + 'static {
 }
 
 /// Keeps the existing UDP path and sends datagrams over an active negotiated USB tunnel when
-/// the link tracker selects its loopback peer.
+/// the link tracker selects the unspecified-address USB route marker.
 pub struct HybridSink {
     udp: UdpSink,
     tunnel: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
@@ -61,7 +61,7 @@ impl HybridSink {
 
 impl DatagramSink for HybridSink {
     fn send(&mut self, datagram: &[u8], dest: SocketAddr) -> io::Result<()> {
-        if dest.ip().is_loopback() {
+        if dest.ip().is_unspecified() {
             return self
                 .tunnel
                 .as_ref()
@@ -200,5 +200,26 @@ mod tests {
         let (n, _) = rx.recv_from(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"mapped");
         assert!(sink.v6.is_none(), "no IPv6 socket needed");
+    }
+
+    #[test]
+    fn hybrid_sink_routes_only_the_explicit_usb_marker_to_tunnel() {
+        let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let (tx, mut tunnel) = tokio::sync::broadcast::channel(4);
+        let mut sink = HybridSink::new(Some(tx), 65536, Dscp::Off).unwrap();
+        sink.send(b"loopback udp", rx.local_addr().unwrap())
+            .unwrap();
+        let mut bytes = [0u8; 32];
+        let (n, _) = rx.recv_from(&mut bytes).unwrap();
+        assert_eq!(&bytes[..n], b"loopback udp");
+
+        sink.send(
+            b"usb",
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 48440),
+        )
+        .unwrap();
+        assert_eq!(&*tunnel.try_recv().unwrap(), b"usb");
     }
 }

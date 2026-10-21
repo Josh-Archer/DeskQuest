@@ -366,9 +366,17 @@ async fn start_stream_services(
         std::net::SocketAddr::from(([0, 0, 0, 0], linux_quest_transport::DEFAULT_CONTROL_PORT));
     match HostClipboardService::bind_auto(control_bind_addr).await {
         Ok(clipboard_service) => {
+            let usb_keyframes = keyframe_requests.clone();
             let mut clipboard_service = clipboard_service
                 .with_link_tracker(link)
-                .with_tunnel_video(tunnel_video);
+                .with_tunnel_video(tunnel_video)
+                .with_tunnel_keyframe_request(Arc::new(move || {
+                    for stream_id in
+                        0..linux_quest_host::video_sender::KeyframeRequests::MAX_STREAMS
+                    {
+                        let _ = usb_keyframes.request(stream_id);
+                    }
+                }));
             if let Some(handler) = usb_packet_handler {
                 clipboard_service = clipboard_service.with_tunnel_packet_handler(handler);
             }

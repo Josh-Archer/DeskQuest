@@ -7,6 +7,7 @@
 //! formats from being confused on the same TCP stream.
 
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -15,6 +16,8 @@ use crate::control::{ControlMessage, MAX_CONTROL_MESSAGE_SIZE};
 pub const USB_TUNNEL_HELLO: &[u8; 8] = b"LQUSB\0\x01\n";
 pub const USB_TUNNEL_ACCEPT: &[u8; 8] = b"LQOK\0\x01\n\0";
 pub const MAX_TUNNEL_FRAME_SIZE: usize = 16 * 1024 * 1024;
+/// A peer must complete the protocol greeting promptly after connecting.
+pub const TUNNEL_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TunnelFrame {
@@ -41,16 +44,20 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    writer.write_all(USB_TUNNEL_HELLO).await?;
-    writer.flush().await?;
-    let mut response = [0; USB_TUNNEL_ACCEPT.len()];
-    reader.read_exact(&mut response).await?;
-    if &response != USB_TUNNEL_ACCEPT {
-        return Err(TunnelError::Negotiation(
-            "daemon rejected or misversioned tunnel",
-        ));
-    }
-    Ok(())
+    tokio::time::timeout(TUNNEL_NEGOTIATION_TIMEOUT, async {
+        writer.write_all(USB_TUNNEL_HELLO).await?;
+        writer.flush().await?;
+        let mut response = [0; USB_TUNNEL_ACCEPT.len()];
+        reader.read_exact(&mut response).await?;
+        if &response != USB_TUNNEL_ACCEPT {
+            return Err(TunnelError::Negotiation(
+                "daemon rejected or misversioned tunnel",
+            ));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| TunnelError::Negotiation("client negotiation timed out"))?
 }
 
 /// Performs the daemon half of protocol negotiation.
@@ -59,16 +66,20 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut hello = [0; USB_TUNNEL_HELLO.len()];
-    reader.read_exact(&mut hello).await?;
-    if &hello != USB_TUNNEL_HELLO {
-        return Err(TunnelError::Negotiation(
-            "unsupported client tunnel protocol",
-        ));
-    }
-    writer.write_all(USB_TUNNEL_ACCEPT).await?;
-    writer.flush().await?;
-    Ok(())
+    tokio::time::timeout(TUNNEL_NEGOTIATION_TIMEOUT, async {
+        let mut hello = [0; USB_TUNNEL_HELLO.len()];
+        reader.read_exact(&mut hello).await?;
+        if &hello != USB_TUNNEL_HELLO {
+            return Err(TunnelError::Negotiation(
+                "unsupported client tunnel protocol",
+            ));
+        }
+        writer.write_all(USB_TUNNEL_ACCEPT).await?;
+        writer.flush().await?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| TunnelError::Negotiation("server negotiation timed out"))?
 }
 
 /// Writes one typed tunnel frame.
@@ -97,7 +108,26 @@ pub async fn recv_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<TunnelFr
     if len > max {
         return Err(TunnelError::FrameTooLarge(len));
     }
+    // Reject untrusted lengths before allocating the body buffer.
     let mut body = vec![0; len];
     reader.read_exact(&mut body).await?;
     bincode::deserialize(&body).map_err(|e| TunnelError::Serialization(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn recv_frame_rejects_oversized_length_before_body_arrives() {
+        let (mut writer, mut reader) = duplex(8);
+        writer
+            .write_all(&((MAX_TUNNEL_FRAME_SIZE as u32) + 1).to_be_bytes())
+            .await
+            .unwrap();
+        assert!(
+            matches!(recv_frame(&mut reader).await, Err(TunnelError::FrameTooLarge(n)) if n == MAX_TUNNEL_FRAME_SIZE + 1)
+        );
+    }
 }
