@@ -110,6 +110,11 @@ pub trait DisplayCapture: Send + Sync {
 }
 
 /// Deterministic synthetic screen generator for integration tests and headless benchmarking.
+///
+/// Every display gets its own look, so several streams can be told apart on the headset: the
+/// colour cycles through a hue chosen by the display id, and displays other than 0 also carry a
+/// white bar sweeping across the picture, which makes motion and latency visible even when the
+/// colour changes slowly. Display 0 is the plain cycling colour, as it always was.
 pub struct SyntheticCapture {
     display_id: u16,
     width: u32,
@@ -161,7 +166,10 @@ impl DisplayCapture for SyntheticCapture {
         // Solid colour that cycles every 256 frames (BGRA). `repeat` is a block copy; a
         // per-byte loop over a 1080p frame cost more than a frame interval in debug builds.
         let offset = (self.frame_counter % 256) as u8;
-        let buffer = [255 - offset, 128, offset, 255].repeat(frame_size / 4);
+        let mut buffer = synthetic_pixel(self.display_id, offset).repeat(frame_size / 4);
+        if self.display_id != 0 {
+            draw_sweep_bar(&mut buffer, self.width, self.height, self.frame_counter);
+        }
 
         let interval_us = 1_000_000 / (self.fps as u64).max(1);
         let pts_us = self.frame_counter * interval_us;
@@ -191,6 +199,36 @@ impl DisplayCapture for SyntheticCapture {
             dmabuf: false,
             modifier: None,
         })
+    }
+}
+
+/// One BGRA pixel of the cycling background for `display_id` at colour phase `offset`.
+///
+/// Display 0 keeps the original blue-to-red cycle with green fixed at 128. Display 1 holds blue
+/// at 128 and cycles green against red; display 2 holds red at 128 and cycles blue against
+/// green. At any phase the three pixels differ.
+fn synthetic_pixel(display_id: u16, offset: u8) -> [u8; 4] {
+    let (rising, falling, fixed) = (offset, 255 - offset, 128);
+    match display_id % 3 {
+        0 => [falling, fixed, rising, 255],
+        1 => [fixed, rising, falling, 255],
+        _ => [rising, falling, fixed, 255],
+    }
+}
+
+/// Frames a sweep bar takes to cross the picture.
+const SWEEP_PERIOD_FRAMES: u64 = 120;
+
+/// Paints a white bar one sixteenth of the width wide, at a position that advances with
+/// `frame_counter` and wraps every [`SWEEP_PERIOD_FRAMES`] frames (2 s at 60 fps).
+fn draw_sweep_bar(buffer: &mut [u8], width: u32, height: u32, frame_counter: u64) {
+    let bar_width = (width / 16).max(1) as usize;
+    let travel = (width as usize).saturating_sub(bar_width);
+    let x = travel * (frame_counter % SWEEP_PERIOD_FRAMES) as usize / SWEEP_PERIOD_FRAMES as usize;
+    let stride = width as usize * 4;
+    for row in 0..height as usize {
+        let start = row * stride + x * 4;
+        buffer[start..start + bar_width * 4].fill(255);
     }
 }
 
@@ -296,6 +334,80 @@ mod tests {
             .await
             .expect("Failed to capture frame 2");
         assert!(frame2.pts_us > frame1.pts_us);
+    }
+
+    /// Capture one frame of display `id` after `frames_before` earlier ones.
+    async fn nth_frame(id: u16, width: u32, height: u32, frames_before: usize) -> RawFrame {
+        let mut capture = SyntheticCapture::new(id, width, height, 1000);
+        capture.init().await.unwrap();
+        for _ in 0..frames_before {
+            capture.capture_frame().await.unwrap();
+        }
+        capture.capture_frame().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn synthetic_displays_are_tinted_differently() {
+        let frames = [
+            nth_frame(0, 64, 32, 0).await,
+            nth_frame(1, 64, 32, 0).await,
+            nth_frame(2, 64, 32, 0).await,
+        ];
+        for (i, frame) in frames.iter().enumerate() {
+            assert_eq!(frame.display_id, i as u16, "frames carry the display id");
+            assert_eq!(frame.data.len(), 64 * 32 * 4);
+        }
+        // Compare a pixel far from the sweep bar, which starts at the left edge.
+        let corner = |f: &RawFrame| {
+            let at = (31 * 64 + 48) * 4;
+            f.data[at..at + 4].to_vec()
+        };
+        let (c0, c1, c2) = (corner(&frames[0]), corner(&frames[1]), corner(&frames[2]));
+        assert_ne!(c0, c1);
+        assert_ne!(c0, c2);
+        assert_ne!(c1, c2);
+    }
+
+    #[tokio::test]
+    async fn display_zero_is_the_unchanged_cycling_colour() {
+        // Frame n has offset n % 256; display 0 stays BGRA = (255 - offset, 128, offset, 255)
+        // over the whole picture, with no bar.
+        let frame = nth_frame(0, 64, 32, 4).await;
+        let offset = 5u8;
+        assert_eq!(
+            frame.data[..],
+            [255 - offset, 128, offset, 255].repeat(64 * 32)[..]
+        );
+    }
+
+    #[tokio::test]
+    async fn extra_displays_carry_a_bar_that_moves_each_frame() {
+        let first = nth_frame(1, 320, 64, 0).await;
+        let second = nth_frame(1, 320, 64, 30).await;
+        // The bar is white; the cycling background never has all three channels at 255.
+        let white_columns = |f: &RawFrame| -> Vec<usize> {
+            (0..320usize)
+                .filter(|x| f.data[x * 4..x * 4 + 4] == [255, 255, 255, 255])
+                .collect()
+        };
+        let (a, b) = (white_columns(&first), white_columns(&second));
+        assert_eq!(a.len(), 320 / 16, "bar is a sixteenth of the width");
+        assert_eq!(b.len(), 320 / 16);
+        assert!(b[0] > a[0], "the bar moves right: {a:?} -> {b:?}");
+        // Every row carries the bar, so it is a vertical stripe.
+        let last_row = 63 * 320 * 4;
+        assert_eq!(
+            first.data[last_row + a[0] * 4..last_row + a[0] * 4 + 4],
+            [255, 255, 255, 255]
+        );
+    }
+
+    #[tokio::test]
+    async fn synthetic_bar_stays_inside_tiny_pictures() {
+        for width in [2u32, 6, 17, 100] {
+            let frame = nth_frame(2, width, 4, 7).await;
+            assert_eq!(frame.data.len(), (width * 4 * 4) as usize);
+        }
     }
 
     #[test]

@@ -137,6 +137,8 @@ It needs a StatusNotifierItem host (KDE Plasma, GNOME with the AppIndicator exte
 - **Virtual Mouse:** Relative movement (`REL_X`, `REL_Y`), discrete & high-resolution scrolling (`REL_WHEEL`, `REL_HWHEEL`, `REL_WHEEL_HI_RES`, `REL_HWHEEL_HI_RES`), and mouse buttons (`BTN_LEFT`, `BTN_RIGHT`, `BTN_MIDDLE`, `BTN_SIDE`, `BTN_EXTRA`).
 - **Virtual Absolute Pointer:** Absolute coordinate positioning (`ABS_X`, `ABS_Y`) and pointer buttons for spatial ray pointing.
 - **Virtual Keyboard:** Full evdev keycodes with autorepeat support and automatic held key/button release on client disconnect or drop.
+- **Committed text:** Horizon soft keyboard (toggle with `Super+K`) and IME commits carry UTF-8 text; install `wtype` on Wayland or `xdotool` on X11 to inject non-ASCII commits.
+- **Keyboard focus:** `Ctrl+Alt+Escape` hides the Horizon keyboard and returns focus to the headset UI. Set Android property `debug.linuxquest.keyboard_escape_chord` (or `LINUX_QUEST_KEYBOARD_ESCAPE_CHORD` when available) to a chord such as `META+BACK` to change it. Alt+Tab and Ctrl+Alt+F1 through F12 are left to Horizon OS when it exposes them to the app.
 
 ### Permissions & Udev Configuration
 To allow `linux-quest-host` to create virtual devices without running as `root`:
