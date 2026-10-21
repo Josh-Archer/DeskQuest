@@ -7,6 +7,53 @@ use linux_quest_protocol::{ElementState, InputEvent, MouseButton};
 
 use crate::{InputBackend, InputError, InputInjector};
 
+/// Injects an IME commit using a compositor-aware text tool. The argument is passed directly to
+/// the child process (never interpreted by a shell), so punctuation and Unicode stay intact.
+pub(crate) fn inject_committed_text(text: &str) -> Result<(), InputError> {
+    if text.is_empty() {
+        return Ok(());
+    }
+
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let x11 = std::env::var_os("DISPLAY").is_some();
+    let (program, args) = committed_text_command(wayland, x11, text).ok_or_else(|| {
+        InputError::EmitFailed("text input requires wtype on Wayland or xdotool on X11".into())
+    })?;
+
+    let output = Command::new(program)
+        .args(&args)
+        .output()
+        .map_err(|e| InputError::EmitFailed(format!("cannot run {program}: {e}")))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(InputError::EmitFailed(format!(
+            "{program} text injection failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+}
+
+fn committed_text_command(
+    wayland: bool,
+    x11: bool,
+    text: &str,
+) -> Option<(&'static str, Vec<String>)> {
+    if wayland {
+        Some(("wtype", vec![text.to_owned()]))
+    } else if x11 {
+        Some((
+            "xdotool",
+            ["type", "--clearmodifiers", "--delay", "0", "--", text]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        ))
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
     Portal,
@@ -129,6 +176,7 @@ impl InputInjector for XTestInjector {
                 };
                 self.run(&[command, &format!("keycode:{x_keycode}")])
             }
+            InputEvent::TextCommit { text } => inject_committed_text(&text),
             InputEvent::ClipboardSync { .. }
             | InputEvent::KeyframeRequest
             | InputEvent::KeyframeRequestFor { .. } => Ok(()),
@@ -193,5 +241,28 @@ mod tests {
     fn backend_names_are_suitable_for_diagnostics() {
         assert_eq!(BackendKind::XTest.name(), "X11 XTEST");
         assert_eq!(BackendKind::Portal.name(), "RemoteDesktop portal (libei)");
+    }
+
+    #[test]
+    fn committed_text_uses_platform_tool_and_preserves_utf8_as_an_argument() {
+        assert_eq!(
+            committed_text_command(true, false, "naïve 東京"),
+            Some(("wtype", vec!["naïve 東京".to_owned()]))
+        );
+        assert_eq!(
+            committed_text_command(false, true, "a;b $(literal)"),
+            Some((
+                "xdotool",
+                vec![
+                    "type".into(),
+                    "--clearmodifiers".into(),
+                    "--delay".into(),
+                    "0".into(),
+                    "--".into(),
+                    "a;b $(literal)".into(),
+                ]
+            ))
+        );
+        assert_eq!(committed_text_command(false, false, "text"), None);
     }
 }

@@ -3,7 +3,6 @@
 //! The client sends [`InputBatch`](linux_quest_protocol::InputBatch) datagrams to the host's
 //! input port (UDP `48442`, [`DEFAULT_INPUT_PORT`]) using the existing
 //! [`InputChannelSender`] encoder, which owns sequence numbers and the redundant key history.
-//! The wire format and the host are unchanged.
 //!
 //! # Why this exists
 //!
@@ -137,6 +136,59 @@ impl InputSource for PointerInputSource {
     }
 }
 
+/// Sender source combining queued keyboard/IME events with XR pointer events, plus
+/// per-stream keyframe requests.
+///
+/// [`KeyframeRequestSource`] drains the keyboard [`InputEventQueue`] with per-stream flags,
+/// while [`PointerInputSource`] drains the pointer [`SharedInputEvents`] with per-stream
+/// flags; the runtime needs one sender carrying everything, so this source drains both
+/// queues (keyboard first, then pointer) plus the raised streams' keyframe requests.
+pub struct CombinedInputSource {
+    keyboard: InputEventQueue,
+    pointer: SharedInputEvents,
+    keyframe: KeyframeRequestFlags,
+}
+
+impl CombinedInputSource {
+    pub fn new() -> Self {
+        Self {
+            keyboard: InputEventQueue::default(),
+            pointer: SharedInputEvents::default(),
+            keyframe: KeyframeRequestFlags::default(),
+        }
+    }
+
+    /// The flags to raise when a stream needs a keyframe.
+    pub fn requester(&self) -> KeyframeRequestFlags {
+        self.keyframe.clone()
+    }
+
+    /// Queue for native Android keyboard/IME events to be forwarded by this sender.
+    pub fn keyboard_queue(&self) -> InputEventQueue {
+        self.keyboard.clone()
+    }
+
+    /// Queue for XR pointer events to be forwarded by this sender.
+    pub fn pointer_events(&self) -> SharedInputEvents {
+        self.pointer.clone()
+    }
+}
+
+impl Default for CombinedInputSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InputSource for CombinedInputSource {
+    fn poll(&mut self) -> Vec<InputEvent> {
+        let mut events = self.keyboard.drain();
+        events.extend(self.pointer.drain());
+        events.extend(self.keyframe.take_events());
+        events
+    }
+}
+
 /// Supplies input state to the sender. Implemented by the Android runtime.
 pub trait InputSource: Send {
     /// Returns the events produced since the last call (empty when nothing changed). Called
@@ -192,31 +244,110 @@ impl KeyframeRequestFlags {
     }
 }
 
-/// An [`InputSource`] that only emits keepalives, plus a keyframe request for each stream
-/// raised on [`KeyframeRequestSource::requester`]'s flags (then call
-/// [`InputSenderControl::notify`] so it goes out at once).
+/// An [`InputSource`] that only emits keepalives, plus queued keyboard events and a
+/// keyframe request for each stream raised on [`KeyframeRequestSource::requester`]'s flags
+/// (then call [`InputSenderControl::notify`] so it goes out at once).
 #[derive(Debug, Default, Clone)]
 pub struct KeyframeRequestSource {
     pending: KeyframeRequestFlags,
+    input: InputEventQueue,
 }
 
 impl KeyframeRequestSource {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            pending: KeyframeRequestFlags::default(),
+            input: InputEventQueue::default(),
+        }
     }
 
     /// The flags to raise when a stream needs a keyframe.
     pub fn requester(&self) -> KeyframeRequestFlags {
         self.pending.clone()
     }
+
+    /// Queue for native Android input events to be forwarded by this sender.
+    pub fn input_queue(&self) -> InputEventQueue {
+        self.input.clone()
+    }
 }
 
 impl InputSource for KeyframeRequestSource {
     fn poll(&mut self) -> Vec<InputEvent> {
-        self.pending.take_events()
+        let mut events = self.input.drain();
+        events.extend(self.pending.take_events());
+        events
     }
     fn needs_polling(&self) -> bool {
         false
+    }
+}
+
+/// Thread-safe bounded queue for events captured on Android's main thread.
+#[derive(Debug, Clone, Default)]
+pub struct InputEventQueue(Arc<parking_lot::Mutex<VecDeque<InputEvent>>>);
+
+impl InputEventQueue {
+    /// Adds an event, discarding the oldest event only if the queue reaches its safety bound.
+    pub fn push(&self, event: InputEvent) {
+        let mut events = self.0.lock();
+        if events.len() >= MAX_PENDING_EVENTS {
+            events.pop_front();
+        }
+        events.push_back(event);
+    }
+
+    fn drain(&self) -> Vec<InputEvent> {
+        self.0.lock().drain(..).collect()
+    }
+}
+
+#[cfg(test)]
+mod live_input_source_tests {
+    use super::*;
+
+    #[test]
+    fn keyframe_source_drains_physical_keys_and_unicode_commits() {
+        let mut source = KeyframeRequestSource::new();
+        let queue = source.input_queue();
+        let key = InputEvent::KeyboardKey {
+            keycode: 30,
+            state: linux_quest_protocol::ElementState::Pressed,
+            modifiers: linux_quest_protocol::KeyModifiers::CTRL
+                | linux_quest_protocol::KeyModifiers::META,
+        };
+        let text = InputEvent::TextCommit {
+            text: "naïve 東京".into(),
+        };
+        queue.push(key.clone());
+        queue.push(text.clone());
+
+        assert_eq!(source.poll(), vec![key, text]);
+        assert!(source.poll().is_empty());
+    }
+
+    #[test]
+    fn combined_source_drains_keyboard_then_pointer_plus_keyframe() {
+        let mut source = CombinedInputSource::new();
+        let key = InputEvent::KeyboardKey {
+            keycode: 30,
+            state: linux_quest_protocol::ElementState::Pressed,
+            modifiers: linux_quest_protocol::KeyModifiers::empty(),
+        };
+        let pointer = InputEvent::MouseMoveRelative { dx: 3, dy: -1 };
+        source.keyboard_queue().push(key.clone());
+        source.pointer_events().push(pointer.clone());
+        source.requester().raise(1);
+
+        assert_eq!(
+            source.poll(),
+            vec![
+                key,
+                pointer,
+                InputEvent::KeyframeRequestFor { stream_id: 1 }
+            ]
+        );
+        assert!(source.poll().is_empty());
     }
 }
 
