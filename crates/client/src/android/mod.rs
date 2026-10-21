@@ -813,6 +813,7 @@ pub fn android_main(app: AndroidApp) {
                         }
                     }
 
+                    let mut temp_buf = [0u8; 16384];
                     let mut read_buf = Vec::with_capacity(65536);
                     while bg_running.load(std::sync::atomic::Ordering::Relaxed) {
                         match stream.read(&mut temp_buf) {
