@@ -20,6 +20,7 @@ pub mod input_receiver;
 pub mod ipc;
 pub mod link_status;
 pub mod multi_display;
+pub mod service;
 pub mod session_registry;
 pub mod tray;
 pub mod tui;

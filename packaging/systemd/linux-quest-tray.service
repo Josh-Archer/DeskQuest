@@ -1,0 +1,19 @@
+[Unit]
+Description=Linux Quest host tray icon
+Documentation=https://github.com/Josh-Archer/linux-quest
+PartOf=graphical-session.target
+# Only orders the start; it does not start the daemon. The tray copes with the daemon being down.
+After=graphical-session.target linux-quest-host.service
+
+[Service]
+Type=simple
+# Adjust this path if the binary is installed elsewhere (`linux-quest-host service install --tray`
+# writes the path of the binary it is run from).
+ExecStart=/usr/bin/linux-quest-host tray
+# systemd user services do not inherit your shell's TERMINAL. Set one for "Open dashboard":
+# Environment=TERMINAL=kitty
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

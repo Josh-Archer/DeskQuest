@@ -12,6 +12,7 @@ use linux_quest_host::congestion::RateCoordinator;
 use linux_quest_host::link_status::{
     new_shared_link_tracker, SharedLinkTracker, DEFAULT_INPUT_LIVENESS,
 };
+use linux_quest_host::service;
 use linux_quest_host::tui::{
     run_dashboard_with_source, IpcTelemetrySource, LiveDaemonTelemetrySource, MockTelemetrySource,
 };
@@ -55,6 +56,46 @@ enum Commands {
     /// Show a system tray icon with connection status and service controls
     /// (requires a build with `--features tray`)
     Tray(TrayArgs),
+
+    /// Install or remove the systemd user service that runs the daemon at login and restarts
+    /// it if it fails
+    Service(ServiceArgs),
+}
+
+#[derive(Args, Debug)]
+struct ServiceArgs {
+    #[command(subcommand)]
+    action: ServiceCommands,
+}
+
+#[derive(Subcommand, Debug)]
+enum ServiceCommands {
+    /// Write ~/.config/systemd/user/linux-quest-host.service for this binary and reload
+    /// systemd. Daemon options go after `--`: `service install --enable -- --streams 3`
+    Install(ServiceInstallArgs),
+    /// Print the unit files `install` would write, without writing them
+    Print(ServiceInstallArgs),
+    /// Disable and stop the services, and remove their unit files
+    Uninstall,
+}
+
+#[derive(Args, Debug, Default)]
+struct ServiceInstallArgs {
+    /// Also install linux-quest-tray.service for the tray icon
+    #[arg(long)]
+    tray: bool,
+    /// Enable the units, so they start with every graphical login
+    #[arg(long)]
+    enable: bool,
+    /// Start (or restart) the units now
+    #[arg(long)]
+    start: bool,
+    /// Replace unit files that already exist with different contents
+    #[arg(long)]
+    force: bool,
+    /// Options for `linux-quest-host daemon`, after `--`
+    #[arg(last = true, value_name = "DAEMON_OPTIONS")]
+    daemon_args: Vec<String>,
 }
 
 #[derive(Args, Debug, Default)]
@@ -262,6 +303,136 @@ async fn log_stream_plan(preference: BackendPreference) {
              software mock, which produces no real video",
             preference
         ),
+    }
+}
+
+/// The absolute path of this binary, for `ExecStart`. After a package upgrade Linux reports
+/// the replaced file as `<path> (deleted)`; the path itself is what the unit must run.
+fn service_exe() -> Result<std::path::PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("cannot find this binary: {e}"))?;
+    let shown = exe.display().to_string();
+    let exe = match shown.strip_suffix(" (deleted)") {
+        Some(path) => std::path::PathBuf::from(path),
+        None => exe,
+    };
+    linux_quest_host::service::check_exe(&exe)?;
+    Ok(exe)
+}
+
+fn service_install_options(args: ServiceInstallArgs) -> Result<service::InstallOptions, String> {
+    service::check_daemon_args(&args.daemon_args)?;
+    // Catch typos now rather than in a restart loop: the options must parse as `daemon`'s.
+    let argv = ["linux-quest-host", "daemon"]
+        .into_iter()
+        .map(String::from)
+        .chain(args.daemon_args.iter().cloned());
+    if let Err(e) = Cli::try_parse_from(argv) {
+        return Err(format!("the daemon options do not parse:\n{e}"));
+    }
+    Ok(service::InstallOptions {
+        tray: args.tray,
+        enable: args.enable,
+        start: args.start,
+        force: args.force,
+        daemon_args: args.daemon_args,
+    })
+}
+
+/// `true` when the daemon socket answers but the user service is not the one running: a
+/// daemon started by hand holds the PID lock, so starting the service would fail.
+async fn manual_daemon_running() -> bool {
+    let socket_live = tokio::net::UnixStream::connect(daemon_socket_path())
+        .await
+        .is_ok();
+    let service_active = std::process::Command::new("systemctl")
+        .args(["--user", "--quiet", "is-active", service::DAEMON_UNIT])
+        .status()
+        .is_ok_and(|s| s.success());
+    socket_live && !service_active
+}
+
+async fn run_service_command(args: ServiceArgs) -> Result<(), String> {
+    let unit_dir = service::user_unit_dir()
+        .ok_or("cannot find the systemd user unit directory (HOME is not set)")?;
+    match args.action {
+        ServiceCommands::Print(install) => {
+            let exe = service_exe()?;
+            let options = service_install_options(install)?;
+            let plan = service::plan_install(&unit_dir, &exe.display().to_string(), &options);
+            for unit in plan.units {
+                println!("# {}", unit.path.display());
+                print!("{}", unit.contents);
+                println!();
+            }
+            Ok(())
+        }
+        ServiceCommands::Install(install) => {
+            let exe = service_exe()?;
+            let options = service_install_options(install)?;
+            if options.start && manual_daemon_running().await {
+                return Err(format!(
+                    "a daemon started outside systemd is running (socket {}). Stop it first: the \
+                     service would fail on its PID lock. Or install without --start",
+                    daemon_socket_path().display()
+                ));
+            }
+            if let Some(warning) = service::build_dir_warning(&exe) {
+                eprintln!("Note: {warning}");
+            }
+            let plan = service::plan_install(&unit_dir, &exe.display().to_string(), &options);
+            let outcomes =
+                service::apply_install(&plan, options.force, &mut service::SystemctlRunner)?;
+            for (path, outcome) in &outcomes {
+                let what = match outcome {
+                    service::WriteOutcome::Created => "Wrote",
+                    service::WriteOutcome::Updated => "Updated",
+                    service::WriteOutcome::Unchanged => "Unchanged",
+                };
+                println!("{what} {}", path.display());
+            }
+            if let Some(exec) = plan.units[0]
+                .contents
+                .lines()
+                .find(|l| l.starts_with("ExecStart="))
+            {
+                println!("  {exec}");
+            }
+            println!("Reloaded the systemd user manager.");
+            let names: Vec<&str> = plan
+                .units
+                .iter()
+                .map(|u| u.name.trim_end_matches(".service"))
+                .collect();
+            match (options.enable, options.start) {
+                (true, true) => println!("Enabled and started: {}", names.join(", ")),
+                (true, false) => println!(
+                    "Enabled; starts at the next login. Start it now with: systemctl --user start {}",
+                    names.join(" ")
+                ),
+                (false, true) => println!(
+                    "Started, but not enabled for the next login. Enable it with: \
+                     systemctl --user enable {}",
+                    names.join(" ")
+                ),
+                (false, false) => println!(
+                    "Not enabled or started. To start it now and at every login:\n  \
+                     systemctl --user enable --now {}",
+                    names.join(" ")
+                ),
+            }
+            println!("Logs: journalctl --user -u linux-quest-host -f");
+            Ok(())
+        }
+        ServiceCommands::Uninstall => {
+            let removed = service::apply_uninstall(&unit_dir, &mut service::SystemctlRunner)?;
+            if removed.is_empty() {
+                println!("No Linux Quest user units in {}", unit_dir.display());
+            }
+            for path in removed {
+                println!("Removed {}", path.display());
+            }
+            Ok(())
+        }
     }
 }
 
@@ -526,6 +697,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 let source = IpcTelemetrySource;
                 run_dashboard_with_source(source, tick_rate, None).await?;
+            }
+        }
+        Commands::Service(args) => {
+            if let Err(e) = run_service_command(args).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
             }
         }
         Commands::Tray(args) => {
@@ -839,6 +1016,46 @@ mod tests {
         assert_eq!((daemon.streams, daemon.bitrate), (2, 20));
         assert!(daemon.test_pattern);
         assert_eq!(daemon.extra_stream_size.to_string(), "1600x900@72");
+    }
+
+    #[test]
+    fn service_install_takes_daemon_options_after_a_double_dash() {
+        let cli = Cli::try_parse_from([
+            "linux-quest-host",
+            "service",
+            "install",
+            "--tray",
+            "--enable",
+            "--",
+            "--streams",
+            "3",
+        ])
+        .expect("service install parses");
+        let Some(Commands::Service(super::ServiceArgs {
+            action: super::ServiceCommands::Install(args),
+        })) = cli.command
+        else {
+            panic!("expected service install");
+        };
+        assert!(args.tray && args.enable && !args.start && !args.force);
+        assert_eq!(args.daemon_args, ["--streams", "3"]);
+        let options = super::service_install_options(args).expect("valid daemon options");
+        assert_eq!(options.daemon_args, ["--streams", "3"]);
+    }
+
+    #[test]
+    fn service_install_rejects_daemon_options_that_do_not_parse() {
+        let args = super::ServiceInstallArgs {
+            daemon_args: vec!["--streams".into(), "9".into()],
+            ..Default::default()
+        };
+        let err = super::service_install_options(args).unwrap_err();
+        assert!(err.contains("do not parse"), "{err}");
+        let args = super::ServiceInstallArgs {
+            daemon_args: vec!["--tui".into()],
+            ..Default::default()
+        };
+        assert!(super::service_install_options(args).is_err());
     }
 
     #[tokio::test]

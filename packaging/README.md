@@ -45,6 +45,36 @@ Without this the daemon still starts, but input injection falls back to the logg
 
 ## 3. Install and enable the user unit
 
+The daemon runs as a systemd **user** service: it starts with your graphical login, stops when
+you log out, and `Restart=on-failure` brings it back 2 seconds after a crash. A daemon started by
+hand in a terminal does none of that, so a reboot or a crash leaves the headset black.
+
+### With `service install` (any build)
+
+`linux-quest-host service install` writes `~/.config/systemd/user/linux-quest-host.service` with
+`ExecStart` pointing at the binary you run it from, and reloads systemd. Daemon options go after
+`--`. It does not enable or start anything unless asked:
+
+```bash
+linux-quest-host service install -- --streams 3      # write the unit and reload, nothing else
+linux-quest-host service install --enable --start -- --streams 3   # also start it now and at login
+linux-quest-host service install --tray --enable       # also install the tray icon unit
+linux-quest-host service print -- --streams 3        # show what would be written
+linux-quest-host service uninstall                   # disable, stop and remove both units
+```
+
+- Install the binary somewhere stable first (`cargo install --path crates/host --root ~/.local`).
+  A binary in a cargo `target` directory works, but `cargo clean` deletes it and the service then
+  fails to start; `install` prints a note when that is the case.
+- Stop a daemon you started by hand before `--start` (or `systemctl --user start`): it holds the
+  PID lock, so the service would fail. `install --start` refuses while such a daemon runs.
+- `install` refuses to replace a unit file that has different contents (for example other daemon
+  options). Pass `--force` to replace it.
+- The portal screen-share grant is kept in `~/.local/state/linux-quest/screencast-restore-token`,
+  so a service restart does not show GNOME's share dialog again.
+
+### By hand (packages ship the unit in `/usr/lib/systemd/user`)
+
 ```bash
 mkdir -p ~/.config/systemd/user
 cp packaging/systemd/linux-quest-host.service ~/.config/systemd/user/
