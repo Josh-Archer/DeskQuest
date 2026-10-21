@@ -56,7 +56,7 @@ reusing the existing local test keystore allowed `adb install -r` to succeed.
 No app uninstall or data reset was used. `apksigner verify --print-certs` confirmed
 `CN=Android Debug,O=Android,C=US`.
 
-Built artifact SHA-256:
+Initial test artifact SHA-256 (before the later main integration):
 
 ```text
 host 25e51e2e26ab30df71af2f870d20b02a1f0e287a3255be6be6a1a772c85b327d
@@ -175,10 +175,17 @@ and inspect text in the headset. Record any unavailable measurements explicitly.
 - #34 remains open for the exclusive 4K 90 Hz run, optical measurements, text
   inspection and reliability cycles.
 
-Validation: release host and debug-signed release APK builds passed; workspace
-tests **958 passed, 2 ignored**; client library tests **249 passed, 1 ignored**;
+Validation of the initial checkout: release host and debug-signed release APK
+builds passed; workspace tests **958 passed, 2 ignored**; client library tests **249 passed, 1 ignored**;
 strict client Clippy, Rust formatting, ShellCheck and five collector parser tests
-passed. Android compilation retains the pre-existing unused `receiver_ack` warning.
+passed. The initial Android compilation retained the pre-existing unused
+`receiver_ack` warning.
+
+Main advanced during this work. After merging `92567b4` (PR #100), workspace tests
+were rerun: **961 passed, 2 ignored**. Strict client Clippy, Rust formatting and
+the debug-signed release APK build passed again; the inherited unused-handle
+warning is removed on this integrated version. No hardware result is attributed
+to this later build, and it was not installed over the competing session.
 
 No release or deployment was created. No system configuration, headset power
 override or proximity override was changed. The read-only observation left the

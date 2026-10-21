@@ -253,7 +253,8 @@ def main():
     video_status = "NOT VALIDATED: exported counters unavailable"
     if stream:
         video_status = ("OBSERVED" if not stream["counter_reset"] and stream["delta"]["surface_releases"] > 0
-                        and not stream["last"]["simulated"] else "FAIL: no valid live video surface release interval")
+                        and not stream["last"]["simulated"] and result["client_pid_stable"]
+                        and result["apk_bytes_stable"] else "FAIL: no valid live video surface release interval")
     report = [f"# Hardware run: {args.mode}", "", f"UTC: {metadata['utc']}", "",
               "| Measurement | Raw summary |", "| --- | --- |"]
     for key, value in result.items():
