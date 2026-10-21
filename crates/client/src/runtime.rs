@@ -635,47 +635,6 @@ impl QuestClientRuntime {
         });
         let moving =
             matches!(interaction_state, InteractionState::Grabbing(_)) && resizing.is_none();
-        let (bar, corner) = crate::openxr::overlay::window_handles(
-            &self.screen_transform,
-            hover_uv,
-            moving,
-            resizing,
-        );
-        self.overlay_scene.bar = bar;
-        self.overlay_scene.corner = corner;
-
-        let interaction_state = self.interaction_state_machine.state();
-        self.overlay_scene = crate::openxr::overlay::OverlayScene {
-            pointers: pointing
-                .iter()
-                .zip(&hits)
-                .filter_map(|(i, hit)| {
-                    let ray = i.aim_ray.as_ref()?;
-                    Some(crate::openxr::overlay::PointerVisual {
-                        origin: ray.origin,
-                        direction: ray.direction,
-                        length: hit
-                            .as_ref()
-                            .map_or(crate::openxr::overlay::RAY_MISS_LENGTH_M, |h| h.distance),
-                        hit: hit.is_some(),
-                    })
-                })
-                .collect(),
-            bar: None,
-            corner: None,
-        };
-        let hover_uv = match interaction_state {
-            InteractionState::Hovering { hit, .. } => Some(hit.uv),
-            _ => None,
-        };
-        let resizing = self.interaction_state_machine.resizing().map(|c| match c {
-            Corner::TopLeft => (0.0, 0.0),
-            Corner::TopRight => (1.0, 0.0),
-            Corner::BottomLeft => (0.0, 1.0),
-            Corner::BottomRight => (1.0, 1.0),
-        });
-        let moving =
-            matches!(interaction_state, InteractionState::Grabbing(_)) && resizing.is_none();
         let handle_display = match interaction_state {
             InteractionState::Hovering { display_id, .. } => *display_id,
             InteractionState::Grabbing(session) => session.display_id,
