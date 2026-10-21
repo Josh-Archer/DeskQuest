@@ -15,7 +15,10 @@ pub use clipboard::{
     ClipboardSyncEngine, SyncAction, DEFAULT_CLIPBOARD_CHUNK_SIZE, MAX_CLIPBOARD_TEXT_SIZE,
 };
 pub use error::ProtocolError;
-pub use handshake::{ClientHandshake, DisplayConfigMessage, DisplayInfo, ServerHandshake};
+pub use handshake::{
+    ClientHandshake, DisplayConfigMessage, DisplayInfo, ServerHandshake, WindowInfo,
+    WINDOW_STREAM_ID_BASE,
+};
 pub use input::{
     ElementState, InputBatch, InputEvent, KeyModifiers, MouseButton, RedundantKeyEvent,
     INPUT_BATCH_HEADER_SIZE, INPUT_BATCH_MAGIC, INPUT_BATCH_VERSION,
