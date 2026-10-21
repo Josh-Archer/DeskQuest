@@ -33,8 +33,9 @@ pub use clipboard_service::{HostClipboardService, HOST_CLIPBOARD_ORIGIN_ID};
 pub use headset::{HeadsetError, HeadsetHub};
 pub use input_receiver::HostInputReceiver;
 pub use ipc::{
-    daemon_pid_path, daemon_runtime_dir, daemon_socket_path, run_ipc_server, send_daemon_request,
-    DaemonRequest, DaemonResponse,
+    daemon_pid_path, daemon_runtime_dir, daemon_socket_path, run_ipc_server, run_ipc_server_with,
+    send_daemon_request, send_daemon_request_to, DaemonCapture, DaemonRequest, DaemonResponse,
+    DaemonStatus, HeadsetReport, IpcContext,
 };
 pub use multi_display::MultiDisplayHost;
 pub use window_panels::{WindowPanelManager, WindowSource, X11WindowSource};

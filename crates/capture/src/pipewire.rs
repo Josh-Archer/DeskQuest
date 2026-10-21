@@ -186,6 +186,56 @@ impl PipeWireCapture {
         self.initialized = true;
         Ok(())
     }
+
+    /// Replaces the running capture with one the user picks in the portal's dialog, over an
+    /// already-built portal client. On failure (for example the user cancelled) the previous
+    /// source is captured again through `restore` (normally a new portal client, which reuses
+    /// the stored restore token, so no dialog is shown for that).
+    #[cfg(feature = "pipewire-screencast")]
+    pub async fn reselect_with_portals<P, R, F>(
+        &mut self,
+        fresh: P,
+        restore: F,
+    ) -> Result<(), CaptureError>
+    where
+        P: crate::screencast::portal::ScreenCastPortal + 'static,
+        R: crate::screencast::portal::ScreenCastPortal + 'static,
+        F: std::future::Future<Output = Result<R, CaptureError>>,
+    {
+        // The portal hands out a new session; the old one is closed first so the two do not
+        // compete for the hub.
+        self.stop().await;
+        let picked = crate::screencast::session::ScreenCastSession::start_fresh(
+            fresh,
+            &self.config,
+            Arc::clone(&self.hub),
+            self.display_id,
+            self.window_source,
+        )
+        .await;
+        match picked {
+            Ok(session) => {
+                self.session = Some(session);
+                self.initialized = true;
+                tracing::info!("screencast: the user picked a new source");
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "screencast: no new source picked; restoring the previous one");
+                match restore.await {
+                    Ok(portal) => {
+                        if let Err(restore_err) = self.init_with_portal(portal).await {
+                            tracing::warn!(error = %restore_err, "screencast: could not restore the previous source");
+                        }
+                    }
+                    Err(restore_err) => {
+                        tracing::warn!(error = %restore_err, "screencast: could not reach the portal to restore the previous source");
+                    }
+                }
+                Err(e.into())
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -223,6 +273,26 @@ impl DisplayCapture for PipeWireCapture {
             self.hub.info()
         } else {
             None
+        }
+    }
+
+    async fn reselect(&mut self) -> Result<(), CaptureError> {
+        #[cfg(feature = "pipewire-screencast")]
+        {
+            use crate::screencast::portal_zbus::ZbusPortal;
+            let fresh = ZbusPortal::connect_session().await?;
+            let restore = async {
+                ZbusPortal::connect_session()
+                    .await
+                    .map_err(CaptureError::from)
+            };
+            self.reselect_with_portals(fresh, restore).await
+        }
+        #[cfg(not(feature = "pipewire-screencast"))]
+        {
+            Err(CaptureError::BackendUnavailable(
+                ScreenCastError::FeatureDisabled.to_string(),
+            ))
         }
     }
 }

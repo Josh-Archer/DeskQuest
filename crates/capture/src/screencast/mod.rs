@@ -99,3 +99,64 @@ impl ScreenCastConfig {
             .or_else(RestoreTokenStore::default_location)
     }
 }
+
+/// Choosing another screen (`negotiate_source_fresh`), against the in-memory fake.
+#[cfg(test)]
+mod reselect_tests {
+    use super::portal::fake::{ok_start, FakePortal};
+    use super::portal::{negotiate_source_fresh, SOURCE_MONITOR};
+    use super::{RestoreTokenStore, ScreenCastError};
+
+    fn store(tag: &str) -> (RestoreTokenStore, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("lq-reselect-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        (RestoreTokenStore::at(root.join("token")), root)
+    }
+
+    #[tokio::test]
+    async fn choosing_again_shows_the_picker_and_replaces_the_stored_token() {
+        let (store, root) = store("fresh");
+        store.save("old-token").unwrap();
+        let mut fake = FakePortal::new();
+        fake.start_results.push_back(ok_start(9, Some("new-token")));
+
+        let grant = negotiate_source_fresh(&mut fake, Some(&store), SOURCE_MONITOR)
+            .await
+            .unwrap();
+        assert!(!grant.used_restore_token);
+        assert_eq!(grant.stream.node_id, 9);
+        assert_eq!(fake.select_seen.len(), 1);
+        assert_eq!(
+            fake.select_seen[0].restore_token, None,
+            "no token: the picker shows"
+        );
+        assert!(
+            fake.select_seen[0].persist_mode.is_some(),
+            "the new grant is kept"
+        );
+        assert_eq!(store.load().as_deref(), Some("new-token"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_choice_keeps_the_stored_token() {
+        let (store, root) = store("cancel");
+        store.save("old-token").unwrap();
+        let mut fake = FakePortal::new();
+        fake.start_results
+            .push_back(Err(ScreenCastError::UserCancelled));
+
+        let err = match negotiate_source_fresh(&mut fake, Some(&store), SOURCE_MONITOR).await {
+            Ok(_) => panic!("a cancelled pick must fail"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, ScreenCastError::UserCancelled));
+        assert_eq!(store.load().as_deref(), Some("old-token"));
+        assert_eq!(
+            fake.closed_sessions.len(),
+            1,
+            "the failed session is closed"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

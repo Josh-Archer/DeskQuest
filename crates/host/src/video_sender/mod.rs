@@ -25,6 +25,7 @@
 //! stream ([`multi`]); each has its own capture, encoder, packetizer and frame ids, and stamps
 //! its [`VideoSenderConfig::stream_id`] on every packet.
 
+pub mod control;
 pub mod daemon;
 pub mod keyframe;
 pub mod multi;
@@ -42,7 +43,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use linux_quest_capture::{CaptureError, RawFrame};
-use linux_quest_encoder::VideoEncoder;
+use linux_quest_encoder::{EncoderConfig, VideoEncoder};
 use linux_quest_transport::PacketPacer;
 use parking_lot::Mutex;
 use tokio::sync::{watch, Notify};
@@ -52,6 +53,7 @@ use tracing::{debug, error, info, info_span, warn, Instrument, Span};
 use crate::congestion::StreamRate;
 use crate::link_status::SharedLinkTracker;
 
+pub use control::{CaptureKind, PausablePeers, VideoControl};
 pub use keyframe::KeyframeRequests;
 pub use packetizer::{
     Datagram, FecConfig, FramePlan, Packetizer, VideoSendError, DEFAULT_MAX_PAYLOAD,
@@ -128,6 +130,10 @@ pub struct VideoSenderConfig {
     /// them before each frame and reports the rate it achieved. `None` keeps the encoder and
     /// FEC settings fixed.
     pub rate: Option<Arc<StreamRate>>,
+    /// What the encoder was set up with. When given, a frame of another size (the user picked
+    /// another screen) re-creates the encoder at that size with the same codec and rate.
+    /// `None` passes every frame to the encoder as it is.
+    pub encoder_config: Option<EncoderConfig>,
 }
 
 impl Default for VideoSenderConfig {
@@ -143,6 +149,7 @@ impl Default for VideoSenderConfig {
             min_keyframe_interval: Duration::from_millis(250),
             keyframe_requests: None,
             rate: None,
+            encoder_config: None,
         }
     }
 }
@@ -210,6 +217,8 @@ pub struct FramePipeline<E: VideoEncoder, K: DatagramSink> {
     applied_kbps: Option<u32>,
     last_bitrate_apply: Option<Instant>,
     rate_window: RateWindow,
+    /// Frame size the encoder is set up for (with `cfg.encoder_config`).
+    encoder_size: Option<(u32, u32)>,
 }
 
 /// Measures the video payload rate (FEC parity excluded) over fixed windows.
@@ -263,6 +272,7 @@ pub enum KeyframeReason {
 impl<E: VideoEncoder, K: DatagramSink> FramePipeline<E, K> {
     pub fn new(encoder: E, sink: K, cfg: VideoSenderConfig, stats: Arc<VideoSenderStats>) -> Self {
         let packetizer = Packetizer::new(cfg.stream_id, cfg.max_payload, cfg.fec);
+        let encoder_size = cfg.encoder_config.as_ref().map(|c| (c.width, c.height));
         Self {
             encoder,
             sink,
@@ -276,6 +286,7 @@ impl<E: VideoEncoder, K: DatagramSink> FramePipeline<E, K> {
             applied_kbps: None,
             last_bitrate_apply: None,
             rate_window: RateWindow::new(),
+            encoder_size,
         }
     }
 
@@ -339,6 +350,37 @@ impl<E: VideoEncoder, K: DatagramSink> FramePipeline<E, K> {
         self.encoder.request_keyframe();
     }
 
+    /// Re-creates the encoder when `raw` is not the size it was set up for, which happens when
+    /// the user picks another screen. Codec, frame rate and the current bitrate are kept, and
+    /// the new encoder starts with a keyframe.
+    async fn follow_frame_size(&mut self, raw: &RawFrame) -> Result<(), VideoSendError> {
+        let Some(base) = &self.cfg.encoder_config else {
+            return Ok(());
+        };
+        let size = (raw.width & !1, raw.height & !1);
+        if size.0 < 2 || size.1 < 2 || self.encoder_size == Some(size) {
+            return Ok(());
+        }
+        let config = EncoderConfig {
+            width: size.0,
+            height: size.1,
+            bitrate_kbps: self.applied_kbps.unwrap_or(base.bitrate_kbps),
+            ..base.clone()
+        };
+        info!(
+            from = ?self.encoder_size,
+            to = ?size,
+            stream_id = self.cfg.stream_id,
+            "capture size changed; re-creating the encoder"
+        );
+        // Whatever happens, do not retry this size on every frame.
+        self.encoder_size = Some(size);
+        self.encoder.init(config).await?;
+        self.keyframe_pending = true;
+        self.encoder.request_keyframe();
+        Ok(())
+    }
+
     fn now_us(&self) -> u64 {
         self.epoch.elapsed().as_micros() as u64 + 1
     }
@@ -365,6 +407,7 @@ impl<E: VideoEncoder, K: DatagramSink> FramePipeline<E, K> {
         if let Some(rate) = self.cfg.rate.clone() {
             self.apply_rate(&rate, frame_in);
         }
+        self.follow_frame_size(raw).await?;
         let encoded = self.encoder.encode(raw).await?;
         let Some(mut plan) = self.packetizer.plan(&encoded)? else {
             return Ok(None);

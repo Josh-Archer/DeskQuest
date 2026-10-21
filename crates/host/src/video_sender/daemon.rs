@@ -12,6 +12,7 @@ use linux_quest_encoder::{
     EncoderError, VideoEncoder,
 };
 
+use super::control::{CaptureKind, PausablePeers, ReselectRequest, VideoControl};
 use super::{
     spawn_video_sender, FrameSource, KeyframeRequests, UdpSink, VideoSenderConfig,
     VideoSenderHandle, DEFAULT_SEND_BUFFER_BYTES,
@@ -23,6 +24,8 @@ use crate::link_status::SharedLinkTracker;
 /// Adapts the capture crate's [`DisplayCapture`] to [`FrameSource`].
 pub struct CaptureFrameSource<C: DisplayCapture> {
     capture: C,
+    /// Requests to let the user pick another screen, served between frames.
+    reselect: Option<tokio::sync::mpsc::UnboundedReceiver<ReselectRequest>>,
 }
 
 impl<C: DisplayCapture> CaptureFrameSource<C> {
@@ -42,7 +45,37 @@ impl<C: DisplayCapture> CaptureFrameSource<C> {
                 "only the synthetic test-pattern capture is available; {hint}"
             )));
         }
-        Ok(Self { capture })
+        Ok(Self {
+            capture,
+            reselect: None,
+        })
+    }
+
+    /// Serves `requests` to pick another screen (see [`VideoControl::choose_screen`]).
+    pub fn with_reselect(
+        mut self,
+        requests: tokio::sync::mpsc::UnboundedReceiver<ReselectRequest>,
+    ) -> Self {
+        self.reselect = Some(requests);
+        self
+    }
+
+    /// Runs one request to pick another screen and answers it.
+    async fn serve_reselect(&mut self, request: ReselectRequest) {
+        tracing::info!("showing the screen picker so the user can choose what to share");
+        let result = self.capture.reselect().await.map_err(|e| match e {
+            CaptureError::ScreenCast(ScreenCastError::UserCancelled) => {
+                "the screen picker was cancelled; still sharing the previous screen".to_string()
+            }
+            other => other.to_string(),
+        });
+        match &result {
+            Ok(()) => {
+                tracing::info!(info = ?self.capture.capture_info(), "now sharing the chosen screen")
+            }
+            Err(e) => tracing::warn!(error = %e, "no new screen chosen"),
+        }
+        let _ = request.reply.send(result);
     }
 
     /// Size and rate the capture negotiated, if it reports them.
@@ -86,7 +119,23 @@ const MAX_REOPEN_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1
 #[async_trait]
 impl<C: DisplayCapture + 'static> FrameSource for CaptureFrameSource<C> {
     async fn next_frame(&mut self) -> Result<RawFrame, CaptureError> {
-        let err = match self.capture.capture_frame().await {
+        let captured = loop {
+            let Some(requests) = self.reselect.as_mut() else {
+                break self.capture.capture_frame().await;
+            };
+            // A static screen may send no frame for a long time, so a request must not wait
+            // for one. Dropping the pending capture call is fine: frames wait in the capture's
+            // own queue.
+            tokio::select! {
+                biased;
+                request = requests.recv() => match request {
+                    Some(request) => self.serve_reselect(request).await,
+                    None => self.reselect = None,
+                },
+                frame = self.capture.capture_frame() => break frame,
+            }
+        };
+        let err = match captured {
             Ok(frame) => return Ok(frame),
             Err(e) if capture_ended(&e) => e,
             Err(e) => return Err(e),
@@ -164,7 +213,7 @@ pub(super) async fn open_planned_encoder(
     preference: BackendPreference,
     bitrate_kbps: u32,
     (width, height, fps): (u32, u32, u32),
-) -> Result<(BoxedEncoder, StreamPlan), String> {
+) -> Result<(BoxedEncoder, StreamPlan, EncoderConfig), String> {
     let probes = tokio::task::spawn_blocking(|| {
         CODEC_PREFERENCE
             .iter()
@@ -204,10 +253,10 @@ pub(super) async fn open_planned_encoder(
         BackendKind::Vaapi => BackendPreference::Vaapi,
         BackendKind::Mock => BackendPreference::Mock,
     };
-    let (_, encoder) = create_encoder(config, backend_only)
+    let (_, encoder) = create_encoder(config.clone(), backend_only)
         .await
         .map_err(|e| e.to_string())?;
-    Ok((BoxedEncoder(encoder), plan))
+    Ok((BoxedEncoder(encoder), plan, config))
 }
 
 /// Starts the UDP video sender for the headless daemon.
@@ -221,6 +270,19 @@ pub async fn start_daemon_video_sender(
     keyframe_requests: Arc<KeyframeRequests>,
     rate: Option<Arc<RateCoordinator>>,
 ) -> Result<VideoSenderHandle, String> {
+    start_daemon_video_sender_with(link, options, keyframe_requests, rate, VideoControl::new())
+        .await
+}
+
+/// [`start_daemon_video_sender`] whose video `control` pauses, resumes and lets the user pick
+/// another screen.
+pub async fn start_daemon_video_sender_with(
+    link: SharedLinkTracker,
+    options: DaemonVideoOptions,
+    keyframe_requests: Arc<KeyframeRequests>,
+    rate: Option<Arc<RateCoordinator>>,
+    control: Arc<VideoControl>,
+) -> Result<VideoSenderHandle, String> {
     let stream_rate = rate.as_ref().map(|r| r.register_stream(0));
     start_daemon_video_stream(
         link,
@@ -230,6 +292,7 @@ pub async fn start_daemon_video_sender(
         options.bitrate_mbps.saturating_mul(1000),
         keyframe_requests,
         stream_rate,
+        control,
     )
     .await
 }
@@ -273,6 +336,7 @@ pub async fn start_daemon_video_senders(
                 bitrate.saturating_mul(1000),
                 keyframe_requests.clone(),
                 stream_rate,
+                VideoControl::new(),
             )
             .await?,
         );
@@ -297,6 +361,7 @@ fn bitrate_shares(total_mbps: u32, streams: usize) -> Result<Vec<u32>, String> {
         .collect())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_daemon_video_stream(
     link: SharedLinkTracker,
     options: DaemonVideoOptions,
@@ -305,21 +370,31 @@ async fn start_daemon_video_stream(
     initial_bitrate_kbps: u32,
     keyframe_requests: Arc<KeyframeRequests>,
     rate: Option<Arc<StreamRate>>,
+    control: Arc<VideoControl>,
 ) -> Result<VideoSenderHandle, String> {
     let defaults = EncoderConfig::default();
     let capture = AutoCapture::new(display_id, defaults.width, defaults.height, defaults.fps);
 
-    let source = CaptureFrameSource::open(capture, options.test_pattern)
+    let mut source = CaptureFrameSource::open(capture, options.test_pattern)
         .await
         .map_err(|e| format!("capture: {e}"))?;
+    let kind = if source.capture.backend_type() == CaptureBackendType::Synthetic {
+        CaptureKind::TestPattern
+    } else {
+        // A real screen: the user can pick another one from the desktop app or the tray.
+        source = source.with_reselect(control.register_reselect());
+        CaptureKind::Screen
+    };
+    control.set_running(1, kind);
     let geometry = encode_geometry(source.capture_info().as_ref(), &defaults);
     // A coordinator's share (focus-weighted) replaces the even split.
     let bitrate_kbps = rate
         .as_ref()
         .map_or(initial_bitrate_kbps, |r| r.target_kbps());
-    let (encoder, plan) = open_planned_encoder(options.encoder, bitrate_kbps, geometry)
-        .await
-        .map_err(|e| format!("encoder: {e}"))?;
+    let (encoder, plan, encoder_config) =
+        open_planned_encoder(options.encoder, bitrate_kbps, geometry)
+            .await
+            .map_err(|e| format!("encoder: {e}"))?;
 
     tracing::info!(
         backend = plan.backend.name(),
@@ -338,9 +413,14 @@ async fn start_daemon_video_stream(
         stream_id,
         keyframe_requests: Some(keyframe_requests),
         rate,
+        encoder_config: Some(encoder_config),
         ..VideoSenderConfig::default()
     };
-    Ok(spawn_video_sender(source, encoder, sink, link, config))
+    let peers = PausablePeers {
+        peers: link,
+        control,
+    };
+    Ok(spawn_video_sender(source, encoder, sink, peers, config))
 }
 
 #[cfg(test)]
@@ -453,6 +533,86 @@ mod tests {
         fn backend_type(&self) -> CaptureBackendType {
             CaptureBackendType::PipeWire
         }
+    }
+
+    /// Sends no frames (a static screen) until the user picks a screen, then frames of 1280x720.
+    struct PickerCapture {
+        picked: bool,
+        refuse: bool,
+    }
+
+    #[async_trait]
+    impl DisplayCapture for PickerCapture {
+        async fn init(&mut self) -> Result<(), CaptureError> {
+            Ok(())
+        }
+        async fn capture_frame(&mut self) -> Result<RawFrame, CaptureError> {
+            if !self.picked {
+                std::future::pending::<()>().await;
+            }
+            SyntheticCapture::new(0, 1280, 720, 1000)
+                .capture_frame()
+                .await
+        }
+        fn backend_type(&self) -> CaptureBackendType {
+            CaptureBackendType::PipeWire
+        }
+        async fn reselect(&mut self) -> Result<(), CaptureError> {
+            if self.refuse {
+                return Err(ScreenCastError::UserCancelled.into());
+            }
+            self.picked = true;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_screen_pick_is_served_while_the_screen_sends_no_frames() {
+        let control = VideoControl::new();
+        let capture = PickerCapture {
+            picked: false,
+            refuse: false,
+        };
+        let mut source = CaptureFrameSource::open(capture, false)
+            .await
+            .unwrap()
+            .with_reselect(control.register_reselect());
+        let next = tokio::spawn(async move {
+            source
+                .next_frame()
+                .await
+                .map(|frame| (frame.width, frame.height))
+        });
+        control
+            .choose_screen(std::time::Duration::from_secs(5))
+            .await
+            .expect("picked");
+        assert_eq!(next.await.unwrap().unwrap(), (1280, 720));
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_pick_says_the_old_screen_is_still_shared() {
+        let control = VideoControl::new();
+        let capture = PickerCapture {
+            picked: false,
+            refuse: true,
+        };
+        let mut source = CaptureFrameSource::open(capture, false)
+            .await
+            .unwrap()
+            .with_reselect(control.register_reselect());
+        let next = tokio::spawn(async move {
+            let _ = source.next_frame().await;
+        });
+        let err = control
+            .choose_screen(std::time::Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("cancelled") && err.contains("previous"),
+            "{err}"
+        );
+        next.abort();
     }
 
     #[tokio::test(start_paused = true)]

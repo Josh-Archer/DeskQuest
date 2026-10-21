@@ -21,8 +21,9 @@ use std::sync::Arc;
 use linux_quest_capture::SyntheticCapture;
 use tracing::{info, warn};
 
+use super::control::{PausablePeers, VideoControl};
 use super::daemon::{
-    open_planned_encoder, start_daemon_video_sender, CaptureFrameSource, DaemonVideoOptions,
+    open_planned_encoder, start_daemon_video_sender_with, CaptureFrameSource, DaemonVideoOptions,
 };
 use super::{
     spawn_video_sender, Dscp, KeyframeRequests, UdpSink, VideoSenderConfig, VideoSenderHandle,
@@ -191,17 +192,31 @@ pub async fn start_daemon_video_senders(
     keyframe_requests: Arc<KeyframeRequests>,
     rate: Option<Arc<RateCoordinator>>,
 ) -> Result<MultiVideoSenderHandle, String> {
+    start_daemon_video_senders_with(link, options, keyframe_requests, rate, VideoControl::new())
+        .await
+}
+
+/// [`start_daemon_video_senders`] with a [`VideoControl`] that pauses and resumes every stream
+/// and lets the user pick what stream 0 shows.
+pub async fn start_daemon_video_senders_with(
+    link: SharedLinkTracker,
+    options: MultiStreamOptions,
+    keyframe_requests: Arc<KeyframeRequests>,
+    rate: Option<Arc<RateCoordinator>>,
+    control: Arc<VideoControl>,
+) -> Result<MultiVideoSenderHandle, String> {
     if !(1..=MAX_VIDEO_STREAMS).contains(&options.streams) {
         return Err(format!(
             "{} video streams requested; the daemon sends 1 to {MAX_VIDEO_STREAMS}",
             options.streams
         ));
     }
-    let primary = start_daemon_video_sender(
+    let primary = start_daemon_video_sender_with(
         link.clone(),
         options.video,
         keyframe_requests.clone(),
         rate.clone(),
+        control.clone(),
     )
     .await?;
     let mut streams = vec![(0, primary)];
@@ -214,6 +229,7 @@ pub async fn start_daemon_video_senders(
             options.extra_stream,
             keyframe_requests.clone(),
             rate.as_ref().map(|r| r.register_stream(stream_id)),
+            control.clone(),
         )
         .await
         {
@@ -223,6 +239,7 @@ pub async fn start_daemon_video_senders(
             ),
         }
     }
+    control.set_running(streams.len() as u16, control.capture_kind());
     if options.streams > 1 {
         info!(
             requested = options.streams,
@@ -243,6 +260,7 @@ async fn start_synthetic_stream(
     size: StreamSize,
     keyframe_requests: Arc<KeyframeRequests>,
     rate: Option<Arc<StreamRate>>,
+    control: Arc<VideoControl>,
 ) -> Result<VideoSenderHandle, String> {
     let capture = SyntheticCapture::new(stream_id, size.width, size.height, size.fps);
     let source = CaptureFrameSource::open(capture, true)
@@ -252,7 +270,7 @@ async fn start_synthetic_stream(
         || options.bitrate_mbps.saturating_mul(1000),
         |r| r.target_kbps(),
     );
-    let (encoder, plan) = open_planned_encoder(
+    let (encoder, plan, _) = open_planned_encoder(
         options.encoder,
         bitrate_kbps,
         (size.width, size.height, size.fps),
@@ -278,7 +296,11 @@ async fn start_synthetic_stream(
         rate,
         ..VideoSenderConfig::default()
     };
-    Ok(spawn_video_sender(source, encoder, sink, link, config))
+    let peers = PausablePeers {
+        peers: link,
+        control,
+    };
+    Ok(spawn_video_sender(source, encoder, sink, peers, config))
 }
 
 #[cfg(test)]

@@ -184,6 +184,20 @@ pub async fn negotiate_source<P: ScreenCastPortal + ?Sized>(
     attempt(portal, store, None, cursor_mode, can_persist, source_types).await
 }
 
+/// Like [`negotiate_source`], but always shows the picker: the stored restore token is not
+/// offered, so the user chooses again. A successful grant replaces the stored token; a
+/// cancelled one leaves it as it was.
+pub async fn negotiate_source_fresh<P: ScreenCastPortal + ?Sized>(
+    portal: &mut P,
+    store: Option<&RestoreTokenStore>,
+    source_types: u32,
+) -> Result<PortalGrant, ScreenCastError> {
+    let version = portal.version().await?;
+    let can_persist = version >= RESTORE_TOKEN_MIN_VERSION;
+    let cursor_mode = choose_cursor_mode(portal.available_cursor_modes().await.unwrap_or(0));
+    attempt(portal, store, None, cursor_mode, can_persist, source_types).await
+}
+
 async fn attempt<P: ScreenCastPortal + ?Sized>(
     portal: &mut P,
     store: Option<&RestoreTokenStore>,

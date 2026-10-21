@@ -107,6 +107,16 @@ pub trait DisplayCapture: Send + Sync {
     fn capture_info(&self) -> Option<CaptureInfo> {
         None
     }
+
+    /// Lets the user pick another screen or window to capture (the screen-cast portal shows
+    /// its picker again). On success the capture continues with the new source; on failure
+    /// (cancelled, refused) it continues with the old one where it can. Backends without a
+    /// picker return `BackendUnavailable`.
+    async fn reselect(&mut self) -> Result<(), CaptureError> {
+        Err(CaptureError::BackendUnavailable(
+            "this capture source has no screen picker".into(),
+        ))
+    }
 }
 
 /// Deterministic synthetic screen generator for integration tests and headless benchmarking.
@@ -286,6 +296,10 @@ impl DisplayCapture for AutoCapture {
 
     fn capture_info(&self) -> Option<CaptureInfo> {
         self.inner.capture_info()
+    }
+
+    async fn reselect(&mut self) -> Result<(), CaptureError> {
+        self.inner.reselect().await
     }
 }
 

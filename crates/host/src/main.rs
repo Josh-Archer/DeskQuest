@@ -20,9 +20,11 @@ use linux_quest_host::video_sender::multi::{
     parse_stream_count, MultiStreamOptions, MultiVideoSenderHandle, StreamSize,
 };
 use linux_quest_host::video_sender::KeyframeRequests;
+use linux_quest_host::video_sender::VideoControl;
 use linux_quest_host::{
-    daemon_socket_path, run_ipc_server, send_daemon_request, DaemonRequest, DaemonResponse,
-    HeadsetHub, HostClipboardService, HostInputReceiver, MultiDisplayHost,
+    daemon_socket_path, run_ipc_server, run_ipc_server_with, send_daemon_request, DaemonRequest,
+    DaemonResponse, HeadsetHub, HostClipboardService, HostInputReceiver, IpcContext,
+    MultiDisplayHost,
 };
 use linux_quest_input::InputInjector as _;
 
@@ -573,6 +575,7 @@ async fn start_video(
     link: SharedLinkTracker,
     keyframe_requests: Arc<KeyframeRequests>,
     rate: Arc<RateCoordinator>,
+    control: Arc<VideoControl>,
 ) -> Option<MultiVideoSenderHandle> {
     if args.no_video {
         info!("UDP video sender disabled by --no-video");
@@ -588,11 +591,12 @@ async fn start_video(
         streams: args.streams,
         extra_stream: args.extra_stream_size,
     };
-    match linux_quest_host::video_sender::multi::start_daemon_video_senders(
+    match linux_quest_host::video_sender::multi::start_daemon_video_senders_with(
         link,
         options,
         keyframe_requests,
         Some(rate),
+        control,
     )
     .await
     {
@@ -832,7 +836,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .await;
                 let adb_handle = start_adb_bridge(&daemon_args, &shutdown_tx, link.clone());
 
-                let video = start_video(&daemon_args, link.clone(), keyframe_requests, rate).await;
+                // Pause and resume, and the screen picker, for the IPC server.
+                let video_control = VideoControl::new();
+                let video = start_video(
+                    &daemon_args,
+                    link.clone(),
+                    keyframe_requests,
+                    rate.clone(),
+                    video_control.clone(),
+                )
+                .await;
 
                 // Advertise only the ports that were really bound above.
                 let listening = match (control_port, input_port) {
@@ -849,7 +862,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 )
                 .await;
 
-                let served = run_ipc_server(host, link, shutdown_rx).await;
+                let ipc = IpcContext {
+                    host,
+                    link,
+                    headset,
+                    video: video_control,
+                    rate: video.is_some().then_some(rate),
+                };
+                let served = run_ipc_server_with(ipc, shutdown_rx).await;
                 // The IPC server may have ended on its own; make sure the bridge stops too.
                 let _ = shutdown_tx.send(());
                 finish_adb_bridge(adb_handle).await;
@@ -919,8 +939,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         }
                     }
                 }
-                DaemonResponse::DashboardSnapshot(_) => {
-                    println!("Received DashboardSnapshot response from daemon.");
+                DaemonResponse::DashboardSnapshot(_)
+                | DaemonResponse::Status(_)
+                | DaemonResponse::Headset(_) => {
+                    println!("Received an unexpected response from the daemon.");
                 }
                 DaemonResponse::Success(msg) => {
                     println!("{msg}");
