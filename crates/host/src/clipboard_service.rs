@@ -189,58 +189,100 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
     }
 
     /// Runs the clipboard service until `running` flag is cleared.
+    ///
+    /// Control connections are accepted on a task of their own, so they are served at once
+    /// whatever the clipboard poll is doing. The local clipboard is polled on a timer here.
+    /// Reading it runs external tools that can block (up to their timeout), so on a
+    /// multi-threaded runtime the poll runs with `block_in_place`, which moves the other tasks
+    /// waiting on this worker elsewhere.
     pub async fn run(&mut self) -> Result<(), HostError> {
         self.running.store(true, Ordering::SeqCst);
         let poll_interval = self.watcher.poll_interval();
+        let mut poll = tokio::time::interval(poll_interval);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let acceptor = self.listener.take().map(|listener| {
+            let peers = self.peer_context();
+            tokio::spawn(async move { peers.accept_loop(listener).await })
+        });
 
-        loop {
-            if !self.running.load(Ordering::Relaxed) {
-                break;
-            }
-
-            // Step local backend change detection
-            if let Err(e) = self.step_local() {
-                tracing::trace!(error = ?e, "Error during local clipboard poll step");
-            }
-
-            // Process any incoming messages queued from channel
-            while let Ok(msg) = self.incoming_rx.try_recv() {
-                if let Err(e) = self.handle_incoming(msg) {
-                    tracing::warn!(error = ?e, "Error handling incoming clipboard message");
-                }
-            }
-
-            // If a TCP listener is configured, accept incoming control channel connections
-            if let Some(ref listener) = self.listener {
-                // Non-blocking accept check
-                match listener.accept().await {
-                    Ok((stream, peer_addr)) => {
-                        tracing::info!(peer = %peer_addr, "New control channel connection for clipboard sync");
-                        if let Err(e) = stream.set_nodelay(true) {
-                            tracing::warn!(error = ?e, "Failed to set TCP_NODELAY on control socket");
-                        }
-                        if let Err(e) = enable_control_keepalive(&stream) {
-                            tracing::warn!(error = ?e, "Failed to enable TCP keepalive on control socket");
-                        }
-                        if let Err(e) = enable_control_nodelay(&stream) {
-                            tracing::warn!(error = ?e, "Failed to set TCP_NODELAY on control socket");
-                        }
-                        if let Some(link) = &self.link {
-                            link.lock().control_accepted(peer_addr, Instant::now());
-                        }
-                        self.spawn_peer_handler(stream, peer_addr);
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(e) => {
-                        tracing::trace!(error = ?e, "TCP listener accept error");
-                    }
-                }
-            } else {
-                tokio::time::sleep(poll_interval).await;
-            }
+        while self.running.load(Ordering::Relaxed) {
+            poll.tick().await;
+            self.poll_local_and_incoming();
         }
 
+        if let Some(acceptor) = acceptor {
+            acceptor.abort();
+        }
         Ok(())
+    }
+
+    fn peer_context(&self) -> PeerContext<B> {
+        PeerContext {
+            backend: self.backend.clone(),
+            sync_engine: self.sync_engine.clone(),
+            running: self.running.clone(),
+            peer_writers: self.peer_writers.clone(),
+            link: self.link.clone(),
+            headset: self.headset.clone(),
+        }
+    }
+
+    /// One clipboard poll, plus the incoming messages queued meanwhile.
+    fn poll_local_and_incoming(&mut self) {
+        let multi_thread = tokio::runtime::Handle::try_current()
+            .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+        let stepped = if multi_thread {
+            tokio::task::block_in_place(|| self.step_local())
+        } else {
+            self.step_local()
+        };
+        if let Err(e) = stepped {
+            tracing::trace!(error = ?e, "Error during local clipboard poll step");
+        }
+        while let Ok(msg) = self.incoming_rx.try_recv() {
+            if let Err(e) = self.handle_incoming(msg) {
+                tracing::warn!(error = ?e, "Error handling incoming clipboard message");
+            }
+        }
+    }
+}
+
+/// What the connection handlers share with the service: everything they need, by `Arc`, so
+/// accepting runs on its own task.
+struct PeerContext<B: ClipboardBackend + 'static> {
+    backend: Arc<Mutex<B>>,
+    sync_engine: Arc<Mutex<ClipboardSyncEngine>>,
+    running: Arc<AtomicBool>,
+    peer_writers: Arc<Mutex<Vec<mpsc::UnboundedSender<ControlMessage>>>>,
+    link: Option<SharedLinkTracker>,
+    headset: Option<Arc<HeadsetHub>>,
+}
+
+impl<B: ClipboardBackend + 'static> PeerContext<B> {
+    async fn accept_loop(self, listener: TcpListener) {
+        while self.running.load(Ordering::Relaxed) {
+            match listener.accept().await {
+                Ok((stream, peer_addr)) => self.accept_peer(stream, peer_addr),
+                Err(e) => {
+                    tracing::trace!(error = ?e, "TCP listener accept error");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+
+    fn accept_peer(&self, stream: TcpStream, peer_addr: SocketAddr) {
+        tracing::info!(peer = %peer_addr, "New control channel connection for clipboard sync");
+        if let Err(e) = enable_control_keepalive(&stream) {
+            tracing::warn!(error = ?e, "Failed to enable TCP keepalive on control socket");
+        }
+        if let Err(e) = enable_control_nodelay(&stream) {
+            tracing::warn!(error = ?e, "Failed to set TCP_NODELAY on control socket");
+        }
+        if let Some(link) = &self.link {
+            link.lock().control_accepted(peer_addr, Instant::now());
+        }
+        self.spawn_peer_handler(stream, peer_addr);
     }
 
     fn spawn_peer_handler(&self, stream: TcpStream, peer_addr: SocketAddr) {
@@ -465,6 +507,68 @@ mod tests {
             echo.is_none(),
             "Echo was not suppressed: host re-emitted client's write!"
         );
+    }
+
+    /// A clipboard whose reads block like a `wl-paste` waiting for focus.
+    struct SlowClipboard;
+
+    impl ClipboardBackend for SlowClipboard {
+        fn get_text(&self) -> Result<String, linux_quest_input::InputError> {
+            std::thread::sleep(Duration::from_millis(1500));
+            Ok(String::new())
+        }
+        fn set_text(&mut self, _text: &str) -> Result<(), linux_quest_input::InputError> {
+            Ok(())
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &'static str {
+            "slow"
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blocking_clipboard_read_does_not_hold_up_new_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        let (_in_tx, in_rx) = mpsc::unbounded_channel();
+        let mut service = HostClipboardService::new(
+            Arc::new(Mutex::new(SlowClipboard)),
+            Arc::new(Mutex::new(ClipboardSyncEngine::new(
+                HOST_CLIPBOARD_ORIGIN_ID,
+            ))),
+            out_tx,
+            in_rx,
+        )
+        .with_listener(listener)
+        .with_watcher_config(ClipboardWatcherConfig {
+            poll_interval: Duration::from_millis(20),
+            debounce_duration: Duration::ZERO,
+        })
+        .with_headset_hub(Arc::new(HeadsetHub::new()));
+        let running = service.running_flag();
+        let server = tokio::spawn(async move { service.run().await });
+
+        // Let a slow poll start, then connect: the greeting must not wait for it.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (reader, _writer) = stream.into_split();
+        let mut channel = ControlChannel::new(reader, tokio::io::sink());
+        let started = std::time::Instant::now();
+        let greeting = tokio::time::timeout(Duration::from_secs(5), channel.recv_message())
+            .await
+            .expect("greeted")
+            .unwrap();
+        assert_eq!(greeting, ControlMessage::HeadsetStatusRequest);
+        assert!(
+            started.elapsed() < Duration::from_millis(1200),
+            "the greeting waited for the clipboard read: {:?}",
+            started.elapsed()
+        );
+        running.store(false, Ordering::SeqCst);
+        server.abort();
     }
 
     #[tokio::test]
