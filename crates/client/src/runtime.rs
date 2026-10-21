@@ -21,6 +21,9 @@ use crate::spatial::{
     InteractionState, PointerInput, ScreenTransform, SpatialLayoutStore, SpatialScreenLayout, Vec3,
 };
 
+mod host_control;
+pub use host_control::MAX_LAYOUT_DISPLAY_ID;
+
 /// Video streams beyond the primary one (stream ids 1 to this) that get a screen of their own.
 pub const MAX_EXTRA_STREAMS: u16 = 3;
 
@@ -95,6 +98,10 @@ pub struct QuestClientRuntime {
     settings_store: Option<SettingsStore>,
     shortcuts: ShortcutDetector,
     settings_action_sink: Option<Box<dyn Fn(SettingsAction) + Send>>,
+    /// Headset model reported to the host.
+    device_name: String,
+    /// Something the host sees changed since the last status (see `host_control`).
+    host_status_dirty: bool,
 }
 
 impl QuestClientRuntime {
@@ -185,6 +192,8 @@ impl QuestClientRuntime {
             settings_store: None,
             shortcuts: ShortcutDetector::default(),
             settings_action_sink: None,
+            device_name: "Meta Quest".to_string(),
+            host_status_dirty: false,
         })
     }
 
@@ -900,6 +909,7 @@ impl QuestClientRuntime {
                 self.config.enable_hud = enabled;
                 self.settings_panel.sync_hud(enabled);
                 self.persist_settings();
+                self.host_status_dirty = true;
             }
             Some(ShortcutAction::TogglePanel) => {
                 self.settings_panel.toggle();
@@ -938,6 +948,7 @@ impl QuestClientRuntime {
             if let Some(sink) = &self.settings_action_sink {
                 sink(action);
             }
+            self.host_status_dirty = true;
         }
         self.persist_settings();
     }
@@ -1204,6 +1215,7 @@ impl QuestClientRuntime {
                     ..
                 } => {
                     self.apply_screen_transform(*display_id, final_transform.clone());
+                    self.host_status_dirty = true;
 
                     // Persist spatial layout to disk via layout store
                     if let Some(store) = &self.layout_store {

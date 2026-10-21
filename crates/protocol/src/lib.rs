@@ -2,6 +2,7 @@ pub mod audio;
 pub mod clipboard;
 pub mod error;
 pub mod handshake;
+pub mod headset;
 pub mod input;
 pub mod packet;
 pub mod reassembler;
@@ -18,6 +19,9 @@ pub use error::ProtocolError;
 pub use handshake::{
     ClientHandshake, DisplayConfigMessage, DisplayInfo, ServerHandshake, WindowInfo,
     WINDOW_STREAM_ID_BASE,
+};
+pub use headset::{
+    HeadsetCodec, HeadsetSettings, HeadsetStats, HeadsetStatus, ScreenCurve, ScreenPlacement,
 };
 pub use input::{
     ElementState, InputBatch, InputEvent, KeyModifiers, MouseButton, NetworkFeedback,

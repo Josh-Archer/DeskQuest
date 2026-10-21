@@ -22,7 +22,7 @@ use linux_quest_host::video_sender::multi::{
 use linux_quest_host::video_sender::KeyframeRequests;
 use linux_quest_host::{
     daemon_socket_path, run_ipc_server, send_daemon_request, DaemonRequest, DaemonResponse,
-    HostClipboardService, HostInputReceiver, MultiDisplayHost,
+    HeadsetHub, HostClipboardService, HostInputReceiver, MultiDisplayHost,
 };
 use linux_quest_input::InputInjector as _;
 
@@ -455,6 +455,7 @@ async fn start_stream_services(
     keyframe_requests: Arc<KeyframeRequests>,
     rate: Arc<RateCoordinator>,
     display_map: linux_quest_input::SharedDisplayMap,
+    headset: Arc<HeadsetHub>,
 ) -> (Option<u16>, Option<u16>) {
     let mut input_port = None;
     let mut control_port = None;
@@ -502,7 +503,9 @@ async fn start_stream_services(
         std::net::SocketAddr::from(([0, 0, 0, 0], linux_quest_transport::DEFAULT_CONTROL_PORT));
     match HostClipboardService::bind_auto(control_bind_addr).await {
         Ok(clipboard_service) => {
-            let mut clipboard_service = clipboard_service.with_link_tracker(link);
+            let mut clipboard_service = clipboard_service
+                .with_link_tracker(link)
+                .with_headset_hub(headset);
             control_port = clipboard_service.local_addr().map(|a| a.port());
             let running_flag = clipboard_service.running_flag();
             let mut shutdown_rx_clipboard = shutdown_tx.subscribe();
@@ -732,6 +735,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let link = new_shared_link_tracker(DEFAULT_INPUT_LIVENESS);
             let display_map = linux_quest_input::SharedDisplayMap::default();
             spawn_display_map_refresh(host.clone(), display_map.clone());
+            // Layout and settings the headset reports on the control channel.
+            let headset = Arc::new(HeadsetHub::new());
 
             if run_tui {
                 let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
@@ -749,6 +754,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         false,
                     )),
                     display_map.clone(),
+                    headset.clone(),
                 )
                 .await;
                 let adb_handle = start_adb_bridge(&daemon_args, &shutdown_tx, link.clone());
@@ -821,6 +827,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     keyframe_requests.clone(),
                     rate.clone(),
                     display_map.clone(),
+                    headset.clone(),
                 )
                 .await;
                 let adb_handle = start_adb_bridge(&daemon_args, &shutdown_tx, link.clone());

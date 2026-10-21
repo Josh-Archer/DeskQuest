@@ -281,6 +281,11 @@ impl DebugHud {
     }
 
     /// Returns the current snapshot of metrics.
+    /// Video received, in kbit/s, as last set by [`Self::set_received_kbps`].
+    pub fn received_kbps(&self) -> u32 {
+        self.received_kbps
+    }
+
     pub fn snapshot(&self) -> &HudSnapshot {
         &self.last_snapshot
     }

@@ -19,6 +19,7 @@ use linux_quest_input::{
 use linux_quest_protocol::{ClipboardMessage, ClipboardSyncEngine, SyncAction};
 use linux_quest_transport::{ControlChannel, ControlMessage, TransportError};
 
+use crate::headset::HeadsetHub;
 use crate::link_status::SharedLinkTracker;
 use crate::HostError;
 
@@ -60,6 +61,7 @@ pub struct HostClipboardService<B: ClipboardBackend + 'static = AutoClipboardBac
     listener: Option<TcpListener>,
     peer_writers: Arc<Mutex<Vec<mpsc::UnboundedSender<ControlMessage>>>>,
     link: Option<SharedLinkTracker>,
+    headset: Option<Arc<HeadsetHub>>,
 }
 
 impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
@@ -88,12 +90,27 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
             listener: None,
             peer_writers: Arc::new(Mutex::new(Vec::new())),
             link: None,
+            headset: None,
         }
     }
 
     /// Reports accepted and closed control connections to the shared link tracker.
     pub fn with_link_tracker(mut self, link: SharedLinkTracker) -> Self {
         self.link = Some(link);
+        self
+    }
+
+    /// Greets every control connection with a headset status request and records the
+    /// answers in `hub`, so the daemon can read and change the headset's layout and settings.
+    pub fn with_headset_hub(mut self, hub: Arc<HeadsetHub>) -> Self {
+        self.headset = Some(hub);
+        self
+    }
+
+    /// Accepts control connections on `listener` while running (tests use a mock backend with a
+    /// loopback listener; the daemon uses [`HostClipboardService::bind_auto`]).
+    pub fn with_listener(mut self, listener: TcpListener) -> Self {
+        self.listener = Some(listener);
         self
     }
 
@@ -232,7 +249,14 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
         let mut ctrl_writer = ControlChannel::new(tokio::io::empty(), writer);
 
         let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<ControlMessage>();
-        self.peer_writers.lock().push(peer_tx);
+        self.peer_writers.lock().push(peer_tx.clone());
+        let headset = self.headset.clone();
+        let headset_id = headset.as_ref().map(|hub| {
+            // A headset that understands the settings channel answers with its status; an
+            // older one ignores the message (it skips what it cannot decode).
+            let _ = peer_tx.send(HeadsetHub::greeting());
+            hub.next_peer_id()
+        });
 
         let sync_engine = self.sync_engine.clone();
         let backend = self.backend.clone();
@@ -273,10 +297,21 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
                             let _ = b.set_text(&text);
                         }
                     }
+                    Ok(ControlMessage::HeadsetStatus(status)) => {
+                        if let (Some(hub), Some(id)) = (&headset, headset_id) {
+                            hub.status_received(id, peer_addr, &peer_tx, *status);
+                        }
+                    }
                     Ok(ControlMessage::Disconnect { .. }) => break,
                     Ok(_) => {}
+                    Err(e) if e.is_recoverable() => {
+                        tracing::debug!(peer = %peer_addr, error = %e, "skipping control message");
+                    }
                     Err(_) => break,
                 }
+            }
+            if let (Some(hub), Some(id)) = (&headset, headset_id) {
+                hub.peer_closed(id);
             }
             if let Some(link) = link {
                 link.lock().control_closed(peer_addr);
