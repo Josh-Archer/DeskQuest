@@ -199,6 +199,11 @@ pub enum InputEvent {
     KeyframeRequestFor {
         stream_id: u16,
     },
+    /// Text committed by an IME or virtual keyboard. Kept separate from key presses so Unicode
+    /// input does not depend on the host keyboard layout. Wire tag 10.
+    TextCommit {
+        text: String,
+    },
 }
 
 impl InputEvent {
@@ -255,6 +260,11 @@ impl InputEvent {
             InputEvent::KeyframeRequestFor { stream_id } => {
                 dst.put_u8(9);
                 dst.put_u16(*stream_id);
+            }
+            InputEvent::TextCommit { text } => {
+                dst.put_u8(10);
+                dst.put_u32(text.len() as u32);
+                dst.put_slice(text.as_bytes());
             }
         }
     }
@@ -386,6 +396,26 @@ impl InputEvent {
                 Ok(InputEvent::KeyframeRequestFor {
                     stream_id: src.get_u16(),
                 })
+            }
+            10 => {
+                if src.len() < 4 {
+                    return Err(ProtocolError::BufferTooShort {
+                        required: 4,
+                        found: src.len(),
+                    });
+                }
+                let text_len = src.get_u32() as usize;
+                if src.len() < text_len {
+                    return Err(ProtocolError::BufferTooShort {
+                        required: text_len,
+                        found: src.len(),
+                    });
+                }
+                let text = std::str::from_utf8(&src[..text_len])
+                    .map_err(|e| ProtocolError::DeserializationError(e.to_string()))?
+                    .to_owned();
+                src.advance(text_len);
+                Ok(InputEvent::TextCommit { text })
             }
             other => Err(ProtocolError::DeserializationError(format!(
                 "Invalid event tag: {other}"
@@ -600,6 +630,9 @@ mod tests {
             InputEvent::KeyframeRequestFor { stream_id: 2 },
             InputEvent::KeyframeRequestFor {
                 stream_id: u16::MAX,
+            },
+            InputEvent::TextCommit {
+                text: "héllo 🥐".into(),
             },
         ];
 
