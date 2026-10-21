@@ -5,6 +5,7 @@ pub mod handshake;
 pub mod input;
 pub mod packet;
 pub mod reassembler;
+pub mod session;
 pub mod telemetry;
 pub mod video;
 
@@ -24,6 +25,9 @@ pub use packet::{
     FLAG_KEYFRAME, FLAG_LAST_CHUNK, FLAG_NONE, HEADER_SIZE, PROTOCOL_MAGIC, PROTOCOL_VERSION,
 };
 pub use reassembler::{AssembledFrame, FrameReassembler};
+pub use session::{
+    ClientSession, ResumeStatus, SessionToken, DEFAULT_RESUME_GRACE_MS, SESSION_TOKEN_LEN,
+};
 pub use telemetry::{
     AudioLatencyBreakdown, AudioStreamTelemetry, ClientConnectionMode, ClientTransportTelemetry,
     FrameLatencyBreakdown,

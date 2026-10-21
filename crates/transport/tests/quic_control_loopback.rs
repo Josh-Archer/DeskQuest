@@ -7,8 +7,8 @@
 #![cfg(feature = "quic")]
 
 use linux_quest_protocol::{
-    chunk_clipboard_text, ClientHandshake, ClipboardReassembler, ServerHandshake, VideoCodec,
-    DEFAULT_CLIPBOARD_CHUNK_SIZE, MAX_CLIPBOARD_TEXT_SIZE,
+    chunk_clipboard_text, ClientHandshake, ClipboardReassembler, ResumeStatus, ServerHandshake,
+    SessionToken, VideoCodec, DEFAULT_CLIPBOARD_CHUNK_SIZE, MAX_CLIPBOARD_TEXT_SIZE,
 };
 use linux_quest_transport::quic::{QUIC_KEEP_ALIVE_INTERVAL, QUIC_MAX_IDLE_TIMEOUT};
 use linux_quest_transport::{
@@ -83,6 +83,7 @@ async fn handshake_round_trip_over_quic() {
         requested_displays: 1,
         max_bandwidth_mbps: 150,
         preferred_refresh_rate: 72,
+        resume_token: None,
     });
     let (mut client, mut server) = open_session(&h, &client_hello).await;
 
@@ -91,6 +92,9 @@ async fn handshake_round_trip_over_quic() {
         selected_codec: VideoCodec::Av1,
         negotiated_bitrate_mbps: 120,
         displays: vec![],
+        session_token: SessionToken::from_bytes([1; 16]),
+        resume_status: ResumeStatus::New,
+        resume_grace_ms: 30_000,
     });
     server.control.send_message(&server_hello).await.unwrap();
     assert_eq!(client.control.recv_message().await.unwrap(), server_hello);
