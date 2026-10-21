@@ -1766,3 +1766,173 @@ async fn bench_sender_latency() {
         drained.load(Ordering::Relaxed)
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Adaptive bitrate
+// ---------------------------------------------------------------------------------------------
+
+/// Records the bitrates the sender asks the encoder to switch to.
+struct BitrateProbe<E: VideoEncoder> {
+    inner: E,
+    applied: Arc<Mutex<Vec<u32>>>,
+    supports_retune: bool,
+}
+
+#[async_trait]
+impl<E: VideoEncoder> VideoEncoder for BitrateProbe<E> {
+    async fn init(&mut self, config: EncoderConfig) -> Result<(), EncoderError> {
+        self.inner.init(config).await
+    }
+    async fn encode(&mut self, frame: &RawFrame) -> Result<EncodedFrame, EncoderError> {
+        self.inner.encode(frame).await
+    }
+    fn request_keyframe(&mut self) {
+        self.inner.request_keyframe();
+    }
+    fn invalidate_reference_picture(&mut self, pts_us: u64) {
+        self.inner.invalidate_reference_picture(pts_us);
+    }
+    fn set_bitrate(&mut self, kbps: u32) -> bool {
+        self.applied.lock().push(kbps);
+        self.supports_retune
+    }
+}
+
+#[tokio::test]
+async fn the_sender_applies_live_rate_changes_to_the_encoder_and_fec() {
+    let _serial = SERIAL.lock().await;
+    let rc = crate::congestion::RateCoordinator::new(30_000, true);
+    let rate = rc.register_stream(0);
+    let applied = Arc::new(Mutex::new(Vec::new()));
+    let sink = RecordingSink::default();
+    let sent = sink.sent.clone();
+    let mut pipeline = FramePipeline::new(
+        BitrateProbe {
+            inner: ScriptedEncoder::new(vec![20 * 1200], 60),
+            applied: applied.clone(),
+            supports_retune: true,
+        },
+        sink,
+        VideoSenderConfig {
+            pacing_fraction: 0.0,
+            rate: Some(rate.clone()),
+            ..VideoSenderConfig::default()
+        },
+        Arc::new(VideoSenderStats::default()),
+    );
+    let raw = raw_frame(640, 360, Bytes::new(), 0);
+    let dest = peer("192.0.2.1:48440");
+
+    let first = pipeline
+        .send_frame(&raw, dest, &|| false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        *applied.lock(),
+        vec![30_000],
+        "initial target is applied once"
+    );
+    assert_eq!(first.parity_datagrams, 5, "base FEC ratio of 25 %");
+    pipeline.send_frame(&raw, dest, &|| false).await.unwrap();
+    assert_eq!(
+        applied.lock().len(),
+        1,
+        "an unchanged target is not re-applied"
+    );
+
+    // The client reports heavy loss: lower bitrate, more parity.
+    rc.on_feedback(
+        &linux_quest_protocol::NetworkFeedback {
+            loss_permille: 150,
+            delay_trend_us_per_s: 0,
+            jitter_us: 0,
+            received_kbps: 12_000,
+            focused_stream: linux_quest_protocol::NO_FOCUSED_STREAM,
+        },
+        Instant::now(),
+    );
+    tokio::time::sleep(MIN_BITRATE_APPLY_INTERVAL + Duration::from_millis(20)).await;
+    let report = pipeline
+        .send_frame(&raw, dest, &|| false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(*applied.lock(), vec![30_000, 8_400]);
+    assert!(
+        report.parity_datagrams > 5,
+        "loss raised parity to {}",
+        report.parity_datagrams
+    );
+    assert_eq!(sent.lock().len(), 25 * 2 + report.datagrams);
+}
+
+#[tokio::test]
+async fn an_encoder_that_cannot_retune_is_not_asked_again_every_frame() {
+    let _serial = SERIAL.lock().await;
+    let rc = crate::congestion::RateCoordinator::new(10_000, true);
+    let rate = rc.register_stream(0);
+    let applied = Arc::new(Mutex::new(Vec::new()));
+    let mut pipeline = FramePipeline::new(
+        BitrateProbe {
+            inner: ScriptedEncoder::new(vec![1200], 60),
+            applied: applied.clone(),
+            supports_retune: false,
+        },
+        RecordingSink::default(),
+        VideoSenderConfig {
+            pacing_fraction: 0.0,
+            rate: Some(rate),
+            ..VideoSenderConfig::default()
+        },
+        Arc::new(VideoSenderStats::default()),
+    );
+    let raw = raw_frame(64, 64, Bytes::new(), 0);
+    let dest = peer("192.0.2.1:48440");
+    for _ in 0..5 {
+        pipeline.send_frame(&raw, dest, &|| false).await.unwrap();
+    }
+    assert_eq!(applied.lock().len(), 1);
+}
+
+#[test]
+fn achieved_rate_is_measured_over_windows_without_counting_parity() {
+    let mut w = RateWindow::new();
+    let t0 = Instant::now();
+    assert_eq!(w.record(62_500, t0), None);
+    assert_eq!(w.record(62_500, t0 + Duration::from_millis(250)), None);
+    // 187 500 B in 0.5 s = 3 Mbit/s.
+    assert_eq!(
+        w.record(62_500, t0 + Duration::from_millis(500)),
+        Some(3_000)
+    );
+    assert_eq!(w.record(0, t0 + Duration::from_millis(600)), None);
+}
+
+#[tokio::test]
+async fn the_sender_publishes_its_achieved_video_rate() {
+    let _serial = SERIAL.lock().await;
+    let rc = crate::congestion::RateCoordinator::new(30_000, true);
+    let rate = rc.register_stream(0);
+    let mut pipeline = FramePipeline::new(
+        ScriptedEncoder::new(vec![20 * 1200], 60),
+        RecordingSink::default(),
+        VideoSenderConfig {
+            pacing_fraction: 0.0,
+            rate: Some(rate.clone()),
+            ..VideoSenderConfig::default()
+        },
+        Arc::new(VideoSenderStats::default()),
+    );
+    let raw = raw_frame(64, 64, Bytes::new(), 0);
+    let dest = peer("192.0.2.1:48440");
+    let end = Instant::now() + RATE_WINDOW + Duration::from_millis(50);
+    while Instant::now() < end {
+        pipeline.send_frame(&raw, dest, &|| false).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(16)).await;
+    }
+    pipeline.send_frame(&raw, dest, &|| false).await.unwrap();
+    // ~60 fps x 24 kB payload is ~11.5 Mbit/s; allow wide timer slack.
+    let kbps = rate.actual_kbps();
+    assert!((4_000..=16_000).contains(&kbps), "measured {kbps} kbit/s");
+}

@@ -768,6 +768,13 @@ impl QuestClientRuntime {
             self.receiver.packets_lost_count(),
         );
         self.hud.set_input_latency_us(pointer_latency_us);
+        // Tell the host how the network is doing so it can adapt the bitrate.
+        if let Some(feedback) = self.receiver.poll_feedback(Instant::now()) {
+            self.hud.set_received_kbps(feedback.received_kbps);
+            if let Some(sink) = &self.pointer_event_sink {
+                sink(InputEvent::NetworkFeedback(feedback));
+            }
+        }
 
         // 6. Submit composition layers to OpenXR compositor for timewarp display
         // The settings panel takes over the head-locked overlay while it is open.

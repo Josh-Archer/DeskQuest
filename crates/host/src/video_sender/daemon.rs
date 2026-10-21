@@ -17,6 +17,7 @@ use super::{
     VideoSenderHandle, DEFAULT_SEND_BUFFER_BYTES,
 };
 use crate::codec_select::{plan_stream, StreamPlan, CLIENT_DECODE_CODECS, CODEC_PREFERENCE};
+use crate::congestion::{RateCoordinator, StreamRate};
 use crate::link_status::SharedLinkTracker;
 
 /// Adapts the capture crate's [`DisplayCapture`] to [`FrameSource`].
@@ -149,6 +150,10 @@ impl VideoEncoder for BoxedEncoder {
     fn invalidate_reference_picture(&mut self, pts_us: u64) {
         self.0.invalidate_reference_picture(pts_us);
     }
+
+    fn set_bitrate(&mut self, kbps: u32) -> bool {
+        self.0.set_bitrate(kbps)
+    }
 }
 
 /// Opens the encoder the existing stream planner picks ([`plan_stream`]: the preference's
@@ -214,20 +219,33 @@ pub async fn start_daemon_video_sender(
     link: SharedLinkTracker,
     options: DaemonVideoOptions,
     keyframe_requests: Arc<KeyframeRequests>,
+    rate: Option<Arc<RateCoordinator>>,
 ) -> Result<VideoSenderHandle, String> {
-    start_daemon_video_stream(link, options, 0, 0, options.bitrate_mbps, keyframe_requests).await
+    let stream_rate = rate.as_ref().map(|r| r.register_stream(0));
+    start_daemon_video_stream(
+        link,
+        options,
+        0,
+        0,
+        options.bitrate_mbps.saturating_mul(1000),
+        keyframe_requests,
+        stream_rate,
+    )
+    .await
 }
 
 /// Starts independent capture/encode/send pipelines for the supplied active monitors. Each
 /// pipeline owns its packetizer, FEC state, pacing state and stream id, and takes its own
 /// keyframe flag from `keyframe_requests`.
 /// Bitrate is divided evenly (remainder goes to lower ids) so the aggregate does not exceed
-/// the configured session bitrate.
+/// the configured session bitrate. With a `rate` coordinator each stream starts at the
+/// coordinator's share and then follows its live, focus-weighted targets.
 pub async fn start_daemon_video_senders(
     link: SharedLinkTracker,
     options: DaemonVideoOptions,
     monitors: &[linux_quest_protocol::DisplayInfo],
     keyframe_requests: Arc<KeyframeRequests>,
+    rate: Option<Arc<RateCoordinator>>,
 ) -> Result<Vec<VideoSenderHandle>, String> {
     if monitors.is_empty() {
         return Err("no active monitors to stream".into());
@@ -239,16 +257,22 @@ pub async fn start_daemon_video_senders(
         ));
     }
     let shares = bitrate_shares(options.bitrate_mbps, monitors.len())?;
+    // Register every stream before starting any, so the first split already covers them all.
+    let stream_rates: Vec<Option<Arc<StreamRate>>> = monitors
+        .iter()
+        .map(|m| rate.as_ref().map(|r| r.register_stream(m.display_id)))
+        .collect();
     let mut handles = Vec::with_capacity(monitors.len());
-    for (monitor, bitrate) in monitors.iter().zip(shares) {
+    for ((monitor, bitrate), stream_rate) in monitors.iter().zip(shares).zip(stream_rates) {
         handles.push(
             start_daemon_video_stream(
                 link.clone(),
                 options,
                 monitor.display_id,
                 monitor.display_id,
-                bitrate,
+                bitrate.saturating_mul(1000),
                 keyframe_requests.clone(),
+                stream_rate,
             )
             .await?,
         );
@@ -278,8 +302,9 @@ async fn start_daemon_video_stream(
     options: DaemonVideoOptions,
     display_id: u16,
     stream_id: u16,
-    bitrate_mbps: u32,
+    initial_bitrate_kbps: u32,
     keyframe_requests: Arc<KeyframeRequests>,
+    rate: Option<Arc<StreamRate>>,
 ) -> Result<VideoSenderHandle, String> {
     let defaults = EncoderConfig::default();
     let capture = AutoCapture::new(display_id, defaults.width, defaults.height, defaults.fps);
@@ -288,7 +313,10 @@ async fn start_daemon_video_stream(
         .await
         .map_err(|e| format!("capture: {e}"))?;
     let geometry = encode_geometry(source.capture_info().as_ref(), &defaults);
-    let bitrate_kbps = bitrate_mbps.saturating_mul(1000);
+    // A coordinator's share (focus-weighted) replaces the even split.
+    let bitrate_kbps = rate
+        .as_ref()
+        .map_or(initial_bitrate_kbps, |r| r.target_kbps());
     let (encoder, plan) = open_planned_encoder(options.encoder, bitrate_kbps, geometry)
         .await
         .map_err(|e| format!("encoder: {e}"))?;
@@ -296,7 +324,7 @@ async fn start_daemon_video_stream(
     tracing::info!(
         backend = plan.backend.name(),
         codec = ?plan.codec,
-        bitrate_mbps,
+        bitrate_kbps,
         stream_id,
         width = geometry.0,
         height = geometry.1,
@@ -309,6 +337,7 @@ async fn start_daemon_video_stream(
         video_port: options.video_port,
         stream_id,
         keyframe_requests: Some(keyframe_requests),
+        rate,
         ..VideoSenderConfig::default()
     };
     Ok(spawn_video_sender(source, encoder, sink, link, config))
@@ -356,6 +385,7 @@ mod tests {
                 bitrate_mbps: 30,
             },
             KeyframeRequests::new(),
+            None,
         )
         .await;
         // On a machine without a real capture backend and NVENC (CI, containers) this is an

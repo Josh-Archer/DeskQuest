@@ -8,6 +8,7 @@ use linux_quest_display::DisplayLayoutMode;
 use linux_quest_encoder::{probe_backends, BackendPreference};
 use linux_quest_host::adb_link::{spawn_adb_supervisor, AdbSupervisorConfig};
 use linux_quest_host::codec_select::{plan_stream, CLIENT_DECODE_CODECS, CODEC_PREFERENCE};
+use linux_quest_host::congestion::RateCoordinator;
 use linux_quest_host::link_status::{
     new_shared_link_tracker, SharedLinkTracker, DEFAULT_INPUT_LIVENESS,
 };
@@ -102,6 +103,12 @@ struct DaemonArgs {
     /// Video bitrate in Mbit/s (default 30)
     #[arg(long, value_name = "MBPS", default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=500))]
     bitrate: u32,
+
+    /// Keep the video bitrate fixed at --bitrate instead of adapting it to client feedback
+    /// (loss, delay, jitter). By default --bitrate is the ceiling and the host lowers it live
+    /// when the link degrades.
+    #[arg(long)]
+    fixed_bitrate: bool,
 
     /// Number of video streams (headset screens) to send, 1 to 3. Stream 0 is the desktop
     /// capture; streams 1 and up are synthetic test patterns for now. All go to --video-port.
@@ -274,6 +281,7 @@ async fn start_stream_services(
     shutdown_tx: &tokio::sync::broadcast::Sender<()>,
     link: SharedLinkTracker,
     keyframe_requests: Arc<KeyframeRequests>,
+    rate: Arc<RateCoordinator>,
 ) -> (Option<u16>, Option<u16>) {
     let mut input_port = None;
     let mut control_port = None;
@@ -283,7 +291,8 @@ async fn start_stream_services(
         Ok(input_service) => {
             let mut input_service = input_service
                 .with_link_tracker(link.clone())
-                .with_keyframe_requests(keyframe_requests);
+                .with_keyframe_requests(keyframe_requests)
+                .with_rate_coordinator(rate);
             input_port = input_service.local_addr().ok().map(|a| a.port());
             let running_flag = input_service.running_flag();
             let auto_injector = input_service.injector();
@@ -358,6 +367,7 @@ async fn start_video(
     args: &DaemonArgs,
     link: SharedLinkTracker,
     keyframe_requests: Arc<KeyframeRequests>,
+    rate: Arc<RateCoordinator>,
 ) -> Option<MultiVideoSenderHandle> {
     if args.no_video {
         info!("UDP video sender disabled by --no-video");
@@ -377,6 +387,7 @@ async fn start_video(
         link,
         options,
         keyframe_requests,
+        Some(rate),
     )
     .await
     {
@@ -519,8 +530,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let shutdown_flag_clone = shutdown_flag.clone();
 
                 // The TUI run binds the listeners but does not advertise them.
-                let _ = start_stream_services(&shutdown_tx, link.clone(), KeyframeRequests::new())
-                    .await;
+                let _ = start_stream_services(
+                    &shutdown_tx,
+                    link.clone(),
+                    KeyframeRequests::new(),
+                    Arc::new(RateCoordinator::new(
+                        daemon_args.bitrate.saturating_mul(1000),
+                        false,
+                    )),
+                )
+                .await;
                 let adb_handle = start_adb_bridge(&daemon_args, &shutdown_tx, link.clone());
 
                 let host_clone = host.clone();
@@ -563,12 +582,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                 // Client keyframe requests: set by the input receiver, consumed by the video sender.
                 let keyframe_requests = KeyframeRequests::new();
-                let (control_port, input_port) =
-                    start_stream_services(&shutdown_tx, link.clone(), keyframe_requests.clone())
-                        .await;
+                // Adaptive bitrate: --bitrate is the ceiling; client feedback lowers it live.
+                let rate = Arc::new(
+                    RateCoordinator::new(
+                        daemon_args.bitrate.saturating_mul(1000),
+                        !daemon_args.fixed_bitrate,
+                    )
+                    .with_link(link.clone()),
+                );
+                linux_quest_host::congestion::install_global(rate.clone());
+                {
+                    let rate = rate.clone();
+                    let mut stop = shutdown_tx.subscribe();
+                    tokio::spawn(async move {
+                        let mut tick = tokio::time::interval(Duration::from_millis(250));
+                        loop {
+                            tokio::select! {
+                                _ = tick.tick() => rate.tick(std::time::Instant::now()),
+                                _ = stop.recv() => break,
+                            }
+                        }
+                    });
+                }
+                let (control_port, input_port) = start_stream_services(
+                    &shutdown_tx,
+                    link.clone(),
+                    keyframe_requests.clone(),
+                    rate.clone(),
+                )
+                .await;
                 let adb_handle = start_adb_bridge(&daemon_args, &shutdown_tx, link.clone());
 
-                let video = start_video(&daemon_args, link.clone(), keyframe_requests).await;
+                let video = start_video(&daemon_args, link.clone(), keyframe_requests, rate).await;
 
                 // Advertise only the ports that were really bound above.
                 let listening = match (control_port, input_port) {
@@ -687,6 +732,12 @@ mod tests {
             Some(Commands::Daemon(daemon)) => daemon,
             other => panic!("expected daemon subcommand, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fixed_bitrate_flag_defaults_off() {
+        assert!(!parse_daemon(&["daemon"]).fixed_bitrate);
+        assert!(parse_daemon(&["daemon", "--fixed-bitrate"]).fixed_bitrate);
     }
 
     #[test]

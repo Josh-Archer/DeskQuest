@@ -2755,6 +2755,19 @@ impl VideoEncoder for VaapiEncoder {
             s.dpb.invalidate(pts_us);
         }
     }
+
+    /// The rate-control and HRD buffers are rebuilt for every picture from the session
+    /// config, so a new rate takes effect on the next frame without a new sequence.
+    fn set_bitrate(&mut self, kbps: u32) -> bool {
+        self.config.bitrate_kbps = kbps;
+        match self.session.as_mut() {
+            Some(s) => {
+                s.config.bitrate_kbps = kbps;
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 impl Drop for VaapiEncoder {

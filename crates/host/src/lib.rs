@@ -15,6 +15,7 @@ pub mod advertise;
 pub mod audio_pipeline;
 pub mod clipboard_service;
 pub mod codec_select;
+pub mod congestion;
 pub mod input_receiver;
 pub mod ipc;
 pub mod link_status;

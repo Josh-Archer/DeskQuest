@@ -28,6 +28,7 @@ use super::{
     spawn_video_sender, Dscp, KeyframeRequests, UdpSink, VideoSenderConfig, VideoSenderHandle,
     VideoSenderStats, DEFAULT_SEND_BUFFER_BYTES,
 };
+use crate::congestion::{RateCoordinator, StreamRate};
 use crate::link_status::SharedLinkTracker;
 
 /// Most video streams the daemon sends: the headset shows at most three screens.
@@ -188,6 +189,7 @@ pub async fn start_daemon_video_senders(
     link: SharedLinkTracker,
     options: MultiStreamOptions,
     keyframe_requests: Arc<KeyframeRequests>,
+    rate: Option<Arc<RateCoordinator>>,
 ) -> Result<MultiVideoSenderHandle, String> {
     if !(1..=MAX_VIDEO_STREAMS).contains(&options.streams) {
         return Err(format!(
@@ -195,8 +197,13 @@ pub async fn start_daemon_video_senders(
             options.streams
         ));
     }
-    let primary =
-        start_daemon_video_sender(link.clone(), options.video, keyframe_requests.clone()).await?;
+    let primary = start_daemon_video_sender(
+        link.clone(),
+        options.video,
+        keyframe_requests.clone(),
+        rate.clone(),
+    )
+    .await?;
     let mut streams = vec![(0, primary)];
 
     for stream_id in 1..options.streams {
@@ -206,6 +213,7 @@ pub async fn start_daemon_video_senders(
             stream_id,
             options.extra_stream,
             keyframe_requests.clone(),
+            rate.as_ref().map(|r| r.register_stream(stream_id)),
         )
         .await
         {
@@ -234,12 +242,16 @@ async fn start_synthetic_stream(
     stream_id: u16,
     size: StreamSize,
     keyframe_requests: Arc<KeyframeRequests>,
+    rate: Option<Arc<StreamRate>>,
 ) -> Result<VideoSenderHandle, String> {
     let capture = SyntheticCapture::new(stream_id, size.width, size.height, size.fps);
     let source = CaptureFrameSource::open(capture, true)
         .await
         .map_err(|e| format!("capture: {e}"))?;
-    let bitrate_kbps = options.bitrate_mbps.saturating_mul(1000);
+    let bitrate_kbps = rate.as_ref().map_or_else(
+        || options.bitrate_mbps.saturating_mul(1000),
+        |r| r.target_kbps(),
+    );
     let (encoder, plan) = open_planned_encoder(
         options.encoder,
         bitrate_kbps,
@@ -263,6 +275,7 @@ async fn start_synthetic_stream(
         video_port: options.video_port,
         stream_id,
         keyframe_requests: Some(keyframe_requests),
+        rate,
         ..VideoSenderConfig::default()
     };
     Ok(spawn_video_sender(source, encoder, sink, link, config))
@@ -353,7 +366,7 @@ mod tests {
                 fps: 30,
             },
         };
-        let handle = start_daemon_video_senders(link, options, KeyframeRequests::new())
+        let handle = start_daemon_video_senders(link, options, KeyframeRequests::new(), None)
             .await
             .expect("mock encoder and synthetic capture need no hardware");
         assert_eq!(handle.stream_count(), 3);
@@ -391,9 +404,10 @@ mod tests {
             streams: 1,
             extra_stream: StreamSize::default(),
         };
-        let handle = start_daemon_video_senders(link.clone(), options, KeyframeRequests::new())
-            .await
-            .unwrap();
+        let handle =
+            start_daemon_video_senders(link.clone(), options, KeyframeRequests::new(), None)
+                .await
+                .unwrap();
         assert_eq!(handle.stream_ids(), vec![0]);
         handle.stop().await;
 
@@ -401,7 +415,7 @@ mod tests {
             streams: 4,
             ..options
         };
-        let err = start_daemon_video_senders(link, too_many, KeyframeRequests::new())
+        let err = start_daemon_video_senders(link, too_many, KeyframeRequests::new(), None)
             .await
             .err()
             .expect("four streams are refused");

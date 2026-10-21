@@ -147,6 +147,7 @@ pub struct DisplayMetricModel {
     pub fps: f64,
     pub fps_history: RollingWindow<u64>,
     pub bitrate_mbps: f64,
+    pub target_bitrate_mbps: f64,
     pub bitrate_history: RollingWindow<u64>,
     pub codec: String,
     pub is_virtual: bool,
@@ -164,6 +165,7 @@ impl DisplayMetricModel {
             fps: refresh_rate as f64,
             fps_history: RollingWindow::new(60),
             bitrate_mbps: 0.0,
+            target_bitrate_mbps: 0.0,
             bitrate_history: RollingWindow::new(60),
             codec: "AV1".to_string(),
             is_virtual: true,
@@ -492,7 +494,10 @@ pub struct DisplaySnapshot {
     pub height: u32,
     pub refresh_rate: u32,
     pub fps: f32,
+    /// Video bitrate the sender actually achieved.
     pub bitrate_mbps: f32,
+    /// Bitrate the congestion controller currently asks the encoder for.
+    pub target_bitrate_mbps: f32,
     pub codec: String,
     pub is_virtual: bool,
 }
@@ -546,12 +551,14 @@ impl DashboardModel {
                 existing.codec = d.codec;
                 existing.is_virtual = d.is_virtual;
                 existing.update_metrics(d.fps as f64, d.bitrate_mbps as f64);
+                existing.target_bitrate_mbps = d.target_bitrate_mbps as f64;
             } else {
                 let mut new_disp =
                     DisplayMetricModel::new(d.id, d.name, d.width, d.height, d.refresh_rate);
                 new_disp.codec = d.codec;
                 new_disp.is_virtual = d.is_virtual;
                 new_disp.update_metrics(d.fps as f64, d.bitrate_mbps as f64);
+                new_disp.target_bitrate_mbps = d.target_bitrate_mbps as f64;
                 self.displays.push(new_disp);
             }
         }
@@ -684,6 +691,7 @@ mod tests {
                 refresh_rate: 90,
                 fps: 89.9,
                 bitrate_mbps: 75.4,
+                target_bitrate_mbps: 75.4,
                 codec: "AV1".into(),
                 is_virtual: true,
             }],

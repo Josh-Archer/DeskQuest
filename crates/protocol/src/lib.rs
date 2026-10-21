@@ -20,8 +20,9 @@ pub use handshake::{
     WINDOW_STREAM_ID_BASE,
 };
 pub use input::{
-    ElementState, InputBatch, InputEvent, KeyModifiers, MouseButton, RedundantKeyEvent,
-    INPUT_BATCH_HEADER_SIZE, INPUT_BATCH_MAGIC, INPUT_BATCH_VERSION,
+    ElementState, InputBatch, InputEvent, KeyModifiers, MouseButton, NetworkFeedback,
+    RedundantKeyEvent, INPUT_BATCH_HEADER_SIZE, INPUT_BATCH_MAGIC, INPUT_BATCH_VERSION,
+    NO_FOCUSED_STREAM,
 };
 pub use packet::{
     Packet, PacketHeader, PacketType, FLAG_COMPRESSED, FLAG_FEC_PROTECTED, FLAG_INTRA_REFRESH,

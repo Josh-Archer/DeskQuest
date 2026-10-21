@@ -178,6 +178,15 @@ protocol changes that are out of scope here.
   most half a frame interval, DSCP AF41 is set best effort, and at most one frame waits for the
   encoder. mDNS advertises the `video` port (48440) only while the sender is actually running;
   otherwise the `video` key is omitted.
+- Adaptive bitrate: the client sends an `InputEvent::NetworkFeedback` every ~200 ms on the input
+  channel (loss left after FEC, one-way delay trend, jitter, received kbit/s, focused panel). The
+  host's `congestion` module cuts the target on loss or rising delay and probes back up
+  multiplicatively once the path is clean, so a dip recovers in a few seconds. `--bitrate` is the
+  ceiling; `--fixed-bitrate` disables adaptation. Wi-Fi reacts fast and raises FEC parity from 25%
+  towards 50% under loss; USB/ADB stays within 70-100% of the ceiling with fixed FEC. The target is
+  split across monitor streams with the focused panel weighted 3x, applied to each encoder live
+  (`VideoEncoder::set_bitrate`; VA-API and the mock apply it, NVENC does not yet), and shown as
+  actual/target in the host dashboard.
 
 ---
 

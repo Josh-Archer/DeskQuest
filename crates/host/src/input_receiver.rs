@@ -9,6 +9,7 @@ use linux_quest_input::InputInjector;
 use linux_quest_protocol::InputEvent;
 use linux_quest_transport::{InputChannelReceiver, TransportError};
 
+use crate::congestion::RateCoordinator;
 use crate::link_status::SharedLinkTracker;
 use crate::video_sender::KeyframeRequests;
 use crate::HostError;
@@ -21,6 +22,7 @@ pub struct HostInputReceiver<I: InputInjector> {
     running: Arc<AtomicBool>,
     link: Option<SharedLinkTracker>,
     keyframe_requests: Option<Arc<KeyframeRequests>>,
+    rate: Option<Arc<RateCoordinator>>,
 }
 
 impl<I: InputInjector> HostInputReceiver<I> {
@@ -31,15 +33,22 @@ impl<I: InputInjector> HostInputReceiver<I> {
             running: Arc::new(AtomicBool::new(false)),
             link: None,
             keyframe_requests: None,
+            rate: None,
         }
     }
 
-    /// Raises the stream's flag in `requests` when the client sends [`InputEvent::KeyframeRequest`]
-    /// (stream 0) or [`InputEvent::KeyframeRequestFor`] (the named stream) because it lost video;
-    /// that stream's video sender clears the flag and forces an IDR. Without this the request is
-    /// dropped.
+    /// Raises the stream's flag in `requests` when the client sends a keyframe request because it
+    /// lost video; that stream's video sender clears the flag and forces an IDR. Without this the
+    /// request is dropped.
     pub fn with_keyframe_requests(mut self, requests: Arc<KeyframeRequests>) -> Self {
         self.keyframe_requests = Some(requests);
+        self
+    }
+
+    /// Hands the client's [`InputEvent::NetworkFeedback`] reports to the congestion
+    /// controller. Without this they are dropped.
+    pub fn with_rate_coordinator(mut self, rate: Arc<RateCoordinator>) -> Self {
+        self.rate = Some(rate);
         self
     }
 
@@ -83,6 +92,17 @@ impl<I: InputInjector> HostInputReceiver<I> {
                 };
                 if !requests.request(stream_id) {
                     tracing::debug!(stream_id, "Ignoring keyframe request for an unknown stream");
+                }
+            }
+        }
+        let (feedback, events): (Vec<_>, Vec<_>) = events
+            .into_iter()
+            .partition(|e| matches!(e, InputEvent::NetworkFeedback(_)));
+        if let Some(rate) = &self.rate {
+            let now = std::time::Instant::now();
+            for event in feedback {
+                if let InputEvent::NetworkFeedback(f) = event {
+                    rate.on_feedback(&f, now);
                 }
             }
         }
@@ -340,6 +360,44 @@ mod tests {
         let count = host_receiver.step().await.unwrap();
         assert_eq!(count, 0);
         assert!(injector.lock().unwrap().received_events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn network_feedback_reaches_the_rate_controller_and_is_not_injected() {
+        let s_sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let s_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr_sender = s_sender.local_addr().unwrap();
+        let addr_receiver = s_receiver.local_addr().unwrap();
+        let mut sender = InputChannelSender::new(s_sender, Some(addr_receiver), 4);
+        let receiver = InputChannelReceiver::new(s_receiver, Some(addr_sender), true);
+
+        let rate = Arc::new(RateCoordinator::new(30_000, true));
+        let stream = rate.register_stream(0);
+        let injector = Arc::new(Mutex::new(MockInputInjector::new()));
+        let mut host_receiver =
+            HostInputReceiver::new(receiver, injector.clone()).with_rate_coordinator(rate.clone());
+
+        let normal = InputEvent::MouseMoveRelative { dx: 1, dy: 2 };
+        sender
+            .send_events(
+                vec![
+                    InputEvent::NetworkFeedback(linux_quest_protocol::NetworkFeedback {
+                        loss_permille: 200,
+                        delay_trend_us_per_s: 0,
+                        jitter_us: 0,
+                        received_kbps: 10_000,
+                        focused_stream: linux_quest_protocol::NO_FOCUSED_STREAM,
+                    }),
+                    normal.clone(),
+                ],
+                100_000,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(host_receiver.step().await.unwrap(), 1);
+        assert_eq!(stream.target_kbps(), 7_000);
+        assert_eq!(injector.lock().unwrap().received_events, vec![normal]);
     }
 
     #[tokio::test]

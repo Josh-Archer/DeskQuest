@@ -9,8 +9,8 @@ use linux_quest_protocol::{
 use std::sync::Arc;
 
 use crate::ipc::{
-    build_dashboard_snapshot, daemon_uptime_secs, mark_daemon_start, send_daemon_request,
-    DaemonRequest, DaemonResponse,
+    apply_stream_rates, build_dashboard_snapshot, daemon_uptime_secs, mark_daemon_start,
+    send_daemon_request, DaemonRequest, DaemonResponse,
 };
 use crate::link_status::SharedLinkTracker;
 use crate::tui::model::{DashboardSnapshot, DisplaySnapshot};
@@ -130,6 +130,7 @@ impl TelemetrySource for MockTelemetrySource {
                     refresh_rate: 90,
                     fps: fps1 as f32,
                     bitrate_mbps: 78.5 + (t.sin() * 2.0) as f32,
+                    target_bitrate_mbps: 78.5 + (t.sin() * 2.0) as f32,
                     codec: "AV1".into(),
                     is_virtual: true,
                 },
@@ -141,6 +142,7 @@ impl TelemetrySource for MockTelemetrySource {
                     refresh_rate: 72,
                     fps: fps2 as f32,
                     bitrate_mbps: 34.1 + (t.cos() * 1.5) as f32,
+                    target_bitrate_mbps: 34.1 + (t.cos() * 1.5) as f32,
                     codec: "AV1".into(),
                     is_virtual: true,
                 },
@@ -199,11 +201,9 @@ impl TelemetrySource for LiveDaemonTelemetrySource {
     async fn fetch_snapshot(&mut self) -> Result<DashboardSnapshot, HostError> {
         let monitors = self.host.list_monitors().await;
         let status = self.link.lock().status(Instant::now());
-        Ok(build_dashboard_snapshot(
-            monitors,
-            status,
-            daemon_uptime_secs(),
-        ))
+        let mut snapshot = build_dashboard_snapshot(monitors, status, daemon_uptime_secs());
+        apply_stream_rates(&mut snapshot, &crate::congestion::global_snapshot());
+        Ok(snapshot)
     }
 }
 

@@ -171,6 +171,21 @@ pub fn daemon_uptime_secs() -> u64 {
     DAEMON_START.get().map_or(0, |t| t.elapsed().as_secs())
 }
 
+/// Fills the per-display bitrate columns and the client's total from the video senders'
+/// rates. Streams are matched to displays by id; displays without a stream keep zeros.
+pub fn apply_stream_rates(
+    snapshot: &mut DashboardSnapshot,
+    rates: &[crate::congestion::StreamRateSnapshot],
+) {
+    for display in &mut snapshot.displays {
+        if let Some(rate) = rates.iter().find(|r| r.stream_id == display.id) {
+            display.bitrate_mbps = rate.actual_kbps as f32 / 1000.0;
+            display.target_bitrate_mbps = rate.target_kbps as f32 / 1000.0;
+        }
+    }
+    snapshot.client.bitrate_mbps = rates.iter().map(|r| r.actual_kbps).sum::<u32>() as f32 / 1000.0;
+}
+
 /// Builds the dashboard snapshot from the live virtual monitors and the derived link state.
 ///
 /// `client.mode` comes only from `link`. `streaming` is true only when a client is connected
@@ -196,6 +211,7 @@ pub fn build_dashboard_snapshot(
             refresh_rate: m.refresh_rate,
             fps: 0.0,
             bitrate_mbps: 0.0,
+            target_bitrate_mbps: 0.0,
             codec: String::new(),
             is_virtual: m.is_virtual,
         })
@@ -287,11 +303,9 @@ async fn handle_ipc_client(
         DaemonRequest::DashboardSnapshot => {
             let monitors = host.list_monitors().await;
             let status = link.lock().status(std::time::Instant::now());
-            DaemonResponse::DashboardSnapshot(Box::new(build_dashboard_snapshot(
-                monitors,
-                status,
-                daemon_uptime_secs(),
-            )))
+            let mut snapshot = build_dashboard_snapshot(monitors, status, daemon_uptime_secs());
+            apply_stream_rates(&mut snapshot, &crate::congestion::global_snapshot());
+            DaemonResponse::DashboardSnapshot(Box::new(snapshot))
         }
     };
 
@@ -350,6 +364,40 @@ mod tests {
             is_virtual: true,
             edid_path: None,
         }
+    }
+
+    #[test]
+    fn stream_rates_fill_the_target_and_actual_bitrate_columns() {
+        let mut snap = build_dashboard_snapshot(
+            vec![virtual_monitor(1), virtual_monitor(2), virtual_monitor(3)],
+            LinkTracker::new(DEFAULT_INPUT_LIVENESS).status(Instant::now()),
+            0,
+        );
+        apply_stream_rates(
+            &mut snap,
+            &[
+                crate::congestion::StreamRateSnapshot {
+                    stream_id: 1,
+                    target_kbps: 20_000,
+                    actual_kbps: 18_500,
+                    fec_ratio: 0.25,
+                },
+                crate::congestion::StreamRateSnapshot {
+                    stream_id: 2,
+                    target_kbps: 10_000,
+                    actual_kbps: 9_500,
+                    fec_ratio: 0.25,
+                },
+            ],
+        );
+        assert_eq!(snap.displays[0].target_bitrate_mbps, 20.0);
+        assert_eq!(snap.displays[0].bitrate_mbps, 18.5);
+        assert_eq!(snap.displays[1].target_bitrate_mbps, 10.0);
+        assert_eq!(
+            snap.displays[2].target_bitrate_mbps, 0.0,
+            "no stream for display 3"
+        );
+        assert_eq!(snap.client.bitrate_mbps, 28.0);
     }
 
     #[test]
