@@ -43,7 +43,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -125,15 +125,13 @@ impl SharedInputEvents {
 /// Sender source combining queued pointer events with keyframe requests.
 pub struct PointerInputSource {
     pub events: SharedInputEvents,
-    pub keyframe: Arc<AtomicBool>,
+    pub keyframe: KeyframeRequestFlags,
 }
 
 impl InputSource for PointerInputSource {
     fn poll(&mut self) -> Vec<InputEvent> {
         let mut events = self.events.drain();
-        if self.keyframe.swap(false, Ordering::AcqRel) {
-            events.push(InputEvent::KeyframeRequest);
-        }
+        events.extend(self.keyframe.take_events());
         events
     }
 }
@@ -144,11 +142,11 @@ impl InputSource for PointerInputSource {
 /// [`KeyframeRequestSource`] drains only the keyboard [`InputEventQueue`], while
 /// [`PointerInputSource`] drains only the pointer [`SharedInputEvents`]; the runtime needs
 /// one sender carrying both, so this source drains both queues (keyboard first, then
-/// pointer) and appends [`InputEvent::KeyframeRequest`] when the shared flag is raised.
+/// pointer) and appends the pending per-stream keyframe requests.
 pub struct CombinedInputSource {
     keyboard: InputEventQueue,
     pointer: SharedInputEvents,
-    keyframe: Arc<AtomicBool>,
+    keyframe: KeyframeRequestFlags,
 }
 
 impl CombinedInputSource {
@@ -156,12 +154,12 @@ impl CombinedInputSource {
         Self {
             keyboard: InputEventQueue::default(),
             pointer: SharedInputEvents::default(),
-            keyframe: Arc::new(AtomicBool::new(false)),
+            keyframe: KeyframeRequestFlags::default(),
         }
     }
 
     /// The flag to raise when a keyframe is needed.
-    pub fn requester(&self) -> Arc<AtomicBool> {
+    pub fn requester(&self) -> KeyframeRequestFlags {
         self.keyframe.clone()
     }
 
@@ -186,9 +184,7 @@ impl InputSource for CombinedInputSource {
     fn poll(&mut self) -> Vec<InputEvent> {
         let mut events = self.keyboard.drain();
         events.extend(self.pointer.drain());
-        if self.keyframe.swap(false, Ordering::AcqRel) {
-            events.push(InputEvent::KeyframeRequest);
-        }
+        events.extend(self.keyframe.take_events());
         events
     }
 }
@@ -221,25 +217,52 @@ impl InputSource for KeepaliveOnlySource {
     }
 }
 
-/// An [`InputSource`] that only emits keepalives, plus [`InputEvent::KeyframeRequest`] each
-/// time [`KeyframeRequestSource::requester`]'s flag is raised (then call
+/// Streams waiting for a keyframe request, one bit per stream id (ids 0..32).
+#[derive(Debug, Default, Clone)]
+pub struct KeyframeRequestFlags(Arc<AtomicU32>);
+
+impl KeyframeRequestFlags {
+    /// Marks `stream_id` as needing a keyframe. Ids of 32 and above are ignored.
+    pub fn raise(&self, stream_id: u16) {
+        if let Some(bit) = 1u32.checked_shl(u32::from(stream_id)) {
+            self.0.fetch_or(bit, Ordering::AcqRel);
+        }
+    }
+
+    /// Takes the pending streams as request events: [`InputEvent::KeyframeRequest`] for
+    /// stream 0 (what single-stream hosts understand) and
+    /// [`InputEvent::KeyframeRequestFor`] for the others.
+    fn take_events(&self) -> Vec<InputEvent> {
+        let pending = self.0.swap(0, Ordering::AcqRel);
+        (0..32u16)
+            .filter(|id| pending & (1 << id) != 0)
+            .map(|id| match id {
+                0 => InputEvent::KeyframeRequest,
+                stream_id => InputEvent::KeyframeRequestFor { stream_id },
+            })
+            .collect()
+    }
+}
+
+/// An [`InputSource`] that only emits keepalives, plus a keyframe request for each stream
+/// raised on [`KeyframeRequestSource::requester`]'s flags (then call
 /// [`InputSenderControl::notify`] so it goes out at once).
 #[derive(Debug, Default, Clone)]
 pub struct KeyframeRequestSource {
-    pending: std::sync::Arc<AtomicBool>,
+    pending: KeyframeRequestFlags,
     input: InputEventQueue,
 }
 
 impl KeyframeRequestSource {
     pub fn new() -> Self {
         Self {
-            pending: std::sync::Arc::new(AtomicBool::new(false)),
+            pending: KeyframeRequestFlags::default(),
             input: InputEventQueue::default(),
         }
     }
 
-    /// The flag to raise when a keyframe is needed.
-    pub fn requester(&self) -> std::sync::Arc<AtomicBool> {
+    /// The flags to raise when a stream needs a keyframe.
+    pub fn requester(&self) -> KeyframeRequestFlags {
         self.pending.clone()
     }
 
@@ -252,9 +275,7 @@ impl KeyframeRequestSource {
 impl InputSource for KeyframeRequestSource {
     fn poll(&mut self) -> Vec<InputEvent> {
         let mut events = self.input.drain();
-        if self.pending.swap(false, Ordering::AcqRel) {
-            events.push(InputEvent::KeyframeRequest);
-        }
+        events.extend(self.pending.take_events());
         events
     }
     fn needs_polling(&self) -> bool {
@@ -316,7 +337,7 @@ mod live_input_source_tests {
         let pointer = InputEvent::MouseMoveRelative { dx: 3, dy: -1 };
         source.keyboard_queue().push(key.clone());
         source.pointer_events().push(pointer.clone());
-        source.requester().store(true, Ordering::SeqCst);
+        source.requester().raise(0);
 
         assert_eq!(
             source.poll(),

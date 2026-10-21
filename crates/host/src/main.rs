@@ -1,5 +1,4 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
@@ -16,6 +15,10 @@ use linux_quest_host::link_status::{
 use linux_quest_host::tui::{
     run_dashboard_with_source, IpcTelemetrySource, LiveDaemonTelemetrySource, MockTelemetrySource,
 };
+use linux_quest_host::video_sender::multi::{
+    parse_stream_count, MultiStreamOptions, MultiVideoSenderHandle, StreamSize,
+};
+use linux_quest_host::video_sender::KeyframeRequests;
 use linux_quest_host::{
     daemon_socket_path, run_ipc_server, send_daemon_request, DaemonRequest, DaemonResponse,
     HostClipboardService, HostInputReceiver, MultiDisplayHost,
@@ -106,6 +109,15 @@ struct DaemonArgs {
     /// when the link degrades.
     #[arg(long)]
     fixed_bitrate: bool,
+
+    /// Number of video streams (headset screens) to send, 1 to 3. Stream 0 is the desktop
+    /// capture; streams 1 and up are synthetic test patterns for now. All go to --video-port.
+    #[arg(long, value_name = "N", default_value_t = 1, value_parser = parse_stream_count)]
+    streams: u16,
+
+    /// Size and frame rate of the synthetic extra streams (1 and up) as WxH@FPS
+    #[arg(long, value_name = "WxH@FPS", default_value_t = StreamSize::default())]
+    extra_stream_size: StreamSize,
 }
 
 fn parse_encoder_backend(value: &str) -> Result<BackendPreference, String> {
@@ -268,7 +280,7 @@ async fn wait_for_shutdown_signal(mut term: tokio::signal::unix::Signal) {
 async fn start_stream_services(
     shutdown_tx: &tokio::sync::broadcast::Sender<()>,
     link: SharedLinkTracker,
-    keyframe_requests: Arc<AtomicBool>,
+    keyframe_requests: Arc<KeyframeRequests>,
     rate: Arc<RateCoordinator>,
 ) -> (Option<u16>, Option<u16>) {
     let mut input_port = None;
@@ -354,20 +366,24 @@ async fn start_stream_services(
 async fn start_video(
     args: &DaemonArgs,
     link: SharedLinkTracker,
-    keyframe_requests: Arc<AtomicBool>,
+    keyframe_requests: Arc<KeyframeRequests>,
     rate: Arc<RateCoordinator>,
-) -> Option<linux_quest_host::video_sender::VideoSenderHandle> {
+) -> Option<MultiVideoSenderHandle> {
     if args.no_video {
         info!("UDP video sender disabled by --no-video");
         return None;
     }
-    let options = linux_quest_host::video_sender::daemon::DaemonVideoOptions {
-        video_port: args.video_port,
-        encoder: args.encoder.unwrap_or_else(BackendPreference::from_env),
-        test_pattern: args.test_pattern,
-        bitrate_mbps: args.bitrate,
+    let options = MultiStreamOptions {
+        video: linux_quest_host::video_sender::daemon::DaemonVideoOptions {
+            video_port: args.video_port,
+            encoder: args.encoder.unwrap_or_else(BackendPreference::from_env),
+            test_pattern: args.test_pattern,
+            bitrate_mbps: args.bitrate,
+        },
+        streams: args.streams,
+        extra_stream: args.extra_stream_size,
     };
-    match linux_quest_host::video_sender::daemon::start_daemon_video_sender(
+    match linux_quest_host::video_sender::multi::start_daemon_video_senders(
         link,
         options,
         keyframe_requests,
@@ -517,7 +533,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let _ = start_stream_services(
                     &shutdown_tx,
                     link.clone(),
-                    Arc::new(AtomicBool::new(false)),
+                    KeyframeRequests::new(),
                     Arc::new(RateCoordinator::new(
                         daemon_args.bitrate.saturating_mul(1000),
                         false,
@@ -565,7 +581,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 });
 
                 // Client keyframe requests: set by the input receiver, consumed by the video sender.
-                let keyframe_requests = Arc::new(AtomicBool::new(false));
+                let keyframe_requests = KeyframeRequests::new();
                 // Adaptive bitrate: --bitrate is the ceiling; client feedback lowers it live.
                 let rate = Arc::new(
                     RateCoordinator::new(
@@ -730,6 +746,64 @@ mod tests {
         assert_eq!(parse_daemon(&["daemon"]).bitrate, 30);
         assert!(Cli::try_parse_from(["linux-quest-host", "daemon", "--bitrate", "0"]).is_err());
         assert!(Cli::try_parse_from(["linux-quest-host", "daemon", "--bitrate", "501"]).is_err());
+    }
+
+    #[test]
+    fn daemon_streams_option_is_one_to_three_and_defaults_to_one() {
+        assert_eq!(parse_daemon(&["daemon"]).streams, 1);
+        assert_eq!(parse_daemon(&["daemon", "--streams", "1"]).streams, 1);
+        assert_eq!(parse_daemon(&["daemon", "--streams", "3"]).streams, 3);
+        for bad in ["0", "4", "-1", "two", ""] {
+            let err = Cli::try_parse_from(["linux-quest-host", "daemon", "--streams", bad])
+                .expect_err(bad);
+            if bad == "0" || bad == "4" {
+                assert!(
+                    err.to_string().contains("1 to 3"),
+                    "{bad:?} gets a clear message: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn daemon_extra_stream_size_parses_and_defaults_to_1080p60() {
+        let default = parse_daemon(&["daemon"]).extra_stream_size;
+        assert_eq!(
+            (default.width, default.height, default.fps),
+            (1920, 1080, 60)
+        );
+        let size =
+            parse_daemon(&["daemon", "--extra-stream-size", "1280x720@30"]).extra_stream_size;
+        assert_eq!((size.width, size.height, size.fps), (1280, 720, 30));
+        for bad in [
+            "1280x720",
+            "720p",
+            "1281x720@30",
+            "1280x720@0",
+            "1280x720@x",
+        ] {
+            let err =
+                Cli::try_parse_from(["linux-quest-host", "daemon", "--extra-stream-size", bad])
+                    .expect_err(bad);
+            assert!(err.to_string().contains("WxH@FPS"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn streams_and_extra_stream_size_work_together_with_the_other_daemon_flags() {
+        let daemon = parse_daemon(&[
+            "daemon",
+            "--test-pattern",
+            "--bitrate",
+            "20",
+            "--streams",
+            "2",
+            "--extra-stream-size",
+            "1600x900@72",
+        ]);
+        assert_eq!((daemon.streams, daemon.bitrate), (2, 20));
+        assert!(daemon.test_pattern);
+        assert_eq!(daemon.extra_stream_size.to_string(), "1600x900@72");
     }
 
     #[tokio::test]

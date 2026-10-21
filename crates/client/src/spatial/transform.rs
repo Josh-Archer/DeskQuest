@@ -152,6 +152,17 @@ impl ScreenTransform {
         self.position.z = -cos_yaw * cos_tilt * self.distance;
     }
 
+    /// Places the screen on the viewing sphere at the given yaw, tilt (radians) and distance
+    /// (meters), facing the user. All three are clamped to the ergonomic limits.
+    pub fn place_at(&mut self, yaw: f32, tilt: f32, distance: f32) {
+        self.yaw = clamp_yaw(yaw);
+        self.tilt = clamp_tilt(tilt);
+        self.distance = clamp_distance(distance);
+        self.orientation = Quat::from_euler(self.tilt, self.yaw, self.roll);
+        self.update_position_from_distance_and_angles();
+        self.clamp();
+    }
+
     /// Translates the 3D position by `delta` in meters, clamping to comfortable ergonomic bounds.
     pub fn translate(&mut self, delta: Vec3) {
         self.position += delta;
@@ -309,6 +320,36 @@ impl ScreenTransform {
             .orientation
             .rotate_vec(Vec3::new(0.0, 0.0, self.curve_radius));
         ScreenPose::new(self.position + back, self.orientation)
+    }
+
+    /// A screen of the same size and shape next to this one, turned around the viewer so it
+    /// faces them too: `slot` places to the right (negative: to the left), edge to edge with
+    /// a small gap. The viewer is taken to be [`Self::distance`] in front of this screen.
+    pub fn beside(&self, slot: i32) -> ScreenTransform {
+        const GAP_M: f32 = 0.08;
+        let d = self.distance.max(MIN_DISTANCE_M);
+        let viewer = self.position + self.orientation.rotate_vec(Vec3::new(0.0, 0.0, d));
+        // Angle the screen spans at the viewer, from its true right edge (a curved screen's
+        // edges come closer, so it spans more than its width suggests).
+        let to_centre = self
+            .orientation
+            .conjugate()
+            .rotate_vec(self.position - viewer);
+        let to_edge = self
+            .orientation
+            .conjugate()
+            .rotate_vec(self.surface_pose(1.0, 0.5).position - viewer);
+        let half = to_edge.x.atan2(-to_edge.z) - to_centre.x.atan2(-to_centre.z);
+        let step = 2.0 * half.abs() + GAP_M / d;
+        // Positive yaw turns to the left, so a slot to the right is a negative turn.
+        let angle = -(slot as f32) * step;
+        let turn =
+            Quat::from_axis_angle(self.orientation.rotate_vec(Vec3::new(0.0, 1.0, 0.0)), angle);
+        let mut out = self.clone();
+        out.position = viewer + turn.rotate_vec(self.position - viewer);
+        out.orientation = (turn * self.orientation).normalize();
+        out.yaw = self.yaw + angle;
+        out
     }
 
     /// Clamps all fields to safe, ergonomic ranges.
@@ -487,5 +528,42 @@ mod tests {
         assert_eq!(restored.distance, 1.8);
         assert_eq!(restored.curve_radius, 2.0);
         assert_eq!(restored.curve_angle, 1.5);
+    }
+
+    #[test]
+    fn a_screen_beside_another_sits_edge_to_edge_facing_the_viewer() {
+        for mode in [DisplayMode::CurvedCylinder, DisplayMode::FlatQuad] {
+            let base = ScreenTransform {
+                display_mode: mode,
+                ..ScreenTransform::default()
+            };
+            let viewer = base.position + Vec3::new(0.0, 0.0, base.distance);
+            let right = base.beside(1);
+            let left = base.beside(-1);
+            // Same distance from the viewer, on either side, same height.
+            for s in [&right, &left] {
+                assert!(((s.position - viewer).length() - base.distance).abs() < 1e-3);
+                assert!((s.position.y - base.position.y).abs() < 1e-4);
+                // Facing the viewer: the screen's forward (+Z) points back at them.
+                let facing = s.orientation.rotate_vec(Vec3::new(0.0, 0.0, 1.0));
+                let back = (viewer - s.position).normalize();
+                assert!(facing.dot(back) > 0.999, "{mode:?} {facing:?} {back:?}");
+            }
+            assert!(right.position.x > base.position.x + 0.5);
+            assert!(left.position.x < base.position.x - 0.5);
+            // No overlap: the right screen's left edge is right of the base's right edge.
+            let base_edge = base.surface_pose(1.0, 0.5).position;
+            let right_edge = right.surface_pose(0.0, 0.5).position;
+            let ang = |p: Vec3| (p.x - viewer.x).atan2(-(p.z - viewer.z));
+            assert!(ang(right_edge) > ang(base_edge), "{mode:?}");
+            assert!(
+                ang(right_edge) - ang(base_edge) < 0.1,
+                "{mode:?}: gap too wide"
+            );
+            // Two slots out is twice as far round.
+            let ang_c = |s: &ScreenTransform| ang(s.position);
+            let two = base.beside(2);
+            assert!((ang_c(&two) - 2.0 * ang_c(&right)).abs() < 1e-3);
+        }
     }
 }

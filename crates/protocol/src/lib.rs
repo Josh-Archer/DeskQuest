@@ -5,6 +5,7 @@ pub mod handshake;
 pub mod input;
 pub mod packet;
 pub mod reassembler;
+pub mod session;
 pub mod telemetry;
 pub mod video;
 
@@ -14,7 +15,10 @@ pub use clipboard::{
     ClipboardSyncEngine, SyncAction, DEFAULT_CLIPBOARD_CHUNK_SIZE, MAX_CLIPBOARD_TEXT_SIZE,
 };
 pub use error::ProtocolError;
-pub use handshake::{ClientHandshake, DisplayConfigMessage, DisplayInfo, ServerHandshake};
+pub use handshake::{
+    ClientHandshake, DisplayConfigMessage, DisplayInfo, ServerHandshake, WindowInfo,
+    WINDOW_STREAM_ID_BASE,
+};
 pub use input::{
     ElementState, InputBatch, InputEvent, KeyModifiers, MouseButton, NetworkFeedback,
     RedundantKeyEvent, INPUT_BATCH_HEADER_SIZE, INPUT_BATCH_MAGIC, INPUT_BATCH_VERSION,
@@ -25,6 +29,9 @@ pub use packet::{
     FLAG_KEYFRAME, FLAG_LAST_CHUNK, FLAG_NONE, HEADER_SIZE, PROTOCOL_MAGIC, PROTOCOL_VERSION,
 };
 pub use reassembler::{AssembledFrame, FrameReassembler};
+pub use session::{
+    ClientSession, ResumeStatus, SessionToken, DEFAULT_RESUME_GRACE_MS, SESSION_TOKEN_LEN,
+};
 pub use telemetry::{
     AudioLatencyBreakdown, AudioStreamTelemetry, ClientConnectionMode, ClientTransportTelemetry,
     FrameLatencyBreakdown,

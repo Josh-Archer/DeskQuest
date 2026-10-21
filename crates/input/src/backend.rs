@@ -179,6 +179,7 @@ impl InputInjector for XTestInjector {
             InputEvent::TextCommit { text } => inject_committed_text(&text),
             InputEvent::ClipboardSync { .. }
             | InputEvent::KeyframeRequest
+            | InputEvent::KeyframeRequestFor { .. }
             | InputEvent::NetworkFeedback(_) => Ok(()),
         }
     }

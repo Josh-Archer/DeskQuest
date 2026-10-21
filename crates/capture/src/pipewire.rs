@@ -29,6 +29,7 @@ pub const SPA_DATA_DMA_BUF: u32 = 3;
 /// negotiated values come from `capture_info`.
 pub struct PipeWireCapture {
     display_id: u16,
+    window_source: bool,
     width: u32,
     height: u32,
     fps: u32,
@@ -56,6 +57,7 @@ impl PipeWireCapture {
         config.offer.max_fps = config.offer.max_fps.max(fps);
         Self {
             display_id,
+            window_source: false,
             width,
             height,
             fps,
@@ -65,6 +67,13 @@ impl PipeWireCapture {
             #[cfg(feature = "pipewire-screencast")]
             session: None,
         }
+    }
+
+    /// Creates a capture whose portal picker offers application windows.
+    pub fn new_window(display_id: u16, width: u32, height: u32, fps: u32) -> Self {
+        let mut capture = Self::new(display_id, width, height, fps);
+        capture.window_source = true;
+        capture
     }
 
     /// True when this build can capture the screen and a PipeWire daemon socket is present
@@ -156,13 +165,23 @@ impl PipeWireCapture {
         P: crate::screencast::portal::ScreenCastPortal + 'static,
     {
         self.cleanup();
-        let session = crate::screencast::session::ScreenCastSession::start(
-            portal,
-            &self.config,
-            Arc::clone(&self.hub),
-            self.display_id,
-        )
-        .await?;
+        let session = if self.window_source {
+            crate::screencast::session::ScreenCastSession::start_window(
+                portal,
+                &self.config,
+                Arc::clone(&self.hub),
+                self.display_id,
+            )
+            .await?
+        } else {
+            crate::screencast::session::ScreenCastSession::start(
+                portal,
+                &self.config,
+                Arc::clone(&self.hub),
+                self.display_id,
+            )
+            .await?
+        };
         self.session = Some(session);
         self.initialized = true;
         Ok(())

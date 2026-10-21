@@ -1,0 +1,30 @@
+app-id: org.linuxquest.Host
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: linux-quest-host
+finish-args:
+  - --share=network
+  - --device=all
+  - --filesystem=host
+modules:
+  - name: linux-quest-host
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/linux-quest-host/cargo
+    build-commands:
+      - cargo build --release --locked --offline -p linux-quest-host --features mdns
+      - install -Dm755 target/release/linux-quest-host /app/bin/linux-quest-host
+      - install -Dm644 packaging/udev/99-uinput.rules /app/share/doc/linux-quest-host/99-uinput.rules
+      - install -Dm644 packaging/modules-load/linux-quest.conf /app/share/doc/linux-quest-host/linux-quest.conf
+      - install -Dm644 packaging/systemd/linux-quest-host.service /app/share/doc/linux-quest-host/linux-quest-host.service
+      - install -Dm644 LICENSE-MIT /app/share/licenses/linux-quest-host/LICENSE-MIT
+      - install -Dm644 LICENSE-APACHE /app/share/licenses/linux-quest-host/LICENSE-APACHE
+    sources:
+      - type: dir
+        path: ../..
+      - cargo-sources.json

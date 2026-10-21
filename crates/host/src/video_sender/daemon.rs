@@ -1,6 +1,5 @@
 //! Real-hardware adapters and the daemon's start-up probe for the video sender.
 
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -14,8 +13,8 @@ use linux_quest_encoder::{
 };
 
 use super::{
-    spawn_video_sender, FrameSource, UdpSink, VideoSenderConfig, VideoSenderHandle,
-    DEFAULT_SEND_BUFFER_BYTES,
+    spawn_video_sender, FrameSource, KeyframeRequests, UdpSink, VideoSenderConfig,
+    VideoSenderHandle, DEFAULT_SEND_BUFFER_BYTES,
 };
 use crate::codec_select::{plan_stream, StreamPlan, CLIENT_DECODE_CODECS, CODEC_PREFERENCE};
 use crate::congestion::{RateCoordinator, StreamRate};
@@ -132,7 +131,7 @@ pub struct DaemonVideoOptions {
 }
 
 /// Forwards [`VideoEncoder`] to a boxed encoder from [`create_encoder`].
-struct BoxedEncoder(Box<dyn VideoEncoder>);
+pub(super) struct BoxedEncoder(Box<dyn VideoEncoder>);
 
 #[async_trait]
 impl VideoEncoder for BoxedEncoder {
@@ -161,7 +160,7 @@ impl VideoEncoder for BoxedEncoder {
 /// backend order, then the first codec that backend and the client both support). The mock
 /// is used only when explicitly requested with `--encoder mock`: its output is not a
 /// decodable bitstream.
-async fn open_planned_encoder(
+pub(super) async fn open_planned_encoder(
     preference: BackendPreference,
     bitrate_kbps: u32,
     (width, height, fps): (u32, u32, u32),
@@ -219,7 +218,7 @@ async fn open_planned_encoder(
 pub async fn start_daemon_video_sender(
     link: SharedLinkTracker,
     options: DaemonVideoOptions,
-    keyframe_requests: Arc<AtomicBool>,
+    keyframe_requests: Arc<KeyframeRequests>,
     rate: Option<Arc<RateCoordinator>>,
 ) -> Result<VideoSenderHandle, String> {
     let stream_rate = rate.as_ref().map(|r| r.register_stream(0));
@@ -236,7 +235,8 @@ pub async fn start_daemon_video_sender(
 }
 
 /// Starts independent capture/encode/send pipelines for the supplied active monitors. Each
-/// pipeline owns its packetizer, FEC state, pacing state, keyframe flag and stream id.
+/// pipeline owns its packetizer, FEC state, pacing state and stream id, and takes its own
+/// keyframe flag from `keyframe_requests`.
 /// Bitrate is divided evenly (remainder goes to lower ids) so the aggregate does not exceed
 /// the configured session bitrate. With a `rate` coordinator each stream starts at the
 /// coordinator's share and then follows its live, focus-weighted targets.
@@ -244,6 +244,7 @@ pub async fn start_daemon_video_senders(
     link: SharedLinkTracker,
     options: DaemonVideoOptions,
     monitors: &[linux_quest_protocol::DisplayInfo],
+    keyframe_requests: Arc<KeyframeRequests>,
     rate: Option<Arc<RateCoordinator>>,
 ) -> Result<Vec<VideoSenderHandle>, String> {
     if monitors.is_empty() {
@@ -270,7 +271,7 @@ pub async fn start_daemon_video_senders(
                 monitor.display_id,
                 monitor.display_id,
                 bitrate.saturating_mul(1000),
-                Arc::new(AtomicBool::new(false)),
+                keyframe_requests.clone(),
                 stream_rate,
             )
             .await?,
@@ -302,7 +303,7 @@ async fn start_daemon_video_stream(
     display_id: u16,
     stream_id: u16,
     initial_bitrate_kbps: u32,
-    keyframe_requests: Arc<AtomicBool>,
+    keyframe_requests: Arc<KeyframeRequests>,
     rate: Option<Arc<StreamRate>>,
 ) -> Result<VideoSenderHandle, String> {
     let defaults = EncoderConfig::default();
@@ -383,7 +384,7 @@ mod tests {
                 test_pattern: false,
                 bitrate_mbps: 30,
             },
-            Arc::new(AtomicBool::new(false)),
+            KeyframeRequests::new(),
             None,
         )
         .await;

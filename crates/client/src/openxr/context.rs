@@ -117,6 +117,66 @@ struct OverlaySwapchains {
     corner_active_rgba: Vec<u8>,
 }
 
+/// The swapchain and placement of the screen for a video stream other than the primary one.
+struct ExtraScreen {
+    swapchain: Option<Swapchain<Vulkan>>,
+    #[cfg(target_os = "android")]
+    surface_window: Option<ndk::native_window::NativeWindow>,
+    size: (u32, u32),
+    transform: ScreenTransform,
+}
+
+/// A desktop screen's composition layer, curved or flat.
+enum DesktopLayer<'a> {
+    Cylinder(openxr::CompositionLayerCylinderKHR<'a, Vulkan>),
+    Quad(openxr::CompositionLayerQuad<'a, Vulkan>),
+}
+
+impl<'a> DesktopLayer<'a> {
+    /// A cylinder layer when the screen is curved and the runtime supports it, else a quad.
+    /// `settings` (super-sampling and sharpening) is chained when given.
+    fn build(
+        space: &'a Space,
+        swapchain: &'a Swapchain<Vulkan>,
+        (width, height): (u32, u32),
+        cfg: &crate::openxr::layers::DesktopLayerConfig,
+        cylinder_supported: bool,
+        settings: Option<&'a openxr::sys::CompositionLayerSettingsFB>,
+    ) -> Self {
+        let next = settings.map(|s| s as *const _ as *const std::ffi::c_void);
+        if cylinder_supported && cfg.mode == crate::config::DisplayMode::CurvedCylinder {
+            let layer =
+                crate::openxr::layers::build_cylinder_layer(space, swapchain, width, height, cfg);
+            Self::Cylinder(match next {
+                Some(next) => {
+                    let mut raw = layer.into_raw();
+                    raw.next = next;
+                    unsafe { openxr::CompositionLayerCylinderKHR::from_raw(raw) }
+                }
+                None => layer,
+            })
+        } else {
+            let layer =
+                crate::openxr::layers::build_quad_layer(space, swapchain, width, height, cfg);
+            Self::Quad(match next {
+                Some(next) => {
+                    let mut raw = layer.into_raw();
+                    raw.next = next;
+                    unsafe { openxr::CompositionLayerQuad::from_raw(raw) }
+                }
+                None => layer,
+            })
+        }
+    }
+
+    fn base(&self) -> &CompositionLayerBase<'a, Vulkan> {
+        match self {
+            Self::Cylinder(l) => l,
+            Self::Quad(l) => l,
+        }
+    }
+}
+
 /// OpenXR application runtime context managing instance, session, and swapchains.
 pub struct OpenXrContext {
     instance: Option<Instance>,
@@ -150,6 +210,8 @@ pub struct OpenXrContext {
     interaction: Box<dyn InteractionBackend>,
     hand_tracking: Box<dyn HandTrackingBackend>,
     screen_transform: Option<ScreenTransform>,
+    /// Screens for the video streams other than the primary one, by stream id.
+    extra_screens: std::collections::BTreeMap<u16, ExtraScreen>,
     is_simulated: bool,
 }
 
@@ -191,6 +253,7 @@ impl OpenXrContext {
             interaction: Box::new(MockInteractionBackend::new()),
             hand_tracking: Box::new(MockHandTrackingBackend::new(true)),
             screen_transform: None,
+            extra_screens: Default::default(),
             is_simulated: true,
         }
     }
@@ -611,6 +674,7 @@ impl OpenXrContext {
             interaction,
             hand_tracking,
             screen_transform: None,
+            extra_screens: Default::default(),
             is_simulated: false,
         })
     }
@@ -645,73 +709,12 @@ impl OpenXrContext {
         let (desktop_swapchain, surface_window, desktop_swapchain_is_surface) = if let Some(pfn) =
             self.android_surface_pfn
         {
-            let fb_surface_create_info = openxr::sys::AndroidSurfaceSwapchainCreateInfoFB {
-                ty: openxr::sys::StructureType::ANDROID_SURFACE_SWAPCHAIN_CREATE_INFO_FB,
-                next: std::ptr::null(),
-                create_flags: openxr::sys::AndroidSurfaceSwapchainFlagsFB::USE_TIMESTAMPS,
-            };
-            let info = openxr::sys::SwapchainCreateInfo {
-                ty: openxr::sys::StructureType::SWAPCHAIN_CREATE_INFO,
-                next: if self.supports_fb_surface_create {
-                    &fb_surface_create_info as *const _ as *const std::ffi::c_void
-                } else {
-                    std::ptr::null()
-                },
-                create_flags: openxr::sys::SwapchainCreateFlags::EMPTY,
-                usage_flags: openxr::sys::SwapchainUsageFlags::COLOR_ATTACHMENT
-                    | openxr::sys::SwapchainUsageFlags::SAMPLED,
-                // The Android Surface (MediaCodec output) owns the image format and layout;
-                // Horizon OS rejects Vulkan values here ("info format validation failure").
-                format: 0,
-                sample_count: 0,
-                width: config.stream_width,
-                height: config.stream_height,
-                face_count: 0,
-                array_size: 0,
-                mip_count: 0,
-            };
-            let mut raw_swapchain = openxr::sys::Swapchain::NULL;
-            let mut surface: openxr::sys::platform::jobject = std::ptr::null_mut();
-            let res = unsafe {
-                (pfn.create_swapchain_android_surface)(
-                    session.as_raw(),
-                    &info,
-                    &mut raw_swapchain,
-                    &mut surface,
-                )
-            };
-            if res.into_raw() < 0 {
-                return Err(ClientError::OpenXr(format!(
-                    "xrCreateSwapchainAndroidSurfaceKHR failed with error code {}",
-                    res.into_raw()
-                )));
-            }
-            let sc =
-                unsafe { openxr::Swapchain::<Vulkan>::from_raw(session.clone(), raw_swapchain) };
-            if surface.is_null() {
-                return Err(ClientError::OpenXr(
-                    "xrCreateSwapchainAndroidSurfaceKHR returned a null surface jobject".into(),
-                ));
-            }
-            let ctx = ndk_context::android_context();
-            let vm = unsafe { jni::JavaVM::from_raw(ctx.vm() as *mut jni::sys::JavaVM) }
-                .map_err(|e| ClientError::OpenXr(format!("JNI JavaVM error: {e:?}")))?;
-            let (_guard, env_raw) = match vm.get_env() {
-                Ok(env) => (None, env.get_raw()),
-                Err(_) => {
-                    let guard = vm.attach_current_thread().map_err(|e| {
-                        ClientError::OpenXr(format!("JNI attach thread failed: {e:?}"))
-                    })?;
-                    let raw = guard.get_raw();
-                    (Some(guard), raw)
-                }
-            };
-            let win = unsafe { ndk_sys::ANativeWindow_fromSurface(env_raw as _, surface as _) };
-            let native_window = std::ptr::NonNull::new(win)
-                .map(|ptr| unsafe { ndk::native_window::NativeWindow::from_ptr(ptr) })
-                .ok_or_else(|| {
-                    ClientError::OpenXr("ANativeWindow_fromSurface returned NULL".into())
-                })?;
+            let (sc, native_window) = self.create_surface_swapchain(
+                &session,
+                pfn,
+                config.stream_width,
+                config.stream_height,
+            )?;
             (Some(sc), Some(native_window), true)
         } else {
             if !config.force_mock_decoder {
@@ -818,6 +821,83 @@ impl OpenXrContext {
         Ok(())
     }
 
+    /// Creates an Android surface swapchain (the decoder renders straight into its surface) of
+    /// `width` x `height` and returns it with its native window.
+    #[cfg(target_os = "android")]
+    fn create_surface_swapchain(
+        &self,
+        session: &Session<Vulkan>,
+        pfn: openxr::raw::AndroidSurfaceSwapchainKHR,
+        width: u32,
+        height: u32,
+    ) -> ClientResult<(Swapchain<Vulkan>, ndk::native_window::NativeWindow)> {
+        let fb_surface_create_info = openxr::sys::AndroidSurfaceSwapchainCreateInfoFB {
+            ty: openxr::sys::StructureType::ANDROID_SURFACE_SWAPCHAIN_CREATE_INFO_FB,
+            next: std::ptr::null(),
+            create_flags: openxr::sys::AndroidSurfaceSwapchainFlagsFB::USE_TIMESTAMPS,
+        };
+        let info = openxr::sys::SwapchainCreateInfo {
+            ty: openxr::sys::StructureType::SWAPCHAIN_CREATE_INFO,
+            next: if self.supports_fb_surface_create {
+                &fb_surface_create_info as *const _ as *const std::ffi::c_void
+            } else {
+                std::ptr::null()
+            },
+            create_flags: openxr::sys::SwapchainCreateFlags::EMPTY,
+            usage_flags: openxr::sys::SwapchainUsageFlags::COLOR_ATTACHMENT
+                | openxr::sys::SwapchainUsageFlags::SAMPLED,
+            // The Android Surface (MediaCodec output) owns the image format and layout;
+            // Horizon OS rejects Vulkan values here ("info format validation failure").
+            format: 0,
+            sample_count: 0,
+            width: width,
+            height: height,
+            face_count: 0,
+            array_size: 0,
+            mip_count: 0,
+        };
+        let mut raw_swapchain = openxr::sys::Swapchain::NULL;
+        let mut surface: openxr::sys::platform::jobject = std::ptr::null_mut();
+        let res = unsafe {
+            (pfn.create_swapchain_android_surface)(
+                session.as_raw(),
+                &info,
+                &mut raw_swapchain,
+                &mut surface,
+            )
+        };
+        if res.into_raw() < 0 {
+            return Err(ClientError::OpenXr(format!(
+                "xrCreateSwapchainAndroidSurfaceKHR failed with error code {}",
+                res.into_raw()
+            )));
+        }
+        let sc = unsafe { openxr::Swapchain::<Vulkan>::from_raw(session.clone(), raw_swapchain) };
+        if surface.is_null() {
+            return Err(ClientError::OpenXr(
+                "xrCreateSwapchainAndroidSurfaceKHR returned a null surface jobject".into(),
+            ));
+        }
+        let ctx = ndk_context::android_context();
+        let vm = unsafe { jni::JavaVM::from_raw(ctx.vm() as *mut jni::sys::JavaVM) }
+            .map_err(|e| ClientError::OpenXr(format!("JNI JavaVM error: {e:?}")))?;
+        let (_guard, env_raw) = match vm.get_env() {
+            Ok(env) => (None, env.get_raw()),
+            Err(_) => {
+                let guard = vm
+                    .attach_current_thread()
+                    .map_err(|e| ClientError::OpenXr(format!("JNI attach thread failed: {e:?}")))?;
+                let raw = guard.get_raw();
+                (Some(guard), raw)
+            }
+        };
+        let win = unsafe { ndk_sys::ANativeWindow_fromSurface(env_raw as _, surface as _) };
+        let native_window = std::ptr::NonNull::new(win)
+            .map(|ptr| unsafe { ndk::native_window::NativeWindow::from_ptr(ptr) })
+            .ok_or_else(|| ClientError::OpenXr("ANativeWindow_fromSurface returned NULL".into()))?;
+        Ok((sc, native_window))
+    }
+
     /// Whether this OpenXR context is running in simulated/mock mode.
     pub fn is_simulated(&self) -> bool {
         self.is_simulated
@@ -827,6 +907,75 @@ impl OpenXrContext {
     #[cfg(target_os = "android")]
     pub fn surface_window(&self) -> Option<&ndk::native_window::NativeWindow> {
         self.surface_window.as_ref()
+    }
+
+    /// Creates the screen for video stream `stream_id` (not 0, the primary screen): an Android
+    /// surface swapchain of `width` x `height` for that stream's decoder, shown at
+    /// `transform`. Needs a running session. A simulated context records the screen without
+    /// a swapchain. Does nothing if the screen exists.
+    pub fn create_extra_screen(
+        &mut self,
+        stream_id: u16,
+        (width, height): (u32, u32),
+        transform: ScreenTransform,
+    ) -> ClientResult<()> {
+        if self.extra_screens.contains_key(&stream_id) {
+            return Ok(());
+        }
+        #[allow(unused_mut)]
+        let mut screen = ExtraScreen {
+            swapchain: None,
+            #[cfg(target_os = "android")]
+            surface_window: None,
+            size: (width, height),
+            transform,
+        };
+        if !self.is_simulated {
+            #[cfg(target_os = "android")]
+            {
+                let session = self
+                    .session
+                    .clone()
+                    .ok_or_else(|| ClientError::OpenXr("Session not initialized".into()))?;
+                let pfn = self.android_surface_pfn.ok_or_else(|| {
+                    ClientError::OpenXr(
+                        "extra screens need XR_KHR_android_surface_swapchain".into(),
+                    )
+                })?;
+                let (sc, window) = self.create_surface_swapchain(&session, pfn, width, height)?;
+                screen.swapchain = Some(sc);
+                screen.surface_window = Some(window);
+            }
+            #[cfg(not(target_os = "android"))]
+            return Err(ClientError::OpenXr(
+                "extra screens need XR_KHR_android_surface_swapchain".into(),
+            ));
+        }
+        self.extra_screens.insert(stream_id, screen);
+        Ok(())
+    }
+
+    /// The decoder surface of stream `stream_id`'s screen, once created.
+    #[cfg(target_os = "android")]
+    pub fn extra_surface_window(
+        &self,
+        stream_id: u16,
+    ) -> Option<&ndk::native_window::NativeWindow> {
+        self.extra_screens
+            .get(&stream_id)
+            .and_then(|s| s.surface_window.as_ref())
+    }
+
+    /// Whether stream `stream_id` has its own screen.
+    pub fn has_extra_screen(&self, stream_id: u16) -> bool {
+        self.extra_screens.contains_key(&stream_id)
+    }
+
+    /// Moves stream `stream_id`'s screen.
+    pub fn set_extra_screen_transform(&mut self, stream_id: u16, transform: ScreenTransform) {
+        if let Some(screen) = self.extra_screens.get_mut(&stream_id) {
+            screen.transform = transform;
+        }
     }
 
     /// Requests a dynamic display refresh rate change from the OpenXR runtime.
@@ -1114,6 +1263,7 @@ impl OpenXrContext {
                 let _ = desktop_sc.wait_image(openxr::Duration::INFINITE);
                 let _ = desktop_sc.release_image();
             }
+            let desktop_sc: &Swapchain<Vulkan> = desktop_sc;
 
             let desktop_cfg = if let Some(ref tf) = self.screen_transform {
                 tf.to_desktop_layer_config()
@@ -1289,67 +1439,47 @@ impl OpenXrContext {
                 }
             }
 
+            // The primary screen first, then one per extra stream, then pointers and handles
+            // over them, then the HUD on top.
+            let settings = self.supports_layer_settings.then_some(&layer_settings);
+            let mut desktop_layers = vec![DesktopLayer::build(
+                space,
+                desktop_sc,
+                (stream_width, stream_height),
+                &desktop_cfg,
+                self.supports_cylinder,
+                settings,
+            )];
+            for screen in self.extra_screens.values() {
+                if let Some(sc) = &screen.swapchain {
+                    desktop_layers.push(DesktopLayer::build(
+                        space,
+                        sc,
+                        screen.size,
+                        &screen.transform.to_desktop_layer_config(),
+                        self.supports_cylinder,
+                        settings,
+                    ));
+                }
+            }
+
             let mut layers: Vec<&CompositionLayerBase<'_, Vulkan>> =
-                Vec::with_capacity(4 + pointer_layers.len());
+                Vec::with_capacity(2 + desktop_layers.len() + pointer_layers.len());
             if let Some(ref pt) = pt_layer {
                 layers.push(pt);
             }
-
-            if self.supports_cylinder
-                && desktop_cfg.mode == crate::config::DisplayMode::CurvedCylinder
-            {
-                let cyl_layer = crate::openxr::layers::build_cylinder_layer(
-                    space,
-                    desktop_sc,
-                    stream_width,
-                    stream_height,
-                    &desktop_cfg,
-                );
-                let cyl_layer = if self.supports_layer_settings {
-                    let mut raw = cyl_layer.into_raw();
-                    raw.next = &layer_settings as *const _ as *const std::ffi::c_void;
-                    unsafe { openxr::CompositionLayerCylinderKHR::from_raw(raw) }
-                } else {
-                    cyl_layer
-                };
-
-                layers.push(&cyl_layer);
-                for l in &pointer_layers {
-                    layers.push(l);
-                }
-                if let Some(ref hud) = hud_layer {
-                    layers.push(hud);
-                }
-                stream
-                    .end(display_time, blend_mode, &layers)
-                    .map_err(|e| ClientError::OpenXr(format!("end_frame failed: {e:?}")))?;
-            } else {
-                let quad_layer = crate::openxr::layers::build_quad_layer(
-                    space,
-                    desktop_sc,
-                    stream_width,
-                    stream_height,
-                    &desktop_cfg,
-                );
-                let quad_layer = if self.supports_layer_settings {
-                    let mut raw = quad_layer.into_raw();
-                    raw.next = &layer_settings as *const _ as *const std::ffi::c_void;
-                    unsafe { openxr::CompositionLayerQuad::from_raw(raw) }
-                } else {
-                    quad_layer
-                };
-
-                layers.push(&quad_layer);
-                for l in &pointer_layers {
-                    layers.push(l);
-                }
-                if let Some(ref hud) = hud_layer {
-                    layers.push(hud);
-                }
-                stream
-                    .end(display_time, blend_mode, &layers)
-                    .map_err(|e| ClientError::OpenXr(format!("end_frame failed: {e:?}")))?;
+            for l in &desktop_layers {
+                layers.push(l.base());
             }
+            for l in &pointer_layers {
+                layers.push(l);
+            }
+            if let Some(ref hud) = hud_layer {
+                layers.push(hud);
+            }
+            stream
+                .end(display_time, blend_mode, &layers)
+                .map_err(|e| ClientError::OpenXr(format!("end_frame failed: {e:?}")))?;
         } else if let Some(stream_mutex) = &self.frame_stream {
             let mut stream = stream_mutex.lock();
             stream

@@ -20,9 +20,11 @@ pub mod input_receiver;
 pub mod ipc;
 pub mod link_status;
 pub mod multi_display;
+pub mod session_registry;
 pub mod tray;
 pub mod tui;
 pub mod video_sender;
+pub mod window_panels;
 
 pub use audio_pipeline::HostAudioPipeline;
 pub use clipboard_service::{HostClipboardService, HOST_CLIPBOARD_ORIGIN_ID};
@@ -32,6 +34,7 @@ pub use ipc::{
     DaemonRequest, DaemonResponse,
 };
 pub use multi_display::MultiDisplayHost;
+pub use window_panels::{WindowPanelManager, WindowSource, X11WindowSource};
 
 #[derive(Error, Debug)]
 pub enum HostError {
@@ -85,6 +88,7 @@ where
     transport: T,
     input: I,
     display_host: Option<Arc<MultiDisplayHost>>,
+    window_panels: Option<WindowPanelManager<Box<dyn WindowSource>>>,
     stream_id: u16,
     sequence: u32,
     running: Arc<AtomicBool>,
@@ -104,6 +108,7 @@ where
             transport,
             input,
             display_host: None,
+            window_panels: None,
             stream_id,
             sequence: 0,
             running: Arc::new(AtomicBool::new(false)),
@@ -112,6 +117,17 @@ where
 
     pub fn with_display_host(mut self, host: Arc<MultiDisplayHost>) -> Self {
         self.display_host = Some(host);
+        self
+    }
+
+    /// Enables window listing, panel selection, and window-aware pointer routing for this
+    /// session. The source is injectable so tests never invoke desktop tools or hardware.
+    pub fn with_window_panels<S: WindowSource + 'static>(
+        mut self,
+        source: S,
+        desktop_size: (u32, u32),
+    ) -> Self {
+        self.window_panels = Some(WindowPanelManager::new(Box::new(source), desktop_size));
         self
     }
 
@@ -205,6 +221,10 @@ where
             PacketType::InputEvent => {
                 if let Ok(batch) = linux_quest_protocol::InputBatch::decode(&packet.payload) {
                     for event in batch.events {
+                        let event = self
+                            .window_panels
+                            .as_mut()
+                            .map_or(event.clone(), |panels| panels.map_input(event));
                         self.input.inject_event(event)?;
                     }
                 } else if let Ok(event) = bincode::deserialize(&packet.payload) {
@@ -274,7 +294,31 @@ where
                                 | linux_quest_protocol::DisplayConfigMessage::MonitorRemoved {
                                     ..
                                 }
+                                | linux_quest_protocol::DisplayConfigMessage::WindowList(_)
+                                | linux_quest_protocol::DisplayConfigMessage::ActiveWindowPanels(_)
                                 | linux_quest_protocol::DisplayConfigMessage::Error(_) => None,
+                                linux_quest_protocol::DisplayConfigMessage::ListWindows => {
+                                    Some(match self.window_panels.as_mut() {
+                                        Some(panels) => match panels.list_windows() {
+                                            Ok(windows) => linux_quest_protocol::DisplayConfigMessage::WindowList(windows),
+                                            Err(e) => linux_quest_protocol::DisplayConfigMessage::Error(e.to_string()),
+                                        },
+                                        None => linux_quest_protocol::DisplayConfigMessage::Error(
+                                            "Window panel support is not initialized on this session".into(),
+                                        ),
+                                    })
+                                }
+                                linux_quest_protocol::DisplayConfigMessage::SetWindowPanels { window_ids } => {
+                                    Some(match self.window_panels.as_mut() {
+                                        Some(panels) => match panels.set_panels(&window_ids) {
+                                            Ok(displays) => linux_quest_protocol::DisplayConfigMessage::ActiveWindowPanels(displays),
+                                            Err(e) => linux_quest_protocol::DisplayConfigMessage::Error(e.to_string()),
+                                        },
+                                        None => linux_quest_protocol::DisplayConfigMessage::Error(
+                                            "Window panel support is not initialized on this session".into(),
+                                        ),
+                                    })
+                                }
                             }
                         } else {
                             Some(linux_quest_protocol::DisplayConfigMessage::Error(
@@ -491,6 +535,113 @@ mod tests {
                 assert_eq!(monitors[1].dpi, 120);
             }
             _ => panic!("Expected ActiveMonitors response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn window_picker_messages_return_mock_windows_and_panel_descriptors() {
+        use crate::window_panels::mock::MockWindowSource;
+        use linux_quest_protocol::{DisplayConfigMessage, WindowInfo, WINDOW_STREAM_ID_BASE};
+
+        let capture = SyntheticCapture::new(0, 1920, 1080, 60);
+        let encoder = MockVideoEncoder::new(EncoderConfig::default());
+        let (ep_host, mut ep_client) = LoopbackEndpoint::create_pair();
+        let input = MockInputInjector::new();
+        let display_host = Arc::new(MultiDisplayHost::new(Box::new(
+            linux_quest_display::backend::mock::MockDisplayBackend::new(),
+        )));
+        let source = MockWindowSource {
+            windows: vec![
+                WindowInfo {
+                    window_id: 10,
+                    title: "Editor".into(),
+                    app_name: "editor".into(),
+                    width: 1200,
+                    height: 800,
+                    x: 100,
+                    y: 50,
+                },
+                WindowInfo {
+                    window_id: 11,
+                    title: "Browser".into(),
+                    app_name: "browser".into(),
+                    width: 1600,
+                    height: 900,
+                    x: 1300,
+                    y: 50,
+                },
+            ],
+            focused: vec![],
+        };
+        let mut session = HostStreamSession::new(capture, encoder, ep_host, input, 0)
+            .with_display_host(display_host)
+            .with_window_panels(source, (3000, 2000));
+
+        for (sequence, request, expected) in [
+            (
+                1,
+                DisplayConfigMessage::ListWindows,
+                DisplayConfigMessage::WindowList(vec![
+                    WindowInfo {
+                        window_id: 10,
+                        title: "Editor".into(),
+                        app_name: "editor".into(),
+                        width: 1200,
+                        height: 800,
+                        x: 100,
+                        y: 50,
+                    },
+                    WindowInfo {
+                        window_id: 11,
+                        title: "Browser".into(),
+                        app_name: "browser".into(),
+                        width: 1600,
+                        height: 900,
+                        x: 1300,
+                        y: 50,
+                    },
+                ]),
+            ),
+            (
+                2,
+                DisplayConfigMessage::SetWindowPanels {
+                    window_ids: vec![10, 11],
+                },
+                DisplayConfigMessage::ActiveWindowPanels(vec![
+                    linux_quest_protocol::DisplayInfo {
+                        display_id: WINDOW_STREAM_ID_BASE,
+                        name: "Editor".into(),
+                        width: 1200,
+                        height: 800,
+                        refresh_rate: 60,
+                        dpi: 96,
+                        is_virtual: false,
+                        x: 100,
+                        y: 50,
+                    },
+                    linux_quest_protocol::DisplayInfo {
+                        display_id: WINDOW_STREAM_ID_BASE + 1,
+                        name: "Browser".into(),
+                        width: 1600,
+                        height: 900,
+                        refresh_rate: 60,
+                        dpi: 96,
+                        is_virtual: false,
+                        x: 1300,
+                        y: 50,
+                    },
+                ]),
+            ),
+        ] {
+            let payload = bytes::Bytes::from(bincode::serialize(&request).unwrap());
+            let packet = Packet::new(
+                PacketHeader::new(PacketType::DisplayConfig, 0, sequence, 1000, &payload),
+                payload,
+            );
+            session.handle_incoming_packet(packet).await.unwrap();
+            let response = ep_client.recv_packet().await.unwrap();
+            let response: DisplayConfigMessage = bincode::deserialize(&response.payload).unwrap();
+            assert_eq!(response, expected);
         }
     }
 
