@@ -30,7 +30,10 @@ pub(crate) fn activity_jobject() -> *mut std::ffi::c_void {
 use std::net::{IpAddr, SocketAddr};
 
 use crate::config::{ClientConfig, TransportMode};
-use crate::input_sender::{input_sender_config, CombinedInputSource, InputSenderThread};
+use crate::input_sender::{
+    input_sender_config, CombinedInputSource, InputSenderThread, KeyframeRequestFlags,
+    SharedInputEvents,
+};
 use crate::runtime::QuestClientRuntime;
 
 /// Source IPs that UDP video datagrams must come from, or `None` to accept any source.
@@ -85,17 +88,14 @@ pub fn udp_config_warning(config: &ClientConfig) -> Option<String> {
 ///
 /// Only `Udp` mode sends: `adb reverse` forwards TCP only, so in `AdbReverseTcp` mode the client
 /// sends no input (and no keepalive) at all. See `crate::input_sender` for the design.
-/// Returns the sender with the flag that, once raised (then
-/// [`crate::input_sender::InputSenderControl::notify`]), sends a keyframe request, plus the
-/// keyboard queue (physical/IME events) and the pointer queue (XR controller/hand events)
-/// that feed it.
+/// Returns the sender with per-stream keyframe flags, the keyboard queue, and the pointer queue.
 pub fn start_input_sender(
     config: &ClientConfig,
 ) -> Option<(
     InputSenderThread,
-    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    KeyframeRequestFlags,
     crate::input_sender::InputEventQueue,
-    crate::input_sender::SharedInputEvents,
+    SharedInputEvents,
 )> {
     let Some(sender_config) = input_sender_config(config) else {
         match config.transport_mode {
@@ -674,16 +674,18 @@ pub fn android_main(app: AndroidApp) {
     let receiver_ack_control = ack_control.clone();
     // Raises the keyframe request on the input channel and sends it right away.
     let requester_control = ack_control.clone();
-    let keyframe_requester = move || -> Option<Box<dyn Fn() + Send>> {
-        let flag = keyframe_flag.clone()?;
+    let keyframe_requester = move || -> Option<Box<dyn Fn(u16) + Send>> {
+        let flags = keyframe_flag.clone()?;
         let control = requester_control.clone()?;
-        Some(Box::new(move || {
-            tracing::info!("video lost; requesting a keyframe from the host");
-            flag.store(true, std::sync::atomic::Ordering::Release);
+        Some(Box::new(move |stream_id| {
+            tracing::info!(stream_id, "video lost; requesting a keyframe from the host");
+            flags.raise(stream_id);
             control.notify();
         }))
     };
 
+    // The receiver thread acks with its own handle; `ack_control` is still needed below.
+    let receiver_ack = ack_control.clone();
     let receiver_handle = std::thread::spawn(move || {
         match transport_mode {
             crate::config::TransportMode::AdbReverseTcp => {

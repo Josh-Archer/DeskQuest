@@ -1,6 +1,7 @@
 //! Quest client application runtime coordinating OpenXR, Vulkan, decoder, and transport.
 
-use std::time::Instant;
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use linux_quest_protocol::packet::Packet;
 use linux_quest_protocol::InputEvent;
@@ -12,12 +13,57 @@ use crate::error::ClientResult;
 use crate::graphics::VulkanContext;
 use crate::hud::{DebugHud, ShortcutAction, ShortcutDetector};
 use crate::openxr::{FrameLoopEngine, FramePacingMetrics, OpenXrContext};
+use crate::receiver::loss_recovery::{Admit, LossRecovery};
 use crate::receiver::ClientReceiver;
 use crate::settings::{ClientSettings, SettingsAction, SettingsPanel, SettingsStore};
 use crate::spatial::{
     Corner, GrabStateMachine, HandGestureDetector, Handedness, InteractionEvent, InteractionInput,
     InteractionState, PointerInput, ScreenTransform, SpatialLayoutStore, SpatialScreenLayout, Vec3,
 };
+
+/// Video streams beyond the primary one (stream ids 1 to this) that get a screen of their own.
+pub const MAX_EXTRA_STREAMS: u16 = 3;
+
+/// How long to wait before retrying a screen or decoder that could not be created.
+const EXTRA_SCREEN_RETRY: Duration = Duration::from_secs(5);
+
+/// A video stream other than the primary one, shown on its own screen.
+struct ExtraStream {
+    receiver: ClientReceiver,
+    loss_recovery: LossRecovery,
+    /// Bound to the stream's screen, created when the first keyframe gives its size.
+    decoder: Option<Box<dyn HardwareVideoDecoder>>,
+    transform: ScreenTransform,
+    /// After a failed screen or decoder creation, when to try again.
+    retry_at: Option<Instant>,
+}
+
+/// Where stream `stream_id`'s screen starts, in screens beside the primary: 1 to the right,
+/// 2 to the left, 3 further right.
+fn extra_screen_slot(stream_id: u16) -> i32 {
+    let n = i32::from(stream_id);
+    if n % 2 == 1 {
+        (n + 1) / 2
+    } else {
+        -(n / 2)
+    }
+}
+
+/// The screens a pointer can hit or grab: the primary one and every extra stream's screen
+/// that is showing.
+fn visible_screens<'a>(
+    primary: &'a ScreenTransform,
+    extra: &'a BTreeMap<u16, ExtraStream>,
+) -> Vec<(u32, &'a ScreenTransform)> {
+    std::iter::once((0, primary))
+        .chain(
+            extra
+                .iter()
+                .filter(|(_, s)| s.decoder.is_some())
+                .map(|(&id, s)| (u32::from(id), &s.transform)),
+        )
+        .collect()
+}
 
 /// High-performance client runtime managing the VR spatial desktop session.
 pub struct QuestClientRuntime {
@@ -36,9 +82,10 @@ pub struct QuestClientRuntime {
     gesture_detector: HandGestureDetector,
     is_running: bool,
     swapchains_ready: bool,
-    loss_recovery: crate::receiver::loss_recovery::LossRecovery,
+    loss_recovery: LossRecovery,
     overlay_scene: crate::openxr::overlay::OverlayScene,
-    keyframe_requester: Option<Box<dyn Fn() + Send>>,
+    keyframe_requester: Option<Box<dyn Fn(u16) + Send>>,
+    extra_streams: BTreeMap<u16, ExtraStream>,
     pointer_input: PointerInput,
     pointer_event_sink: Option<Box<dyn Fn(InputEvent) + Send>>,
     pointer_queue_latency: Option<Box<dyn Fn() -> u64 + Send>>,
@@ -134,9 +181,10 @@ impl QuestClientRuntime {
             gesture_detector,
             is_running: true,
             swapchains_ready,
-            loss_recovery: crate::receiver::loss_recovery::LossRecovery::new(),
+            loss_recovery: LossRecovery::new(),
             overlay_scene: Default::default(),
             keyframe_requester: None,
+            extra_streams: BTreeMap::new(),
             pointer_input,
             pointer_event_sink: None,
             pointer_queue_latency: None,
@@ -147,9 +195,9 @@ impl QuestClientRuntime {
         })
     }
 
-    /// Called (rate limited) whenever video is lost and a keyframe is needed. On Android this
-    /// sends [`linux_quest_protocol::InputEvent::KeyframeRequest`] on the UDP input channel.
-    pub fn set_keyframe_requester(&mut self, request: Box<dyn Fn() + Send>) {
+    /// Called (rate limited) with the stream id whenever a stream's video is lost and needs a
+    /// keyframe. On Android this sends a keyframe request on the UDP input channel.
+    pub fn set_keyframe_requester(&mut self, request: Box<dyn Fn(u16) + Send>) {
         self.keyframe_requester = Some(request);
     }
 
@@ -164,8 +212,141 @@ impl QuestClientRuntime {
     }
 
     /// Loss-recovery state between the reassembler and the decoder.
-    pub fn loss_recovery(&self) -> &crate::receiver::loss_recovery::LossRecovery {
+    pub fn loss_recovery(&self) -> &LossRecovery {
         &self.loss_recovery
+    }
+
+    /// Stream ids of the extra video streams seen so far, and whether each has a screen yet.
+    pub fn extra_streams(&self) -> Vec<(u16, bool)> {
+        self.extra_streams
+            .iter()
+            .map(|(&id, s)| (id, s.decoder.is_some()))
+            .collect()
+    }
+
+    /// Placement of extra stream `stream_id`'s screen.
+    pub fn extra_screen_transform(&self, stream_id: u16) -> Option<&ScreenTransform> {
+        self.extra_streams.get(&stream_id).map(|s| &s.transform)
+    }
+
+    /// Creates stream `stream_id`'s screen (if needed) and a decoder bound to it.
+    fn open_extra_screen(
+        config: &ClientConfig,
+        openxr_context: &mut OpenXrContext,
+        stream_id: u16,
+        (width, height): (u32, u32),
+        transform: &ScreenTransform,
+    ) -> ClientResult<Box<dyn HardwareVideoDecoder>> {
+        openxr_context.create_extra_screen(stream_id, (width, height), transform.clone())?;
+        #[cfg(target_os = "android")]
+        let surface_ptr = openxr_context
+            .extra_surface_window(stream_id)
+            .map(|win| win.ptr().as_ptr() as *mut std::ffi::c_void);
+        #[cfg(not(target_os = "android"))]
+        let surface_ptr = None;
+        create_decoder(config, width, height, surface_ptr)
+    }
+
+    /// Feeds each extra stream's ready frames to its decoder (creating its screen on the first
+    /// keyframe), asks for keyframes it needs, and shows its newest decoded frame.
+    fn step_extra_streams(&mut self, now: Instant, display_ns: i64) {
+        for (&id, stream) in self.extra_streams.iter_mut() {
+            let frames = stream.receiver.pop_ready_frames(now).unwrap_or_default();
+            for frame in frames {
+                if stream
+                    .loss_recovery
+                    .admit(frame.meta.frame_id, frame.meta.is_keyframe)
+                    == Admit::Skip
+                {
+                    continue;
+                }
+                if stream.decoder.is_none() {
+                    if stream.retry_at.is_some_and(|t| now < t) {
+                        stream.loss_recovery.decoder_refused();
+                        continue;
+                    }
+                    let size = (frame.meta.width, frame.meta.height);
+                    match Self::open_extra_screen(
+                        &self.config,
+                        &mut self.openxr_context,
+                        id,
+                        size,
+                        &stream.transform,
+                    ) {
+                        Ok(decoder) => {
+                            tracing::info!(
+                                stream_id = id,
+                                width = size.0,
+                                height = size.1,
+                                "showing video stream on its own screen"
+                            );
+                            stream.decoder = Some(decoder);
+                            stream.retry_at = None;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = ?e,
+                                stream_id = id,
+                                "could not create a screen for this video stream; retrying later"
+                            );
+                            stream.retry_at = Some(now + EXTRA_SCREEN_RETRY);
+                            stream.loss_recovery.decoder_refused();
+                            continue;
+                        }
+                    }
+                }
+                if let Some(decoder) = stream.decoder.as_mut() {
+                    if let Err(e) = decoder.queue_input_buffer(
+                        &frame.bitstream,
+                        frame.meta.pts_us,
+                        frame.meta.is_keyframe,
+                    ) {
+                        tracing::warn!(
+                            error = ?e,
+                            stream_id = id,
+                            frame_id = frame.meta.frame_id,
+                            "Failed to queue video frame into decoder; waiting for a keyframe"
+                        );
+                        stream.loss_recovery.decoder_refused();
+                    }
+                }
+            }
+            if stream.loss_recovery.take_request(now) {
+                if let Some(request) = &self.keyframe_requester {
+                    request(id);
+                }
+            }
+            if let Some(decoder) = stream.decoder.as_mut() {
+                let mut latest = None;
+                while let Ok(Some(frame)) = decoder.dequeue_output_buffer(0) {
+                    if let Some(prev) = latest.replace(frame) {
+                        let _ = decoder.release_output_buffer(prev.buffer_index, false);
+                    }
+                }
+                if let Some(frame) = latest {
+                    let _ = decoder.release_output_buffer_at_time(frame.buffer_index, display_ns);
+                }
+            }
+        }
+    }
+
+    /// Applies a moved or resized screen, primary or extra.
+    fn apply_screen_transform(&mut self, display_id: u32, transform: ScreenTransform) {
+        self.active_layout.insert(display_id, transform.clone());
+        match u16::try_from(display_id) {
+            Ok(0) => {
+                self.screen_transform = transform.clone();
+                self.openxr_context.set_screen_transform(transform);
+            }
+            Ok(id) => {
+                if let Some(stream) = self.extra_streams.get_mut(&id) {
+                    stream.transform = transform.clone();
+                    self.openxr_context
+                        .set_extra_screen_transform(id, transform);
+                }
+            }
+            Err(_) => {}
+        }
     }
 
     fn build_decoder(
@@ -203,7 +384,7 @@ impl QuestClientRuntime {
         self.openxr_context.create_swapchains(&self.config)?;
         self.decoder = Self::build_decoder(&self.config, &self.openxr_context)?;
         // A fresh decoder can only start from a keyframe.
-        self.loss_recovery = crate::receiver::loss_recovery::LossRecovery::new();
+        self.loss_recovery = LossRecovery::new();
         self.swapchains_ready = true;
         Ok(())
     }
@@ -303,14 +484,18 @@ impl QuestClientRuntime {
                 .cloned()
         })
         .collect();
-        let hits: Vec<Option<crate::spatial::RayHit>> = pointing
-            .iter()
-            .map(|i| {
-                i.aim_ray
-                    .as_ref()
-                    .and_then(|r| self.screen_transform.intersect_ray(r))
-            })
-            .collect();
+        let hits: Vec<Option<crate::spatial::RayHit>> = {
+            let screens = visible_screens(&self.screen_transform, &self.extra_streams);
+            pointing
+                .iter()
+                .map(|i| {
+                    i.aim_ray.as_ref().and_then(|r| {
+                        ScreenTransform::find_closest_hit(r, screens.iter().copied())
+                            .map(|(_, hit)| hit)
+                    })
+                })
+                .collect()
+        };
 
         // An input that points at the screen and squeezes wins (it starts or takes over the
         // grab); otherwise a grab or hover in progress keeps its source.
@@ -354,12 +539,9 @@ impl QuestClientRuntime {
 
         let mut pointer_latency_us = 0;
         if let Some(input) = selected_input {
-            let screen_refs: Vec<_> = self
-                .active_layout
-                .screens
-                .iter()
-                .map(|(&id, screen)| (id, screen))
-                .collect();
+            // Desktop clicks go to the primary screen only: the host maps absolute pointer
+            // positions onto one desktop and cannot yet place them on another stream's monitor.
+            let screen_refs = [(0, &self.screen_transform)];
             let secondary_down = match input.source {
                 crate::spatial::InteractionSource::Controller(Handedness::Right) => {
                     right_ctrl.as_ref().is_some_and(|c| c.thumbstick_clicked)
@@ -504,12 +686,17 @@ impl QuestClientRuntime {
         });
         let moving =
             matches!(interaction_state, InteractionState::Grabbing(_)) && resizing.is_none();
-        let (bar, corner) = crate::openxr::overlay::window_handles(
-            &self.screen_transform,
-            hover_uv,
-            moving,
-            resizing,
-        );
+        let handle_display = match interaction_state {
+            InteractionState::Hovering { display_id, .. } => *display_id,
+            InteractionState::Grabbing(session) => session.display_id,
+            InteractionState::Idle => 0,
+        };
+        let handle_screen = u16::try_from(handle_display)
+            .ok()
+            .and_then(|id| self.extra_streams.get(&id))
+            .map_or(&self.screen_transform, |s| &s.transform);
+        let (bar, corner) =
+            crate::openxr::overlay::window_handles(handle_screen, hover_uv, moving, resizing);
         self.overlay_scene.bar = bar;
         self.overlay_scene.corner = corner;
 
@@ -527,7 +714,6 @@ impl QuestClientRuntime {
         };
 
         if let Ok(ready_frames) = self.receiver.pop_ready_frames(playout_instant) {
-            use crate::receiver::loss_recovery::Admit;
             for frame in ready_frames {
                 if self
                     .loss_recovery
@@ -552,7 +738,7 @@ impl QuestClientRuntime {
         }
         if self.loss_recovery.take_request(playout_instant) {
             if let Some(request) = &self.keyframe_requester {
-                request();
+                request(0);
             }
         }
 
@@ -569,6 +755,7 @@ impl QuestClientRuntime {
                 .decoder
                 .release_output_buffer_at_time(frame.buffer_index, monotonic_display_ns);
         }
+        self.step_extra_streams(playout_instant, monotonic_display_ns);
 
         // 5. Update debug HUD telemetry
         let decoder_stats = self.decoder.stats();
@@ -618,11 +805,35 @@ impl QuestClientRuntime {
     }
 
     /// Ingests an incoming network or USB packet into the appropriate jitter buffer (video or audio).
+    /// Video packets go to their stream's receiver by `stream_id`: 0 is the primary screen,
+    /// and each of the ids 1 to [`MAX_EXTRA_STREAMS`] gets a screen of its own, placed beside
+    /// the primary one (or where the saved layout has it).
     pub fn ingest_packet(&mut self, packet: Packet, now: Instant) {
+        let stream_id = packet.header.stream_id;
         if packet.header.packet_type == linux_quest_protocol::packet::PacketType::AudioFrame {
             let _ = self.audio_receiver.ingest_packet(packet, now);
-        } else {
+        } else if stream_id == 0 {
             self.receiver.ingest_packet(packet, now);
+        } else if stream_id <= MAX_EXTRA_STREAMS {
+            let (config, primary, layout) =
+                (&self.config, &self.screen_transform, &self.active_layout);
+            self.extra_streams
+                .entry(stream_id)
+                .or_insert_with(|| {
+                    tracing::info!(stream_id, "new video stream; it gets its own screen");
+                    ExtraStream {
+                        receiver: ClientReceiver::new(config),
+                        loss_recovery: LossRecovery::new(),
+                        decoder: None,
+                        transform: layout
+                            .get(u32::from(stream_id))
+                            .cloned()
+                            .unwrap_or_else(|| primary.beside(extra_screen_slot(stream_id))),
+                        retry_at: None,
+                    }
+                })
+                .receiver
+                .ingest_packet(packet, now);
         }
     }
 
@@ -845,6 +1056,9 @@ impl QuestClientRuntime {
         let store = SpatialLayoutStore::new(path.as_ref());
         let mut layout = SpatialScreenLayout::default();
         layout.insert(0, self.screen_transform.clone());
+        for (&id, stream) in &self.extra_streams {
+            layout.insert(u32::from(id), stream.transform.clone());
+        }
         store.save(&layout)
     }
 
@@ -930,7 +1144,7 @@ impl QuestClientRuntime {
         secondary: Option<&InteractionInput>,
         dt_seconds: f32,
     ) -> Option<InteractionEvent> {
-        let screens = vec![(0, &self.screen_transform)];
+        let screens = visible_screens(&self.screen_transform, &self.extra_streams);
         let event = self
             .interaction_state_machine
             .update_two(input, secondary, screens, dt_seconds);
@@ -941,21 +1155,13 @@ impl QuestClientRuntime {
                     display_id,
                     transform,
                     ..
-                } => {
-                    self.screen_transform = transform.clone();
-                    self.active_layout.insert(*display_id, transform.clone());
-                    self.openxr_context.set_screen_transform(transform.clone());
-                }
+                } => self.apply_screen_transform(*display_id, transform.clone()),
                 InteractionEvent::GrabEnded {
                     display_id,
                     final_transform,
                     ..
                 } => {
-                    self.screen_transform = final_transform.clone();
-                    self.active_layout
-                        .insert(*display_id, final_transform.clone());
-                    self.openxr_context
-                        .set_screen_transform(final_transform.clone());
+                    self.apply_screen_transform(*display_id, final_transform.clone());
 
                     // Persist spatial layout to disk via layout store
                     if let Some(store) = &self.layout_store {
@@ -979,6 +1185,11 @@ impl QuestClientRuntime {
     pub fn stop(&mut self) {
         self.is_running = false;
         let _ = self.decoder.flush();
+        for stream in self.extra_streams.values_mut() {
+            if let Some(decoder) = stream.decoder.as_mut() {
+                let _ = decoder.flush();
+            }
+        }
     }
 }
 
@@ -1024,7 +1235,7 @@ mod tests {
         let chunk_bytes = chunk.serialize().unwrap();
         let header = linux_quest_protocol::packet::PacketHeader::new(
             linux_quest_protocol::packet::PacketType::VideoFrameChunk,
-            1,
+            0,
             1,
             50_000,
             &chunk_bytes,
@@ -1105,5 +1316,108 @@ mod tests {
         // The panel renders while open even though the HUD is off.
         runtime.step_frame().unwrap();
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn video_packet(stream_id: u16, frame_id: u64, is_keyframe: bool) -> Packet {
+        let meta = VideoChunkMeta {
+            frame_id,
+            chunk_index: 0,
+            total_chunks: 1,
+            codec: VideoCodec::Av1,
+            is_keyframe,
+            is_intra_refresh: false,
+            width: 1280,
+            height: 720,
+            fps: 60,
+            pts_us: frame_id * 16_666,
+        };
+        let bytes = VideoChunk::new(meta, Bytes::from_static(&[0x0A, 0x02, 0x11, 0x22]))
+            .serialize()
+            .unwrap();
+        let header = linux_quest_protocol::packet::PacketHeader::new(
+            linux_quest_protocol::packet::PacketType::VideoFrameChunk,
+            stream_id,
+            frame_id as u32,
+            frame_id * 16_666,
+            &bytes,
+        );
+        Packet::new(header, bytes)
+    }
+
+    #[test]
+    fn extra_screens_start_beside_the_primary_alternating_sides() {
+        assert_eq!(extra_screen_slot(1), 1);
+        assert_eq!(extra_screen_slot(2), -1);
+        assert_eq!(extra_screen_slot(3), 2);
+    }
+
+    #[test]
+    fn each_extra_stream_gets_its_own_screen_and_keyframe_requests() {
+        let mut runtime = QuestClientRuntime::new(ClientConfig::default()).unwrap();
+        let requested = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = requested.clone();
+        runtime.set_keyframe_requester(Box::new(move |id| log.lock().unwrap().push(id)));
+        runtime.step_frame().unwrap();
+        // With no video yet, the primary stream asks for its first keyframe.
+        assert_eq!(std::mem::take(&mut *requested.lock().unwrap()), vec![0]);
+
+        let arrival = Instant::now();
+        runtime.ingest_packet(video_packet(0, 1, true), arrival);
+        runtime.ingest_packet(video_packet(1, 1, true), arrival);
+        // Stream 2 starts mid-GOP: no screen until a keyframe, and it asks for one.
+        runtime.ingest_packet(video_packet(2, 5, false), arrival);
+        // Beyond the supported streams: ignored.
+        runtime.ingest_packet(video_packet(MAX_EXTRA_STREAMS + 1, 1, true), arrival);
+        runtime
+            .step_frame_at(arrival + Duration::from_millis(10))
+            .unwrap();
+
+        assert_eq!(runtime.extra_streams(), vec![(1, true), (2, false)]);
+        assert_eq!(*requested.lock().unwrap(), vec![2]);
+        assert_eq!(runtime.decoder_stats().frames_queued, 1);
+
+        let primary = runtime.screen_transform().position;
+        assert!(runtime.extra_screen_transform(1).unwrap().position.x > primary.x + 0.5);
+        assert!(runtime.extra_screen_transform(2).unwrap().position.x < primary.x - 0.5);
+
+        // The keyframe arrives: stream 2 gets its screen too.
+        runtime.ingest_packet(
+            video_packet(2, 6, true),
+            arrival + Duration::from_millis(20),
+        );
+        runtime
+            .step_frame_at(arrival + Duration::from_millis(40))
+            .unwrap();
+        assert_eq!(runtime.extra_streams(), vec![(1, true), (2, true)]);
+    }
+
+    #[test]
+    fn a_pointer_aimed_at_a_side_screen_hovers_that_screen() {
+        let mut runtime = QuestClientRuntime::new(ClientConfig::default()).unwrap();
+        let arrival = Instant::now();
+        runtime.ingest_packet(video_packet(1, 1, true), arrival);
+        runtime
+            .step_frame_at(arrival + Duration::from_millis(10))
+            .unwrap();
+        let primary = runtime.screen_transform().clone();
+        let viewer = primary.position + Vec3::new(0.0, 0.0, primary.distance);
+        let target = runtime.extra_screen_transform(1).unwrap().position;
+        let input = InteractionInput {
+            source: crate::spatial::InteractionSource::Controller(Handedness::Right),
+            aim_ray: Some(crate::spatial::Ray::new(viewer, target - viewer)),
+            grab_pose: None,
+            is_grabbing: false,
+            is_selecting: false,
+            thumbstick: (0.0, 0.0),
+        };
+        runtime.step_interaction(&input, 1.0 / 90.0);
+        assert!(
+            matches!(
+                runtime.interaction_state(),
+                InteractionState::Hovering { display_id: 1, .. }
+            ),
+            "{:?}",
+            runtime.interaction_state()
+        );
     }
 }

@@ -7,7 +7,9 @@ use tokio::task::JoinHandle;
 
 use super::error::ScreenCastError;
 use super::hub::CaptureHub;
-use super::portal::{negotiate, ScreenCastPortal, SessionHandle};
+use super::portal::{
+    negotiate_source, ScreenCastPortal, SessionHandle, SOURCE_MONITOR, SOURCE_WINDOW,
+};
 use super::stream::{self, StreamHandle, StreamParams};
 use super::ScreenCastConfig;
 use crate::CaptureInfo;
@@ -28,7 +30,7 @@ impl ScreenCastSession {
     ///
     /// `hub` is reset first, so a hub can be reused across restarts.
     pub async fn start<P>(
-        mut portal: P,
+        portal: P,
         cfg: &ScreenCastConfig,
         hub: Arc<CaptureHub>,
         display_id: u16,
@@ -36,15 +38,43 @@ impl ScreenCastSession {
     where
         P: ScreenCastPortal + 'static,
     {
+        Self::start_source(portal, cfg, hub, display_id, SOURCE_MONITOR).await
+    }
+
+    /// Starts a session that asks the portal to select one application window.
+    pub async fn start_window<P>(
+        portal: P,
+        cfg: &ScreenCastConfig,
+        hub: Arc<CaptureHub>,
+        display_id: u16,
+    ) -> Result<Self, ScreenCastError>
+    where
+        P: ScreenCastPortal + 'static,
+    {
+        Self::start_source(portal, cfg, hub, display_id, SOURCE_WINDOW).await
+    }
+
+    async fn start_source<P>(
+        mut portal: P,
+        cfg: &ScreenCastConfig,
+        hub: Arc<CaptureHub>,
+        display_id: u16,
+        source_types: u32,
+    ) -> Result<Self, ScreenCastError>
+    where
+        P: ScreenCastPortal + 'static,
+    {
         hub.reset();
         let store = cfg.resolve_token_store();
-        let grant =
-            match tokio::time::timeout(cfg.portal_timeout, negotiate(&mut portal, store.as_ref()))
-                .await
-            {
-                Ok(r) => r?,
-                Err(_) => return Err(ScreenCastError::NegotiationTimeout(cfg.portal_timeout)),
-            };
+        let grant = match tokio::time::timeout(
+            cfg.portal_timeout,
+            negotiate_source(&mut portal, store.as_ref(), source_types),
+        )
+        .await
+        {
+            Ok(r) => r?,
+            Err(_) => return Err(ScreenCastError::NegotiationTimeout(cfg.portal_timeout)),
+        };
         tracing::info!(
             "screencast: portal granted node {} (restore token {})",
             grant.stream.node_id,

@@ -1,5 +1,6 @@
 //! Pure-Rust spatial screen model, 6DoF transforms, pointing rays, gestures, and layout persistence.
 
+pub mod arrangement;
 pub mod grab;
 pub mod interaction;
 pub mod layout;
@@ -9,6 +10,10 @@ pub mod pose;
 pub mod ray;
 pub mod transform;
 
+pub use arrangement::{
+    host_arrangement_key, ArrangementBook, ArrangementBookStore, HostPlacement, LayoutPreset,
+    PanelArrangement, FOCUS_RAISE_M, PANEL_GAP_RAD,
+};
 pub use grab::{
     corner_at, Corner, GrabMode, GrabSession, GrabStateMachine, InteractionEvent, InteractionState,
     TwoHandScale, CORNER_ZONE,
