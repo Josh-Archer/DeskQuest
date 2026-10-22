@@ -12,6 +12,7 @@ use crate::decoder::{create_decoder, DecoderStats, HardwareVideoDecoder};
 use crate::error::ClientResult;
 use crate::graphics::VulkanContext;
 use crate::hud::{DebugHud, ShortcutAction, ShortcutDetector};
+use crate::openxr::frame_loop::surface_presentation_time_ns;
 use crate::openxr::{FrameLoopEngine, FramePacingMetrics, OpenXrContext};
 use crate::receiver::loss_recovery::{Admit, LossRecovery};
 use crate::receiver::ClientReceiver;
@@ -251,7 +252,7 @@ impl QuestClientRuntime {
 
     /// Feeds each extra stream's ready frames to its decoder (creating its screen on the first
     /// keyframe), asks for keyframes it needs, and shows its newest decoded frame.
-    fn step_extra_streams(&mut self, now: Instant, display_ns: i64) {
+    fn step_extra_streams(&mut self, now: Instant, display_ns: i64, frame_period_ns: i64) {
         for (&id, stream) in self.extra_streams.iter_mut() {
             let frames = stream.receiver.pop_ready_frames(now).unwrap_or_default();
             for frame in frames {
@@ -326,6 +327,12 @@ impl QuestClientRuntime {
                     }
                 }
                 if let Some(frame) = latest {
+                    let display_ns = surface_presentation_time_ns(
+                        display_ns,
+                        self.openxr_context.monotonic_now_ns(),
+                        frame_period_ns,
+                        2_000_000,
+                    );
                     let shown = decoder
                         .release_output_buffer_at_time(frame.buffer_index, display_ns)
                         .is_ok();
@@ -465,6 +472,7 @@ impl QuestClientRuntime {
         let monotonic_display_ns = self
             .openxr_context
             .convert_time_to_monotonic_ns(display_time);
+        let frame_period_ns = pacing.motion_to_photon_latency_us as i64 * 1000;
 
         // 2a. Poll controller actions and skeletal hand tracking
         let _ = self.openxr_context.poll_interaction(display_time);
@@ -812,11 +820,17 @@ impl QuestClientRuntime {
             }
         }
         if let Some(frame) = latest_frame {
+            let display_ns = surface_presentation_time_ns(
+                monotonic_display_ns,
+                self.openxr_context.monotonic_now_ns(),
+                frame_period_ns,
+                2_000_000,
+            );
             let _ = self
                 .decoder
-                .release_output_buffer_at_time(frame.buffer_index, monotonic_display_ns);
+                .release_output_buffer_at_time(frame.buffer_index, display_ns);
         }
-        self.step_extra_streams(playout_instant, monotonic_display_ns);
+        self.step_extra_streams(playout_instant, monotonic_display_ns, frame_period_ns);
 
         // 5. Update debug HUD telemetry
         let decoder_stats = self.decoder.stats();

@@ -1119,6 +1119,19 @@ impl OpenXrContext {
         now.tv_sec * 1_000_000_000 + now.tv_nsec
     }
 
+    /// Returns the current CLOCK_MONOTONIC timestamp in nanoseconds, the clock used by Android
+    /// surface frame timestamps.
+    pub fn monotonic_now_ns(&self) -> i64 {
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        unsafe {
+            libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now);
+        }
+        now.tv_sec * 1_000_000_000 + now.tv_nsec
+    }
+
     /// Returns the active refresh rate manager.
     pub fn refresh_rate_manager(&self) -> Option<&RefreshRateManager> {
         self.refresh_rate_manager.as_ref()

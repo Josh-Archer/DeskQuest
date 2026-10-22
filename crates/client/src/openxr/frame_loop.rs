@@ -22,6 +22,26 @@ pub struct FramePacingMetrics {
     pub should_render: bool,
 }
 
+/// Selects a surface presentation slot with enough time for the native surface queue to accept
+/// the decoded buffer. A predicted OpenXR display time may be only a fraction of a refresh
+/// interval away by the time decoding finishes; Android may then classify the buffer as late.
+pub(crate) fn surface_presentation_time_ns(
+    predicted_display_ns: i64,
+    now_ns: i64,
+    frame_period_ns: i64,
+    minimum_lead_ns: i64,
+) -> i64 {
+    let period = frame_period_ns.max(1);
+    let deadline = now_ns.saturating_add(minimum_lead_ns.max(0));
+    if predicted_display_ns >= deadline {
+        return predicted_display_ns;
+    }
+
+    let late_by = deadline.saturating_sub(predicted_display_ns);
+    let periods = (late_by / period).saturating_add(i64::from(late_by % period != 0));
+    predicted_display_ns.saturating_add(periods.saturating_mul(period))
+}
+
 /// Orchestrates the OpenXR frame pacing loop synchronized to headset refresh rates.
 pub struct FrameLoopEngine {
     last_frame_instant: Instant,
@@ -114,6 +134,34 @@ impl FrameLoopEngine {
 mod tests {
     use super::*;
     use crate::config::ClientConfig;
+
+    #[test]
+    fn surface_timestamp_keeps_predicted_slot_when_it_has_enough_lead() {
+        assert_eq!(
+            surface_presentation_time_ns(20_000_000, 10_000_000, 11_111_111, 2_000_000),
+            20_000_000
+        );
+    }
+
+    #[test]
+    fn surface_timestamp_advances_to_first_slot_with_safe_lead() {
+        assert_eq!(
+            surface_presentation_time_ns(20_000_000, 19_000_000, 11_111_111, 2_000_000),
+            31_111_111
+        );
+        assert_eq!(
+            surface_presentation_time_ns(20_000_000, 42_000_000, 11_111_111, 2_000_000),
+            53_333_333
+        );
+    }
+
+    #[test]
+    fn surface_timestamp_accepts_slot_exactly_at_minimum_lead() {
+        assert_eq!(
+            surface_presentation_time_ns(20_000_000, 9_000_000, 11_000_000, 11_000_000),
+            20_000_000
+        );
+    }
 
     #[test]
     fn test_frame_loop_engine_pacing() {
