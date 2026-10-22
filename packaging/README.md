@@ -190,7 +190,7 @@ Install Rust and the native build prerequisites, then run:
 
 ```bash
 cargo install --locked cargo-deb
-cargo build --release --locked -p linux-quest-host --features mdns
+cargo build --release --locked -p linux-quest-host --features mdns,pipewire-capture
 cargo deb -p linux-quest-host --no-build
 ```
 
@@ -201,7 +201,7 @@ udev rule, boot-time module configuration, systemd user unit and licenses.
 
 ```bash
 cargo install --locked cargo-generate-rpm
-cargo build --release --locked -p linux-quest-host --features mdns
+cargo build --release --locked -p linux-quest-host --features mdns,pipewire-capture
 cargo generate-rpm -p crates/host
 ```
 
@@ -259,6 +259,14 @@ The APK is `crates/client/target/android-apk/linux-quest-release.apk`. It is
 debug-signed for sideload testing, not signed for store distribution. Install it
 on a connected Quest with `scripts/install-quest.sh` (or pass the APK path).
 
+The signing key is per user, not per checkout: the first build generates
+`${XDG_DATA_HOME:-~/.local/share}/linux-quest/debug.keystore` and every later
+build, from any checkout, reuses it, so `adb install -r` upgrades in place. Set
+`LINUX_QUEST_KEYSTORE=/path/to/debug.keystore` to use another one (for example
+to share one key across machines). Never commit it. The build also sets
+`CMAKE_POLICY_VERSION_MINIMUM=3.5` (as does `.cargo/config.toml`) so the bundled
+opus builds with CMake 4.x.
+
 ## Quest sideloading
 
 The `.deb` and `.rpm` run `udevadm control --reload` and `udevadm trigger` after
@@ -279,10 +287,15 @@ ANDROID_SERIAL=<serial> scripts/install-quest.sh   # pick one device when severa
 
 With no path argument, the script installs the newer of `linux-quest-release.apk` and `linux-quest-debug.apk` and warns when both exist. It needs `adb` on `PATH` and accepts the headset's "Allow USB debugging" prompt.
 
+If it fails with `INSTALL_FAILED_UPDATE_INCOMPATIBLE`, the installed app was signed
+with a different key (for example an APK from before the per-user keystore). Run
+`adb uninstall com.linuxquest.client` once (this clears the app's data) and install
+again; later upgrades keep working.
+
 ### Testing LAN discovery on a real Quest (no IP address)
 
 The host package recipes and Quest APK use the `mdns` feature. A source build needs
-it explicitly: `cargo build --release -p linux-quest-host --features mdns` and
+it explicitly: `cargo build --release -p linux-quest-host --features mdns,pipewire-capture` and
 `crates/client/android/build.sh` (which already passes `--features mdns`).
 
 1. Put the PC and the Quest on the same Wi-Fi network (same subnet; guest/isolated SSIDs and some mesh "AP isolation" settings block multicast). Allow UDP `5353` (mDNS), TCP `48444`, UDP `48442` and UDP `48440` through the PC firewall, for example `sudo ufw allow from 192.168.1.0/24`.

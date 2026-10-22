@@ -26,6 +26,8 @@ if [[ -z "${ANDROID_NDK_HOME}" || ! -d "${ANDROID_NDK_HOME}" ]]; then
     exit 1
 fi
 export ANDROID_NDK_HOME
+# audiopus_sys bundles an opus CMakeLists that CMake 4.x rejects without this (#109).
+export CMAKE_POLICY_VERSION_MINIMUM="${CMAKE_POLICY_VERSION_MINIMUM:-3.5}"
 
 # Locate build tools
 BUILD_TOOLS_DIR="$(find "${ANDROID_SDK_ROOT}/build-tools" -maxdepth 1 -mindepth 1 | sort -V | tail -n1)"
@@ -151,10 +153,13 @@ cd "${CLIENT_DIR}"
 echo "[4/6] Aligning APK with zipalign..."
 "${ZIPALIGN}" -f -p 4 "${UNALIGNED_APK}" "${ALIGNED_APK}"
 
-# Step 6: Create debug keystore if absent and sign APK
-KEYSTORE="${OUT_DIR}/debug.keystore"
+# Step 6: Create the debug keystore if absent and sign the APK.
+# The keystore lives per user, outside the repo, so every checkout signs with the same key and
+# `adb install -r` can upgrade in place (#110). Override with LINUX_QUEST_KEYSTORE.
+KEYSTORE="${LINUX_QUEST_KEYSTORE:-${XDG_DATA_HOME:-${HOME}/.local/share}/linux-quest/debug.keystore}"
 if [[ ! -f "${KEYSTORE}" ]]; then
-    echo "[5/6] Generating debug signing keystore..."
+    echo "[5/6] Generating debug signing keystore at ${KEYSTORE} (reused by later builds)..."
+    mkdir -p "$(dirname "${KEYSTORE}")"
     keytool -genkey -v \
         -keystore "${KEYSTORE}" \
         -storepass android \
@@ -164,8 +169,9 @@ if [[ ! -f "${KEYSTORE}" ]]; then
         -keysize 2048 \
         -validity 10000 \
         -dname "CN=Android Debug,O=Android,C=US" > /dev/null 2>&1
+    chmod 600 "${KEYSTORE}"
 else
-    echo "[5/6] Using existing debug keystore..."
+    echo "[5/6] Using debug keystore ${KEYSTORE}..."
 fi
 
 echo "[6/6] Signing APK with apksigner..."
