@@ -136,7 +136,7 @@ systemctl --user disable --now linux-quest-host
 
 ## Tray icon
 
-`linux-quest-host tray` puts a status icon in the system tray. The icon is green for USB, blue for Wi-Fi, grey when no headset is connected, and a hollow ring when the daemon is not running. Its menu has:
+`linux-quest-host tray` puts a status icon in the system tray. The penguin logo has a cyan badge for USB, blue for Wi-Fi, amber when no headset is connected, and a grey ring when the daemon is not running. Disconnected and offline logos are desaturated. Its menu has:
 
 - **Status**: the connection, and below it what is streaming and at what bitrate (or that it is paused), as disabled rows.
 - **Pause Streaming / Resume Streaming**: stops or restarts video to the headset. Capture keeps running, so resuming is immediate. Shown only by a daemon new enough to report it.
@@ -194,7 +194,7 @@ cargo build --release --locked -p linux-quest-host --features mdns
 cargo deb -p linux-quest-host --no-build
 ```
 
-The `.deb` is written under `target/debian/`. It installs the daemon, `/dev/uinput`
+The host `.deb` is written under `target/debian/`. It installs the daemon, `/dev/uinput`
 udev rule, boot-time module configuration, systemd user unit and licenses.
 
 ### RPM package
@@ -299,3 +299,14 @@ Troubleshooting:
 - With a USB tunnel up (`adb reverse tcp:48444 tcp:48444`), discovery is skipped and the cable is used.
 
 SSDP/UPnP is not implemented; mDNS is the only discovery protocol.
+
+## Complete Ubuntu app packages and release staging
+
+Use `scripts/ci/build-ubuntu-packages.sh` with the native dependencies in
+`packaging/ubuntu/Dockerfile` to build both the GUI and daemon packages. The GUI
+package includes the application launcher and penguin icon. For a user-local
+source install with a desktop shortcut, run `scripts/install-desktop.sh
+--desktop-shortcut --tray`. The tray starts automatically at your next login;
+Ubuntu needs its AppIndicators extension enabled to show it in the top bar. The app uses blue/cyan accents from the logo while retaining
+native light/dark mode. See [publishing.md](../docs/publishing.md) for UECB builds,
+draft releases and the remaining Meta/Ubuntu store requirements.

@@ -277,3 +277,9 @@ Dual-licensed under either:
 * MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
 
 at your option.
+
+## Packages and publishing
+
+The desktop app and tray use the penguin logo and its blue/cyan palette.
+See [packaging and store preparation](docs/publishing.md) for Ubuntu desktop and
+host packages, UECB builds through Home, draft releases, and Meta/Ubuntu publishing.

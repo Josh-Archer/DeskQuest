@@ -29,3 +29,17 @@ linux-quest-client = { path = "../client" }
 linux-quest-input = { path = "../input" }
 bytes.workspace = true
 parking_lot.workspace = true
+
+[package.metadata.deb]
+name = "linux-quest"
+section = "utils"
+priority = "optional"
+depends = "$auto, linux-quest-host"
+license-file = ["../../packaging/debian/copyright", "0"]
+assets = [
+    ["target/release/linux-quest", "usr/bin/linux-quest", "755"],
+    ["../../packaging/desktop/org.linuxquest.Desktop.desktop", "usr/share/applications/org.linuxquest.Desktop.desktop", "644"],
+    ["../../packaging/icons/hicolor/512x512/apps/org.linuxquest.Desktop.png", "usr/share/icons/hicolor/512x512/apps/org.linuxquest.Desktop.png", "644"],
+    ["../../LICENSE-MIT", "usr/share/doc/linux-quest/LICENSE-MIT", "644"],
+    ["../../LICENSE-APACHE", "usr/share/doc/linux-quest/LICENSE-APACHE", "644"],
+]

@@ -137,6 +137,7 @@ pub fn activate(app: &adw::Application) {
         .content(&toolbar)
         .build();
     window.set_size_request(720, 520);
+    window.add_css_class("linux-quest-window");
 
     if let Ok(page) = std::env::var("LINUX_QUEST_PAGE") {
         stack.set_visible_child_name(&page);

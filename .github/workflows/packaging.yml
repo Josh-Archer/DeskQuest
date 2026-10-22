@@ -9,6 +9,8 @@ on:
       - 'Cargo.lock'
       - 'crates/**'
       - 'packaging/**'
+      - 'scripts/ci/**'
+      - '.dockerignore'
       - 'scripts/install-quest.sh'
   pull_request:
     paths:
@@ -17,6 +19,8 @@ on:
       - 'Cargo.lock'
       - 'crates/**'
       - 'packaging/**'
+      - 'scripts/ci/**'
+      - '.dockerignore'
       - 'scripts/install-quest.sh'
   workflow_dispatch:
 
@@ -29,27 +33,23 @@ concurrency:
 
 jobs:
   host-packages:
-    name: Build Debian and RPM packages
-    runs-on: ubuntu-latest
+    name: Build Ubuntu desktop and host packages
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y build-essential edid-decode rpm
+          sudo apt-get install --no-install-recommends -y build-essential edid-decode rpm pkg-config cmake clang libclang-dev libgtk-4-dev libadwaita-1-dev libglib2.0-dev-bin libpipewire-0.3-dev libva-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: packaging-host
       - name: Install package builders
         run: cargo install --locked cargo-deb cargo-generate-rpm
-      - name: Build host package payload
-        run: cargo build --release --locked -p linux-quest-host --features mdns
-      - name: Build .deb and .rpm
-        run: |
-          cargo deb -p linux-quest-host --no-build
-          cargo generate-rpm -p crates/host
+      - name: Build and verify desktop and host packages
+        run: scripts/ci/build-ubuntu-packages.sh
       - uses: actions/upload-artifact@v4
         with:
           name: linux-quest-deb-rpm
