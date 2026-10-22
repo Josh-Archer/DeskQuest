@@ -237,7 +237,21 @@ impl Window {
         }
         let this = self.clone();
         glib::spawn_future_local(async move {
-            let result = daemon::spawn(daemon::snapshot()).await;
+            let (result, usb) = daemon::spawn(async {
+                let result = daemon::snapshot().await;
+                let usb = if result
+                    .as_ref()
+                    .ok()
+                    .is_some_and(|snapshot| snapshot.headset.is_some())
+                {
+                    crate::headset::UsbDetection::None
+                } else {
+                    crate::headset::discover_usb().await
+                };
+                (result, usb)
+            })
+            .await;
+            this.screens.set_usb_detection(usb);
             this.fetching.set(false);
             this.apply(result);
         });
@@ -326,7 +340,11 @@ impl Window {
                 Ok(()) => tracing::info!(path = %path.display(), "screenshot saved"),
                 Err(e) => tracing::error!(error = %e, "screenshot failed"),
             }
-            this.window.close();
+            if let Some(app) = this.window.application() {
+                app.quit();
+            } else {
+                this.window.close();
+            }
         });
     }
 }

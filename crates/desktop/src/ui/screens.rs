@@ -17,6 +17,7 @@ use linux_quest_protocol::{ScreenCurve, ScreenPlacement};
 
 use super::Shell;
 use crate::daemon::{self, Snapshot};
+use crate::headset::{self, Identity, Model, UsbDetection};
 use crate::topdown::{self, Part, View};
 
 /// Pixels around the drawing kept free.
@@ -56,6 +57,7 @@ struct State {
     connected: bool,
     monitors: Vec<VirtualMonitor>,
     backend: String,
+    headset: Option<Identity>,
 }
 
 #[derive(PartialEq)]
@@ -83,6 +85,11 @@ pub struct ScreensPage {
     screen_names: gtk::StringList,
     screen_ids: RefCell<Vec<u32>>,
     stack: gtk::Stack,
+    empty: adw::StatusPage,
+    empty_preview: headset::Preview,
+    device_button: gtk::Button,
+    heading: gtk::Label,
+    usb: RefCell<UsbDetection>,
     area: gtk::DrawingArea,
     rows: Rows,
     monitors_group: adw::PreferencesGroup,
@@ -117,7 +124,7 @@ impl ScreensPage {
             .build();
         let hint = gtk::Label::builder()
             .label(
-                "Seen from above, you are the dot. Drag a screen to move it around you, drag \
+                "Seen from above, the headset marks your layout origin. Drag a screen to move it, drag \
                  an end to resize it, scroll over it to scale it.",
             )
             .wrap(true)
@@ -139,6 +146,9 @@ impl ScreensPage {
                  reports them to the host.",
             )
             .build();
+        let empty_preview = headset::Preview::new();
+        empty_preview.widget().set_visible(false);
+        empty.set_child(Some(empty_preview.widget()));
         let stack = gtk::Stack::new();
         stack.add_named(&canvas, Some("canvas"));
         stack.add_named(&empty, Some("empty"));
@@ -275,7 +285,22 @@ impl ScreensPage {
             .margin_start(20)
             .margin_end(20)
             .build();
+        let device_button = gtk::Button::builder()
+            .label("Headset")
+            .tooltip_text("Inspect the detected headset in 3D")
+            .visible(false)
+            .build();
+        device_button.add_css_class("flat");
+        if let Some(label) = device_button.child().and_downcast::<gtk::Label>() {
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            label.set_max_width_chars(22);
+        }
+        // The device button provides the model name, leaving room for the selector on
+        // compact windows without adding another row of controls.
         tools.append(&heading);
+        device_button.set_hexpand(true);
+        device_button.set_halign(gtk::Align::Start);
+        tools.append(&device_button);
         tools.append(&selector);
         tools.append(&controls);
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -346,6 +371,11 @@ impl ScreensPage {
             screen_names,
             screen_ids: RefCell::new(Vec::new()),
             stack,
+            empty,
+            empty_preview,
+            device_button,
+            heading,
+            usb: RefCell::new(UsbDetection::None),
             area,
             rows,
             monitors_group,
@@ -375,6 +405,14 @@ impl ScreensPage {
                 }
             }
         });
+        let weak = Rc::downgrade(&this);
+        this.device_button.connect_clicked(move |button| {
+            if let Some(this) = weak.upgrade() {
+                if let Some(identity) = this.state.borrow().headset.as_ref() {
+                    headset::show_details(button, identity);
+                }
+            }
+        });
         this.connect_canvas();
         this.connect_rows();
         this.connect_monitor_buttons();
@@ -386,13 +424,45 @@ impl ScreensPage {
         &self.root
     }
 
+    pub fn set_usb_detection(&self, detection: UsbDetection) {
+        *self.usb.borrow_mut() = detection;
+    }
+
     // ---- data in -------------------------------------------------------------------------
 
     pub fn update(self: &Rc<Self>, snapshot: Option<&Snapshot>) {
         let headset = snapshot.and_then(|s| s.headset.as_ref());
+        let identity = Identity::detected(snapshot, &self.usb.borrow());
+        self.device_button.set_visible(identity.is_some());
+        self.heading.set_visible(identity.is_none());
+        if let Some(identity) = &identity {
+            self.device_button
+                .set_label(&format!("{} · 3D", identity.name));
+            self.device_button
+                .set_tooltip_text(Some(&format!("{} · View 3D model", identity.connection)));
+            self.empty_preview.set_model(identity.model);
+            self.empty_preview.widget().set_visible(true);
+            self.empty.set_icon_name(None);
+            self.empty.set_title(&format!("{} detected", identity.name));
+            self.empty.set_description(Some(if identity.app_connected {
+                "Waiting for the headset to report its screen layout."
+            } else {
+                "USB is available. Start Linux Quest on the headset and connect the host to see its screen layout."
+            }));
+        } else {
+            self.empty_preview.widget().set_visible(false);
+            self.empty.set_icon_name(Some("video-display-symbolic"));
+            self.empty.set_title("No Headset Layout");
+            self.empty.set_description(Some(if *self.usb.borrow() == UsbDetection::Multiple {
+                "Multiple Quest headsets are visible over USB. Connect one through its Linux Quest app to select its layout."
+            } else {
+                "Start Linux Quest on the headset. Its model and screens appear here when it connects."
+            }));
+        }
         {
             let mut st = self.state.borrow_mut();
             st.connected = headset.is_some();
+            st.headset = identity;
             let settled = st.drag.is_none()
                 && !st.in_flight
                 && st.pending.is_none()
@@ -683,16 +753,12 @@ impl ScreensPage {
             let _ = cr.show_text(&format!("{m} m"));
         }
 
-        // The user, facing up.
-        cr.set_source_rgba(r, g, b, 0.85);
-        cr.new_sub_path();
-        cr.arc(user.0, user.1, 8.0, 0.0, std::f64::consts::TAU);
-        let _ = cr.fill();
-        cr.move_to(user.0 - 6.0, user.1 - 6.0);
-        cr.line_to(user.0, user.1 - 17.0);
-        cr.line_to(user.0 + 6.0, user.1 - 6.0);
-        cr.close_path();
-        let _ = cr.fill();
+        // A fixed layout origin, not a claim of live head-pose tracking.
+        let model = st
+            .headset
+            .as_ref()
+            .map_or(Model::Generic, |identity| identity.model);
+        headset::draw_origin(cr, model, user.0, user.1, area.scale_factor());
 
         // The screens, selected one last so it is on top.
         let mut order: Vec<&ScreenPlacement> = st.screens.iter().collect();
