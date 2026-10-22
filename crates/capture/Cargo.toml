@@ -35,5 +35,6 @@ pipewire-screencast = ["portal", "dep:pipewire"]
 pipewire = ["pipewire-audio", "pipewire-screencast"]
 
 [dev-dependencies]
-tokio.workspace = true
+# `test-util`: tests run the capture's retry timers on a paused clock.
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true

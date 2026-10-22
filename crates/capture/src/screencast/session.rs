@@ -8,12 +8,23 @@ use tokio::task::JoinHandle;
 use super::error::ScreenCastError;
 use super::hub::CaptureHub;
 use super::portal::{
-    negotiate_source, negotiate_source_fresh, ScreenCastPortal, SessionHandle, SOURCE_MONITOR,
-    SOURCE_WINDOW,
+    negotiate_source, negotiate_source_fresh, negotiate_source_restore, ScreenCastPortal,
+    SessionHandle, SOURCE_MONITOR, SOURCE_WINDOW,
 };
 use super::stream::{self, StreamHandle, StreamParams};
 use super::ScreenCastConfig;
 use crate::CaptureInfo;
+
+/// How the portal grant is obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grant {
+    /// The stored restore token if it works, the picker otherwise.
+    TokenOrPicker,
+    /// Always the picker.
+    Picker,
+    /// Only the stored restore token; never the picker.
+    TokenOnly,
+}
 
 /// A live capture. Stop it with [`stop`](Self::stop) (also closes the portal session) or just
 /// drop it (the PipeWire thread is stopped and joined; the D-Bus connection going away makes
@@ -39,7 +50,15 @@ impl ScreenCastSession {
     where
         P: ScreenCastPortal + 'static,
     {
-        Self::start_source(portal, cfg, hub, display_id, SOURCE_MONITOR, false).await
+        Self::start_source(
+            portal,
+            cfg,
+            hub,
+            display_id,
+            SOURCE_MONITOR,
+            Grant::TokenOrPicker,
+        )
+        .await
     }
 
     /// Like [`start`](Self::start), but the portal always shows its picker: the stored
@@ -59,7 +78,27 @@ impl ScreenCastSession {
         } else {
             SOURCE_MONITOR
         };
-        Self::start_source(portal, cfg, hub, display_id, source, true).await
+        Self::start_source(portal, cfg, hub, display_id, source, Grant::Picker).await
+    }
+
+    /// Like [`start`](Self::start), but only with the stored restore token: the user is not
+    /// asked (see [`negotiate_source_restore`]).
+    pub async fn restore<P>(
+        portal: P,
+        cfg: &ScreenCastConfig,
+        hub: Arc<CaptureHub>,
+        display_id: u16,
+        window: bool,
+    ) -> Result<Self, ScreenCastError>
+    where
+        P: ScreenCastPortal + 'static,
+    {
+        let source = if window {
+            SOURCE_WINDOW
+        } else {
+            SOURCE_MONITOR
+        };
+        Self::start_source(portal, cfg, hub, display_id, source, Grant::TokenOnly).await
     }
 
     /// Starts a session that asks the portal to select one application window.
@@ -72,7 +111,15 @@ impl ScreenCastSession {
     where
         P: ScreenCastPortal + 'static,
     {
-        Self::start_source(portal, cfg, hub, display_id, SOURCE_WINDOW, false).await
+        Self::start_source(
+            portal,
+            cfg,
+            hub,
+            display_id,
+            SOURCE_WINDOW,
+            Grant::TokenOrPicker,
+        )
+        .await
     }
 
     async fn start_source<P>(
@@ -81,7 +128,7 @@ impl ScreenCastSession {
         hub: Arc<CaptureHub>,
         display_id: u16,
         source_types: u32,
-        fresh: bool,
+        grant: Grant,
     ) -> Result<Self, ScreenCastError>
     where
         P: ScreenCastPortal + 'static,
@@ -89,10 +136,16 @@ impl ScreenCastSession {
         hub.reset();
         let store = cfg.resolve_token_store();
         let negotiation = async {
-            if fresh {
-                negotiate_source_fresh(&mut portal, store.as_ref(), source_types).await
-            } else {
-                negotiate_source(&mut portal, store.as_ref(), source_types).await
+            match grant {
+                Grant::TokenOrPicker => {
+                    negotiate_source(&mut portal, store.as_ref(), source_types).await
+                }
+                Grant::Picker => {
+                    negotiate_source_fresh(&mut portal, store.as_ref(), source_types).await
+                }
+                Grant::TokenOnly => {
+                    negotiate_source_restore(&mut portal, store.as_ref(), source_types).await
+                }
             }
         };
         let grant = match tokio::time::timeout(cfg.portal_timeout, negotiation).await {

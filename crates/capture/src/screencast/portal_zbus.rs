@@ -276,12 +276,21 @@ impl ScreenCastPortal for ZbusPortal {
             .await
             .map_err(map_err)?;
         let mut signals = proxy.receive_signal("Closed").await.map_err(map_err)?;
-        let (tx, rx) = oneshot::channel();
+        let (mut tx, rx) = oneshot::channel();
         tokio::spawn(async move {
             // Keep the proxy alive as long as we listen.
             let _proxy = proxy;
-            if next(&mut signals).await.is_some() {
-                let _ = tx.send(());
+            // Stop listening once nobody waits for the signal (the capture stopped, or the
+            // flow failed). The portal sends no `Closed` for a session we close ourselves, and
+            // this task holds the D-Bus connection open, so without this every closed session
+            // would leave a connection behind.
+            tokio::select! {
+                () = tx.closed() => {}
+                signal = next(&mut signals) => {
+                    if signal.is_some() {
+                        let _ = tx.send(());
+                    }
+                }
             }
         });
         Ok(rx)

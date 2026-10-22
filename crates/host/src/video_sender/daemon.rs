@@ -26,6 +26,19 @@ pub struct CaptureFrameSource<C: DisplayCapture> {
     capture: C,
     /// Requests to let the user pick another screen, served between frames.
     reselect: Option<tokio::sync::mpsc::UnboundedReceiver<ReselectRequest>>,
+    /// Told what the stream shows whenever that changes (the test pattern standing in for a
+    /// lost screen, and the screen again).
+    status: Option<Arc<VideoControl>>,
+    reported: Option<CaptureKind>,
+}
+
+/// What a capture of `backend` shows.
+fn capture_kind(backend: CaptureBackendType) -> CaptureKind {
+    if backend == CaptureBackendType::Synthetic {
+        CaptureKind::TestPattern
+    } else {
+        CaptureKind::Screen
+    }
 }
 
 impl<C: DisplayCapture> CaptureFrameSource<C> {
@@ -48,6 +61,8 @@ impl<C: DisplayCapture> CaptureFrameSource<C> {
         Ok(Self {
             capture,
             reselect: None,
+            status: None,
+            reported: None,
         })
     }
 
@@ -60,15 +75,40 @@ impl<C: DisplayCapture> CaptureFrameSource<C> {
         self
     }
 
+    /// Keeps `control`'s [`CaptureKind`] up to date as the capture switches between the screen
+    /// and the test pattern.
+    pub fn reporting_to(mut self, control: Arc<VideoControl>) -> Self {
+        self.status = Some(control);
+        self.report_kind();
+        self
+    }
+
+    fn report_kind(&mut self) {
+        let Some(control) = &self.status else {
+            return;
+        };
+        let kind = capture_kind(self.capture.backend_type());
+        if self.reported != Some(kind) {
+            self.reported = Some(kind);
+            control.set_capture_kind(kind);
+        }
+    }
+
     /// Runs one request to pick another screen and answers it.
     async fn serve_reselect(&mut self, request: ReselectRequest) {
         tracing::info!("showing the screen picker so the user can choose what to share");
         let result = self.capture.reselect().await.map_err(|e| match e {
+            CaptureError::ScreenCast(ScreenCastError::UserCancelled)
+                if self.capture.backend_type() == CaptureBackendType::Synthetic =>
+            {
+                "the screen picker was cancelled; still showing the test pattern".to_string()
+            }
             CaptureError::ScreenCast(ScreenCastError::UserCancelled) => {
                 "the screen picker was cancelled; still sharing the previous screen".to_string()
             }
             other => other.to_string(),
         });
+        self.report_kind();
         match &result {
             Ok(()) => {
                 tracing::info!(info = ?self.capture.capture_info(), "now sharing the chosen screen")
@@ -136,13 +176,17 @@ impl<C: DisplayCapture + 'static> FrameSource for CaptureFrameSource<C> {
             }
         };
         let err = match captured {
-            Ok(frame) => return Ok(frame),
+            Ok(frame) => {
+                self.report_kind();
+                return Ok(frame);
+            }
             Err(e) if capture_ended(&e) => e,
             Err(e) => return Err(e),
         };
         // GNOME closes the screen-cast session when the screen locks, or when the user stops
         // sharing. Start a new one (the stored restore token avoids a prompt) instead of
-        // ending video for good.
+        // ending video for good. The daemon's `AutoCapture` never gets here: it shows the
+        // test pattern while it restores the capture itself.
         tracing::warn!(error = %err, "screen capture ended; restarting it");
         let mut backoff = std::time::Duration::from_millis(500);
         loop {
@@ -391,14 +435,14 @@ async fn start_daemon_video_stream(
     let mut source = CaptureFrameSource::open(capture, options.test_pattern)
         .await
         .map_err(|e| format!("capture: {e}"))?;
-    let kind = if source.capture.backend_type() == CaptureBackendType::Synthetic {
-        CaptureKind::TestPattern
-    } else {
-        // A real screen: the user can pick another one from the desktop app or the tray.
+    let kind = capture_kind(source.capture.backend_type());
+    if kind == CaptureKind::Screen {
+        // A real screen: the user can pick another one from the desktop app or the tray,
+        // also while the test pattern stands in for it after the screen was lost (locked).
         source = source.with_reselect(control.register_reselect());
-        CaptureKind::Screen
-    };
+    }
     control.set_running(1, kind);
+    let source = source.reporting_to(control.clone());
     let geometry = encode_geometry(source.capture_info().as_ref(), &defaults);
     // A coordinator's share (focus-weighted) replaces the even split.
     let bitrate_kbps = rate
@@ -656,5 +700,241 @@ mod tests {
         let err = source.next_frame().await.unwrap_err();
         assert!(user_refused(&err), "{err}");
         assert_eq!(source.capture.inits, 2, "exactly one restart attempt");
+    }
+
+    /// Frames of [`GnomeScreen`]; the test pattern standing in for it is `PATTERN`.
+    const SCREEN: (u32, u32) = (64, 32);
+    const PATTERN: (u32, u32) = (16, 16);
+
+    /// The desktop's lock screen, shared by [`GnomeScreen`] and (when the daemon can tell)
+    /// the capture's lock probe.
+    #[derive(Default)]
+    struct LockScreen(std::sync::atomic::AtomicBool);
+
+    impl LockScreen {
+        fn set(&self, locked: bool) {
+            self.0.store(locked, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn locked(&self) -> bool {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl linux_quest_capture::ScreenLock for LockScreen {
+        async fn is_locked(&self) -> Option<bool> {
+            Some(self.locked())
+        }
+    }
+
+    #[derive(Default)]
+    struct Calls {
+        restores: std::sync::atomic::AtomicU32,
+        reselects: std::sync::atomic::AtomicU32,
+    }
+
+    /// A portal screen capture as GNOME runs it: locking the screen closes the session, and
+    /// a restore while locked gets no answer until the portal flow times out (the portal
+    /// queues its share dialog behind the lock screen). Unlocked, the restore token works.
+    struct GnomeScreen {
+        lock: Arc<LockScreen>,
+        calls: Arc<Calls>,
+        /// The stored restore token is usable.
+        has_token: bool,
+        running: bool,
+    }
+
+    impl GnomeScreen {
+        fn new(lock: Arc<LockScreen>, has_token: bool) -> (Self, Arc<Calls>) {
+            let calls = Arc::new(Calls::default());
+            let screen = Self {
+                lock,
+                calls: calls.clone(),
+                has_token,
+                running: false,
+            };
+            (screen, calls)
+        }
+    }
+
+    #[async_trait]
+    impl DisplayCapture for GnomeScreen {
+        async fn init(&mut self) -> Result<(), CaptureError> {
+            self.running = true;
+            Ok(())
+        }
+        async fn capture_frame(&mut self) -> Result<RawFrame, CaptureError> {
+            if self.lock.locked() {
+                self.running = false;
+            }
+            if !self.running {
+                return Err(ScreenCastError::SessionClosed.into());
+            }
+            SyntheticCapture::new(0, SCREEN.0, SCREEN.1, 1000)
+                .capture_frame()
+                .await
+        }
+        fn backend_type(&self) -> CaptureBackendType {
+            CaptureBackendType::PipeWire
+        }
+        async fn restore(&mut self) -> Result<(), CaptureError> {
+            self.calls
+                .restores
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if !self.has_token {
+                return Err(ScreenCastError::NoRestoreToken.into());
+            }
+            if self.lock.locked() {
+                let timeout = std::time::Duration::from_secs(300);
+                tokio::time::sleep(timeout).await;
+                return Err(ScreenCastError::NegotiationTimeout(timeout).into());
+            }
+            self.running = true;
+            Ok(())
+        }
+        async fn reselect(&mut self) -> Result<(), CaptureError> {
+            self.calls
+                .reselects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.has_token = true;
+            self.running = true;
+            Ok(())
+        }
+        fn is_running(&self) -> bool {
+            self.running
+        }
+    }
+
+    fn frame_size(frame: &RawFrame) -> (u32, u32) {
+        (frame.width, frame.height)
+    }
+
+    /// The daemon's stream 0 source over `screen`, reporting to `control`.
+    async fn daemon_source(
+        screen: GnomeScreen,
+        lock: Arc<dyn linux_quest_capture::ScreenLock>,
+        control: &Arc<VideoControl>,
+    ) -> CaptureFrameSource<AutoCapture> {
+        let capture =
+            AutoCapture::with_capture(0, PATTERN.0, PATTERN.1, 10, Some(Box::new(screen)), lock);
+        let source = CaptureFrameSource::open(capture, false)
+            .await
+            .expect("the screen starts")
+            .with_reselect(control.register_reselect())
+            .reporting_to(control.clone());
+        control.set_running(1, CaptureKind::Screen);
+        source
+    }
+
+    /// Pulls frames until one of the screen arrives, checking that the others are the pattern.
+    async fn until_screen(source: &mut CaptureFrameSource<AutoCapture>) {
+        loop {
+            let frame = source.next_frame().await.expect("frames keep coming");
+            if frame_size(&frame) == SCREEN {
+                return;
+            }
+            assert_eq!(frame_size(&frame), PATTERN);
+        }
+    }
+
+    /// Pulls test pattern frames for `period` (paused clock).
+    async fn pattern_for(
+        source: &mut CaptureFrameSource<AutoCapture>,
+        period: std::time::Duration,
+    ) {
+        let end = tokio::time::Instant::now() + period;
+        while tokio::time::Instant::now() < end {
+            let frame = source.next_frame().await.unwrap();
+            assert_eq!(frame_size(&frame), PATTERN, "the test pattern stands in");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_screen_lost_to_the_lock_screen_comes_back_after_the_test_pattern() {
+        // The daemon cannot tell that the screen is locked, so it keeps trying the restore
+        // token while it is.
+        let lock = Arc::new(LockScreen::default());
+        let (screen, calls) = GnomeScreen::new(lock.clone(), true);
+        let control = VideoControl::new();
+        let mut source = daemon_source(
+            screen,
+            Arc::new(linux_quest_capture::UnknownScreenLock),
+            &control,
+        )
+        .await;
+        assert_eq!(frame_size(&source.next_frame().await.unwrap()), SCREEN);
+        assert_eq!(control.capture_kind(), CaptureKind::Screen);
+
+        lock.set(true);
+        assert_eq!(frame_size(&source.next_frame().await.unwrap()), PATTERN);
+        assert_eq!(control.capture_kind(), CaptureKind::TestPattern);
+        assert!(control.can_choose_screen(), "the picker stays available");
+
+        // Locked for 20 minutes: the pattern keeps playing, the restore keeps being retried.
+        pattern_for(&mut source, std::time::Duration::from_secs(20 * 60)).await;
+        let tried = calls.restores.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(tried >= 3, "retried while locked: {tried}");
+
+        lock.set(false);
+        let unlocked = tokio::time::Instant::now();
+        until_screen(&mut source).await;
+        // At worst a restore started just before the unlock times out first, and the next
+        // one waits the longest backoff.
+        assert!(unlocked.elapsed() <= std::time::Duration::from_secs(331));
+        assert_eq!(control.capture_kind(), CaptureKind::Screen);
+        assert_eq!(frame_size(&source.next_frame().await.unwrap()), SCREEN);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_screen_is_restored_right_after_the_unlock_when_the_lock_is_known() {
+        let lock = Arc::new(LockScreen::default());
+        let (screen, calls) = GnomeScreen::new(lock.clone(), true);
+        let control = VideoControl::new();
+        let mut source = daemon_source(screen, lock.clone(), &control).await;
+        assert_eq!(frame_size(&source.next_frame().await.unwrap()), SCREEN);
+
+        lock.set(true);
+        pattern_for(&mut source, std::time::Duration::from_secs(20 * 60)).await;
+        assert_eq!(
+            calls.restores.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no portal request while locked"
+        );
+
+        lock.set(false);
+        let unlocked = tokio::time::Instant::now();
+        until_screen(&mut source).await;
+        assert!(unlocked.elapsed() <= std::time::Duration::from_secs(5));
+        assert_eq!(calls.restores.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(control.capture_kind(), CaptureKind::Screen);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn choose_screen_on_the_test_pattern_shows_the_picker_and_switches_back() {
+        // Nothing to restore silently: the pattern stays until the user picks a screen.
+        let lock = Arc::new(LockScreen::default());
+        let (screen, calls) = GnomeScreen::new(lock.clone(), false);
+        let control = VideoControl::new();
+        let mut source = daemon_source(screen, lock.clone(), &control).await;
+        assert_eq!(frame_size(&source.next_frame().await.unwrap()), SCREEN);
+        lock.set(true);
+        assert_eq!(frame_size(&source.next_frame().await.unwrap()), PATTERN);
+        lock.set(false);
+        pattern_for(&mut source, std::time::Duration::from_secs(60)).await;
+        assert_eq!(calls.restores.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(control.capture_kind(), CaptureKind::TestPattern);
+
+        let stream = tokio::spawn(async move {
+            until_screen(&mut source).await;
+            source
+        });
+        control
+            .choose_screen(std::time::Duration::from_secs(5))
+            .await
+            .expect("the picked screen is shared");
+        let mut source = stream.await.unwrap();
+        assert_eq!(calls.reselects.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(control.capture_kind(), CaptureKind::Screen);
+        assert_eq!(frame_size(&source.next_frame().await.unwrap()), SCREEN);
     }
 }

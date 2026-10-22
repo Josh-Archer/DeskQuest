@@ -1,8 +1,10 @@
 pub mod audio;
 #[cfg(feature = "pipewire-audio")]
 pub mod audio_pipewire;
+mod auto;
 pub mod dmabuf;
 pub mod pipewire;
+pub mod screen_lock;
 pub mod screencast;
 
 use async_trait::async_trait;
@@ -12,8 +14,10 @@ use thiserror::Error;
 pub use audio::{AudioSampleFormat, AudioSource, AutoAudioSource, RawAudioFrame, SineAudioSource};
 #[cfg(feature = "pipewire-audio")]
 pub use audio_pipewire::PipeWireAudioSource;
+pub use auto::AutoCapture;
 pub use dmabuf::DmaBufPlane;
 pub use pipewire::PipeWireCapture;
+pub use screen_lock::{session_screen_lock, ScreenLock, UnknownScreenLock};
 pub use screencast::{CaptureStats, ScreenCastConfig, ScreenCastError};
 
 #[derive(Error, Debug)]
@@ -116,6 +120,20 @@ pub trait DisplayCapture: Send + Sync {
         Err(CaptureError::BackendUnavailable(
             "this capture source has no screen picker".into(),
         ))
+    }
+
+    /// Starts the capture again without asking the user anything: only what the user already
+    /// granted is captured again (for the screen-cast portal, through the stored restore
+    /// token; no picker is shown). Used to bring back a capture that ended. The default is
+    /// [`init`](Self::init), for backends that never ask.
+    async fn restore(&mut self) -> Result<(), CaptureError> {
+        self.init().await
+    }
+
+    /// False when the capture cannot deliver frames until it is started again: it ended, or
+    /// a failed [`reselect`](Self::reselect) could not get the previous source back.
+    fn is_running(&self) -> bool {
+        true
     }
 }
 
@@ -239,67 +257,6 @@ fn draw_sweep_bar(buffer: &mut [u8], width: u32, height: u32, frame_counter: u64
     for row in 0..height as usize {
         let start = row * stride + x * 4;
         buffer[start..start + bar_width * 4].fill(255);
-    }
-}
-
-/// Dynamically discovers and initializes the best available capture engine.
-pub struct AutoCapture {
-    display_id: u16,
-    width: u32,
-    height: u32,
-    fps: u32,
-    inner: Box<dyn DisplayCapture>,
-}
-
-impl AutoCapture {
-    pub fn new(display_id: u16, width: u32, height: u32, fps: u32) -> Self {
-        let inner: Box<dyn DisplayCapture> = if PipeWireCapture::is_available() {
-            Box::new(PipeWireCapture::new(display_id, width, height, fps))
-        } else {
-            Box::new(SyntheticCapture::new(display_id, width, height, fps))
-        };
-        Self {
-            display_id,
-            width,
-            height,
-            fps,
-            inner,
-        }
-    }
-}
-
-#[async_trait]
-impl DisplayCapture for AutoCapture {
-    async fn init(&mut self) -> Result<(), CaptureError> {
-        match self.inner.init().await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                tracing::warn!(
-                    "Primary capture backend failed to initialize: {e}. Gracefully demoting to SyntheticCapture"
-                );
-                let mut fallback =
-                    SyntheticCapture::new(self.display_id, self.width, self.height, self.fps);
-                fallback.init().await?;
-                self.inner = Box::new(fallback);
-                Ok(())
-            }
-        }
-    }
-
-    async fn capture_frame(&mut self) -> Result<RawFrame, CaptureError> {
-        self.inner.capture_frame().await
-    }
-
-    fn backend_type(&self) -> CaptureBackendType {
-        self.inner.backend_type()
-    }
-
-    fn capture_info(&self) -> Option<CaptureInfo> {
-        self.inner.capture_info()
-    }
-
-    async fn reselect(&mut self) -> Result<(), CaptureError> {
-        self.inner.reselect().await
     }
 }
 
