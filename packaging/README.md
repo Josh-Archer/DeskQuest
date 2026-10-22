@@ -321,5 +321,5 @@ package includes the application launcher and penguin icon. For a user-local
 source install with a desktop shortcut, run `scripts/install-desktop.sh
 --desktop-shortcut --tray`. The tray starts automatically at your next login;
 Ubuntu needs its AppIndicators extension enabled to show it in the top bar. The app uses blue/cyan accents from the logo while retaining
-native light/dark mode. See [publishing.md](../docs/publishing.md) for UECB builds,
+native light/dark mode. See [publishing.md](../docs/publishing.md) for ARC builds,
 draft releases and the remaining Meta/Ubuntu store requirements.

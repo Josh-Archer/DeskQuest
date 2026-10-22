@@ -282,4 +282,4 @@ at your option.
 
 The desktop app and tray use the penguin logo and its blue/cyan palette.
 See [packaging and store preparation](docs/publishing.md) for Ubuntu desktop and
-host packages, UECB builds through Home, draft releases, and Meta/Ubuntu publishing.
+host packages, ARC builds through Home, draft releases, and Meta/Ubuntu publishing.

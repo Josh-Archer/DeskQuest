@@ -10,22 +10,24 @@ would require a separate supported client and Apple build/signing pipeline.
 - `Packaging (test artifacts)`: Ubuntu desktop and daemon `.deb` packages, daemon
   `.rpm`, Arch package, Flatpak host bundle and a debug-signed Quest APK. Artifacts
   are test builds, not public store releases.
-- [Home's Linux Quest packages (UECB)](https://github.com/Josh-Archer/home/actions/workflows/linux-quest-packages.yml):
-  manually builds an immutable Linux Quest mainline commit on a Docker-capable
-  UECB worker, inside Ubuntu 24.04. It exports desktop/daemon `.deb` packages, a daemon
-  `.rpm`, `SOURCE_COMMIT` and `SHA256SUMS`. Home verifies mainline ancestry before
-  allocation and finalizes the allocation after the job.
+- [Home's Linux Quest packages (ARC)](https://github.com/Josh-Archer/home/actions/workflows/linux-quest-packages.yml):
+  manually builds an immutable Linux Quest mainline commit directly on the
+  `home-gh-runner-desktop` ARC runner set, inside an Ubuntu 24.04 container. It
+  exports desktop/daemon `.deb` packages, a daemon `.rpm`, `SOURCE_COMMIT` and
+  `SHA256SUMS`. Home verifies mainline ancestry before checking out app code.
+  ARC manages the ephemeral runner; the workflow removes its Buildx builder.
 - `Stage draft release`: manually takes a successful mainline Packaging run ID
   and a version tag matching the workspace, then attaches its artifacts and
   checksums to a **draft** GitHub Release. It never uploads to either store.
 
-The shared UECB broker currently registers runners to `Josh-Archer/home`, not
-`linux-quest`. This is why its worker runs in Home. Reusing a Home runner label
+The existing ARC runner sets register to `Josh-Archer/home`, not `linux-quest`.
+This is why the package workflow runs in Home. Reusing a Home runner label
 in this repository would leave jobs queued for a runner registered elsewhere.
+The package workflow uses ARC only, with no UECB allocation or cloud workers.
 The application repository retains independent GitHub-hosted CI and test builds.
 No cross-repository admin token needs to be copied into the application repository.
 
-To trigger a UECB build:
+To trigger an ARC package build:
 
 ```bash
 gh workflow run linux-quest-packages.yml --repo Josh-Archer/home \
