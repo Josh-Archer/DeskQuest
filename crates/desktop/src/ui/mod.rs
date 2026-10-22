@@ -45,6 +45,7 @@ impl Shell {
 struct Window {
     window: adw::ApplicationWindow,
     banner: adw::Banner,
+    stack: adw::ViewStack,
     choose: gtk::Button,
     status: status::StatusPage,
     screens: Rc<screens::ScreensPage>,
@@ -146,6 +147,7 @@ pub fn activate(app: &adw::Application) {
     let this = Rc::new(Window {
         window: window.clone(),
         banner,
+        stack: stack.clone(),
         choose,
         status,
         screens,
@@ -181,13 +183,27 @@ pub fn activate(app: &adw::Application) {
             .connect_button_clicked(move |_| start_service(&shell));
     }
 
-    let weak = Rc::downgrade(&this);
-    glib::timeout_add_local(REFRESH_INTERVAL, move || match weak.upgrade() {
-        Some(this) => {
-            this.refresh();
-            glib::ControlFlow::Continue
+    {
+        let weak = Rc::downgrade(&this);
+        stack.connect_visible_child_notify(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.update_visible_page(this.last.borrow().as_ref());
+            }
+        });
+    }
+    // Keep the controller alive while the window is open. Weak references alone let it
+    // disappear after the initial async fetch, silently stopping all later refreshes.
+    let controller = this.clone();
+    glib::timeout_add_local(REFRESH_INTERVAL, move || {
+        if !controller.window.is_visible() {
+            return glib::ControlFlow::Break;
         }
-        None => glib::ControlFlow::Break,
+        // An unmapped window needs no daemon traffic or page updates. Keep its state
+        // until it is mapped again so the next tick can show fresh data.
+        if controller.window.is_mapped() {
+            controller.refresh();
+        }
+        glib::ControlFlow::Continue
     });
     this.refresh();
     window.present();
@@ -219,9 +235,7 @@ impl Window {
         match result {
             Ok(snapshot) => {
                 self.banner.set_revealed(false);
-                self.status.update(Some(&snapshot));
-                self.screens.update(Some(&snapshot));
-                self.settings.update(Some(&snapshot));
+                self.update_visible_page(Some(&snapshot));
                 let can_choose = snapshot
                     .status
                     .as_ref()
@@ -249,12 +263,20 @@ impl Window {
                 self.banner
                     .set_button_label(installed.then_some("Start Service"));
                 self.banner.set_revealed(true);
-                self.status.update(None);
-                self.screens.update(None);
-                self.settings.update(None);
+                self.update_visible_page(None);
                 self.choose.set_sensitive(false);
                 *self.last.borrow_mut() = None;
             }
+        }
+    }
+
+    /// Hidden pages catch up from the latest snapshot when selected. In particular,
+    /// telemetry ticks must not redraw the screen-layout canvas behind the Status page.
+    fn update_visible_page(&self, snapshot: Option<&Snapshot>) {
+        match self.stack.visible_child_name().as_deref() {
+            Some("screens") => self.screens.update(snapshot),
+            Some("settings") => self.settings.update(snapshot),
+            _ => self.status.update(snapshot),
         }
     }
 

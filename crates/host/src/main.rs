@@ -707,10 +707,23 @@ async fn finish_adb_bridge(handle: Option<tokio::task::JoinHandle<()>>) {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
+    command_runtime(&cli)?.block_on(run(cli))
+}
 
+/// The tray only handles IPC, D-Bus and timers. Avoid starting one scheduler worker per
+/// CPU for it; the streaming daemon retains its parallel runtime.
+fn command_runtime(cli: &Cli) -> std::io::Result<tokio::runtime::Runtime> {
+    let mut builder = if matches!(cli.command, Some(Commands::Tray(_))) {
+        tokio::runtime::Builder::new_current_thread()
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+    };
+    builder.enable_all().build()
+}
+
+async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let is_tui = cli.tui
         || matches!(&cli.command, Some(Commands::Dashboard(_)))
         || matches!(
@@ -1022,6 +1035,31 @@ mod tests {
             Some(Commands::Daemon(daemon)) => daemon,
             other => panic!("expected daemon subcommand, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tray_uses_a_current_thread_runtime() {
+        let cli = Cli::parse_from(["linux-quest-host", "tray"]);
+        let runtime = super::command_runtime(&cli).unwrap();
+        assert_eq!(
+            runtime.handle().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::CurrentThread
+        );
+        runtime.block_on(async {
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_millis(1)).await })
+                .await
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn daemon_keeps_its_parallel_runtime() {
+        let cli = Cli::parse_from(["linux-quest-host", "daemon"]);
+        let runtime = super::command_runtime(&cli).unwrap();
+        assert_eq!(
+            runtime.handle().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        );
     }
 
     #[test]

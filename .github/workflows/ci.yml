@@ -42,7 +42,7 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update && sudo apt-get install --no-install-recommends -y build-essential edid-decode pkg-config libgtk-4-dev libadwaita-1-dev
+          sudo apt-get update && sudo apt-get install --no-install-recommends -y build-essential edid-decode pkg-config libgtk-4-dev libadwaita-1-dev xvfb
 
 
       - name: Setup Rust toolchain
@@ -63,6 +63,11 @@ jobs:
 
       - name: Run workspace unit and integration tests
         run: cargo test --workspace --verbose
+
+      - name: Check desktop refresh lifecycle without hardware
+        run: |
+          cargo build --locked -p linux-quest-desktop
+          python3 scripts/ci/check-desktop-refresh.py target/debug/linux-quest
 
       - name: Lint and test host tray feature
         run: |
