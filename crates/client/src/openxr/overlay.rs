@@ -54,6 +54,57 @@ pub const ARC_THICKNESS_FRAC: f32 = 0.006;
 /// Half the angle the arc spans around the corner.
 pub const ARC_HALF_SPAN_RAD: f32 = 0.55;
 
+/// How far the soft frame reaches past the window's edge, as a fraction of its width.
+pub const FRAME_MARGIN_FRAC: f32 = 0.04;
+/// Frame texture width; its height follows the grown window's aspect.
+pub const FRAME_TEXTURE_WIDTH: u32 = 640;
+
+/// Frame texture size for windows of `aspect` (width / height).
+pub fn frame_texture_size(aspect: f32) -> (u32, u32) {
+    let grown_w = 1.0 + 2.0 * FRAME_MARGIN_FRAC;
+    let grown_h = 1.0 / aspect.max(0.1) + 2.0 * FRAME_MARGIN_FRAC;
+    let h = (FRAME_TEXTURE_WIDTH as f32 * grown_h / grown_w).round() as u32;
+    (FRAME_TEXTURE_WIDTH, h.max(1))
+}
+
+/// The soft frame for windows of `aspect`: clear over the window itself, a thin bright rim
+/// hugging its rounded edge, and a soft glow fading out over the margin. Lengths are
+/// fractions of the window's width.
+pub fn frame_rgba(aspect: f32) -> Vec<u8> {
+    let (w, h) = frame_texture_size(aspect);
+    let mut px = vec![0u8; (w * h * 4) as usize];
+    let grown_w = 1.0 + 2.0 * FRAME_MARGIN_FRAC;
+    let per_px = grown_w / w as f32;
+    let (half_w, half_h) = (0.5, 0.5 / aspect.max(0.1));
+    let r = CORNER_RADIUS_FRAC;
+    for y in 0..h {
+        for x in 0..w {
+            let dx = ((x as f32 + 0.5) - w as f32 / 2.0) * per_px;
+            let dy = ((y as f32 + 0.5) - h as f32 / 2.0) * per_px;
+            let qx = dx.abs() - (half_w - r);
+            let qy = dy.abs() - (half_h - r);
+            // Signed distance from the window's rounded edge, positive outside.
+            let d = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - r;
+            if d < -per_px {
+                continue;
+            }
+            let rim = 0.9 * (-(d / 0.0025).powi(2)).exp();
+            let glow = 0.28 * (-d.max(0.0) / 0.010).exp();
+            let fade = 1.0 - smoothstep(0.6 * FRAME_MARGIN_FRAC, FRAME_MARGIN_FRAC, d);
+            let inside = smoothstep(-per_px, 0.0, d);
+            put(
+                &mut px,
+                w,
+                x,
+                y,
+                [240, 245, 255],
+                rim.max(glow) * fade * inside,
+            );
+        }
+    }
+    px
+}
+
 /// Side of the resize handle's square texture, as a fraction of the screen's width.
 pub fn corner_handle_frac() -> f32 {
     2.0 * (CORNER_RADIUS_FRAC + ARC_GAP_FRAC + ARC_THICKNESS_FRAC)
@@ -80,10 +131,21 @@ pub struct PointerVisual {
     pub hit: bool,
 }
 
+/// The soft glowing outline around a window being moved or resized, as on Horizon OS. It is
+/// drawn as a layer of the window's own shape (curved or flat), grown by
+/// [`FRAME_MARGIN_FRAC`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameVisual {
+    /// The window grown by the frame's margin; the frame texture covers exactly this.
+    pub window: crate::spatial::ScreenTransform,
+}
+
 /// The window handles to draw for the screen in use: at most one at a time, like Horizon,
-/// which shows the handle under the pointer.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// which shows the handle under the pointer, plus the frame while it is moved or resized.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct WindowChrome {
+    /// Soft outline around the window while it is moved or resized.
+    pub frame: Option<FrameVisual>,
     /// Grab pill under the bottom edge: pointing near the bottom, or moving the window.
     pub bar: Option<HandleVisual>,
     /// Glowing line just outside the side or top edge being pointed at.
@@ -99,10 +161,20 @@ pub struct OverlayScene {
     pub chrome: WindowChrome,
 }
 
+/// Writes a pixel premultiplied by its alpha. The layers are blended with
+/// `BLEND_TEXTURE_SOURCE_ALPHA` and without `UNPREMULTIPLIED_ALPHA`, so the compositor takes
+/// colours as premultiplied: a white pixel with low or zero alpha would otherwise still add
+/// full white, and every soft edge would show as a solid white block.
 fn put(px: &mut [u8], w: u32, x: u32, y: u32, rgb: [u8; 3], a: f32) {
     let i = ((y * w + x) * 4) as usize;
-    let a = (a.clamp(0.0, 1.0) * 255.0).round() as u8;
-    px[i..i + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], a]);
+    let a = a.clamp(0.0, 1.0);
+    let scale = |c: u8| (f32::from(c) * a).round() as u8;
+    px[i..i + 4].copy_from_slice(&[
+        scale(rgb[0]),
+        scale(rgb[1]),
+        scale(rgb[2]),
+        (a * 255.0).round() as u8,
+    ]);
 }
 
 fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
@@ -323,7 +395,12 @@ pub fn window_chrome(
     use std::f32::consts::{FRAC_PI_2, PI};
     let (w, h) = screen.size_m();
     let hover = hover_uv.filter(|_| !moving && resizing_corner.is_none());
-    let mut chrome = WindowChrome::default();
+    let mut chrome = WindowChrome {
+        frame: (moving || resizing_corner.is_some()).then(|| FrameVisual {
+            window: screen.with_margin(FRAME_MARGIN_FRAC * w),
+        }),
+        ..WindowChrome::default()
+    };
 
     let corner = resizing_corner
         .map(|c| (c, true))
@@ -695,5 +772,72 @@ mod tests {
             0,
             "nothing on the screen side"
         );
+    }
+
+    #[test]
+    fn overlay_pixels_are_premultiplied() {
+        let alpha = |px: &[u8], w: u32, x: u32, y: u32| px[((y * w + x) * 4 + 3) as usize];
+        let rgb = |px: &[u8], w: u32, x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            [px[i], px[i + 1], px[i + 2]]
+        };
+        // Transparent pixels must be black, or the compositor adds them as white.
+        let (cw, _) = CURSOR_TEXTURE;
+        let cursor = cursor_rgba();
+        assert_eq!(alpha(&cursor, cw, 0, 0), 0);
+        assert_eq!(rgb(&cursor, cw, 0, 0), [0, 0, 0]);
+        let (kw, kh) = CORNER_TEXTURE;
+        let corner = corner_rgba(1.0);
+        assert_eq!(rgb(&corner, kw, kw - 1, kh - 1), [0, 0, 0]);
+        let (ew, eh) = EDGE_TEXTURE;
+        let edge = edge_rgba(1.0);
+        assert_eq!(
+            rgb(&edge, ew, 0, 0),
+            [0, 0, 0],
+            "the edge strip is not a block"
+        );
+        // A colour never exceeds its alpha.
+        for px in [cursor, corner, edge, bar_rgba(0.6), ray_rgba()].iter() {
+            for p in px.chunks(4) {
+                assert!(p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3], "{p:?}");
+            }
+        }
+        let _ = eh;
+    }
+
+    #[test]
+    fn the_frame_glows_around_the_window_and_leaves_it_clear() {
+        let aspect = 16.0 / 9.0;
+        let (w, h) = frame_texture_size(aspect);
+        let frame = frame_rgba(aspect);
+        let alpha = |x: u32, y: u32| frame[((y * w + x) * 4 + 3) as usize];
+        assert_eq!(alpha(w / 2, h / 2), 0, "the window itself stays clear");
+        // On the window's left edge, half way down: the bright rim.
+        let margin_px = (FRAME_MARGIN_FRAC / (1.0 + 2.0 * FRAME_MARGIN_FRAC) * w as f32) as u32;
+        assert!(
+            alpha(margin_px, h / 2) > 150,
+            "rim {}",
+            alpha(margin_px, h / 2)
+        );
+        // Out in the margin it is fainter, and gone at the texture's edge.
+        assert!(alpha(margin_px / 2, h / 2) < alpha(margin_px, h / 2));
+        assert_eq!(alpha(0, h / 2), 0);
+        assert_eq!(alpha(0, 0), 0);
+    }
+
+    #[test]
+    fn the_frame_shows_while_moving_or_resizing_only() {
+        let screen = crate::spatial::ScreenTransform::default();
+        assert!(window_chrome(&screen, Some((0.5, 0.95)), false, None)
+            .frame
+            .is_none());
+        let moving = window_chrome(&screen, None, true, None);
+        let frame = moving.frame.expect("frame while moving");
+        let (w, _) = screen.size_m();
+        let (fw, _) = frame.window.size_m();
+        assert!((fw - w * (1.0 + 2.0 * FRAME_MARGIN_FRAC)).abs() < 1e-3);
+        assert!(window_chrome(&screen, None, false, Some((0.0, 0.0)))
+            .frame
+            .is_some());
     }
 }
