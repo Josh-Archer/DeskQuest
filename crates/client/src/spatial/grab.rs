@@ -225,6 +225,19 @@ impl GrabStateMachine {
         }
     }
 
+    /// Whether the hover is on the window's handles: in the margin just outside the screen,
+    /// where the grab pill, edge handles and corner arcs are. Hands grab windows only there,
+    /// as on Horizon OS; a pinch on the screen itself is a click.
+    pub fn hovering_handle(&self) -> bool {
+        match &self.state {
+            InteractionState::Hovering { hit, .. } => {
+                let (u, v) = hit.uv;
+                !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v)
+            }
+            _ => false,
+        }
+    }
+
     /// Corner being dragged while a corner resize is active.
     pub fn resizing(&self) -> Option<Corner> {
         match &self.state {
