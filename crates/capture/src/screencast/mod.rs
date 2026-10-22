@@ -100,6 +100,107 @@ impl ScreenCastConfig {
     }
 }
 
+/// Restoring the shared screen without asking (`negotiate_source_restore`), against the
+/// in-memory fake.
+#[cfg(test)]
+mod restore_tests {
+    use super::portal::fake::{ok_start, FakePortal};
+    use super::portal::{negotiate_source_restore, SOURCE_MONITOR};
+    use super::{RestoreTokenStore, ScreenCastError};
+
+    fn store(tag: &str) -> (RestoreTokenStore, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("lq-restore-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        (RestoreTokenStore::at(root.join("token")), root)
+    }
+
+    #[tokio::test]
+    async fn restoring_sends_the_stored_token_and_keeps_the_new_one() {
+        let (store, root) = store("ok");
+        store.save("old-token").unwrap();
+        let mut fake = FakePortal::new();
+        fake.start_results.push_back(ok_start(4, Some("new-token")));
+
+        let grant = negotiate_source_restore(&mut fake, Some(&store), SOURCE_MONITOR)
+            .await
+            .unwrap();
+        assert!(grant.used_restore_token);
+        assert_eq!(grant.stream.node_id, 4);
+        assert_eq!(fake.select_seen.len(), 1);
+        assert_eq!(
+            fake.select_seen[0].restore_token.as_deref(),
+            Some("old-token")
+        );
+        assert!(fake.select_seen[0].persist_mode.is_some());
+        assert_eq!(store.load().as_deref(), Some("new-token"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn without_a_token_nothing_is_asked() {
+        let (store, root) = store("none");
+        let mut fake = FakePortal::new();
+        let err = negotiate_source_restore(&mut fake, Some(&store), SOURCE_MONITOR)
+            .await
+            .unwrap_err();
+        assert_eq!(err, ScreenCastError::NoRestoreToken);
+        assert_eq!(fake.calls, ["version"], "no session, so no picker");
+
+        // Nor without a store, or on a version that cannot restore.
+        let err = negotiate_source_restore(&mut fake, None, SOURCE_MONITOR)
+            .await
+            .unwrap_err();
+        assert_eq!(err, ScreenCastError::NoRestoreToken);
+        store.save("token").unwrap();
+        let mut old = FakePortal::new();
+        old.version = 3;
+        let err = negotiate_source_restore(&mut old, Some(&store), SOURCE_MONITOR)
+            .await
+            .unwrap_err();
+        assert_eq!(err, ScreenCastError::NoRestoreToken);
+        assert!(old.select_seen.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_failed_restore_keeps_the_token_and_does_not_prompt() {
+        // `negotiate` would drop the token and show the picker on each of these.
+        for failure in [
+            ScreenCastError::Denied("portal response code 2".into()),
+            ScreenCastError::Portal("invalid restore_token".into()),
+            ScreenCastError::NoStreams,
+        ] {
+            let (store, root) = store("fail");
+            store.save("keep-me").unwrap();
+            let mut fake = FakePortal::new();
+            if failure == ScreenCastError::NoStreams {
+                fake.start_results
+                    .push_back(Ok(super::portal::StartResponse {
+                        streams: vec![],
+                        restore_token: None,
+                    }));
+            } else {
+                fake.start_results.push_back(Err(failure.clone()));
+            }
+
+            let err = match negotiate_source_restore(&mut fake, Some(&store), SOURCE_MONITOR).await
+            {
+                Ok(_) => panic!("{failure:?} must fail the restore"),
+                Err(e) => e,
+            };
+            assert_eq!(err, failure);
+            assert_eq!(fake.select_seen.len(), 1, "one attempt, with the token");
+            assert_eq!(store.load().as_deref(), Some("keep-me"));
+            assert_eq!(
+                fake.closed_sessions.len(),
+                1,
+                "the failed session is closed"
+            );
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+}
+
 /// Choosing another screen (`negotiate_source_fresh`), against the in-memory fake.
 #[cfg(test)]
 mod reselect_tests {

@@ -198,6 +198,30 @@ pub async fn negotiate_source_fresh<P: ScreenCastPortal + ?Sized>(
     attempt(portal, store, None, cursor_mode, can_persist, source_types).await
 }
 
+/// Like [`negotiate_source`], but only with the stored restore token: nothing is asked of the
+/// user. Without a token it fails with [`ScreenCastError::NoRestoreToken`] before creating a
+/// session. A failure keeps the token, because a restore that fails now (for example while
+/// the screen is locked) can still succeed later.
+///
+/// GNOME's portal shows its share dialog when it cannot restore a token, so the caller should
+/// not try while the screen is locked.
+pub async fn negotiate_source_restore<P: ScreenCastPortal + ?Sized>(
+    portal: &mut P,
+    store: Option<&RestoreTokenStore>,
+    source_types: u32,
+) -> Result<PortalGrant, ScreenCastError> {
+    let version = portal.version().await?;
+    if version < RESTORE_TOKEN_MIN_VERSION {
+        return Err(ScreenCastError::NoRestoreToken);
+    }
+    let token = store
+        .and_then(|s| s.load())
+        .ok_or(ScreenCastError::NoRestoreToken)?;
+    let cursor_mode = choose_cursor_mode(portal.available_cursor_modes().await.unwrap_or(0));
+    tracing::info!("screencast: restoring the shared screen with the stored restore token");
+    attempt(portal, store, Some(token), cursor_mode, true, source_types).await
+}
+
 async fn attempt<P: ScreenCastPortal + ?Sized>(
     portal: &mut P,
     store: Option<&RestoreTokenStore>,

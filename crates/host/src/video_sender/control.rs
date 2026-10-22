@@ -28,7 +28,8 @@ pub enum CaptureKind {
     None,
     /// A real screen through the screen-cast portal.
     Screen,
-    /// The synthetic test pattern (`--test-pattern`, or no capture backend).
+    /// The synthetic test pattern (`--test-pattern`, no capture backend, or standing in while
+    /// a lost screen capture is restored).
     TestPattern,
 }
 
@@ -77,6 +78,12 @@ impl VideoControl {
     /// Records what the senders that started are.
     pub fn set_running(&self, streams: u16, capture: CaptureKind) {
         self.streams.store(streams, Ordering::SeqCst);
+        *self.capture.lock() = capture;
+    }
+
+    /// Records what stream 0 shows now (the test pattern stands in while a lost screen is
+    /// being restored).
+    pub fn set_capture_kind(&self, capture: CaptureKind) {
         *self.capture.lock() = capture;
     }
 

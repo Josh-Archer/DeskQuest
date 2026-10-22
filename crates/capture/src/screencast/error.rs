@@ -53,6 +53,11 @@ pub enum ScreenCastError {
     #[error("built without the `pipewire-screencast` feature")]
     FeatureDisabled,
 
+    /// A restore without asking the user was requested, but no restore token is stored (or
+    /// the portal is too old to take one).
+    #[error("no screen can be restored without asking: no restore token is stored")]
+    NoRestoreToken,
+
     /// Local I/O failure (restore-token file, fd handling).
     #[error("I/O error: {0}")]
     Io(String),

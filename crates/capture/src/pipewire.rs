@@ -187,6 +187,28 @@ impl PipeWireCapture {
         Ok(())
     }
 
+    /// Starts the capture again with the stored restore token only, over an already-built
+    /// portal client: no picker is shown, and without a token this fails with
+    /// [`ScreenCastError::NoRestoreToken`]. `restore` uses the D-Bus portal.
+    #[cfg(feature = "pipewire-screencast")]
+    pub async fn restore_with_portal<P>(&mut self, portal: P) -> Result<(), CaptureError>
+    where
+        P: crate::screencast::portal::ScreenCastPortal + 'static,
+    {
+        self.cleanup();
+        let session = crate::screencast::session::ScreenCastSession::restore(
+            portal,
+            &self.config,
+            Arc::clone(&self.hub),
+            self.display_id,
+            self.window_source,
+        )
+        .await?;
+        self.session = Some(session);
+        self.initialized = true;
+        Ok(())
+    }
+
     /// Replaces the running capture with one the user picks in the portal's dialog, over an
     /// already-built portal client. On failure (for example the user cancelled) the previous
     /// source is captured again through `restore` (normally a new portal client, which reuses
@@ -294,6 +316,25 @@ impl DisplayCapture for PipeWireCapture {
                 ScreenCastError::FeatureDisabled.to_string(),
             ))
         }
+    }
+
+    async fn restore(&mut self) -> Result<(), CaptureError> {
+        #[cfg(feature = "pipewire-screencast")]
+        {
+            let portal = crate::screencast::portal_zbus::ZbusPortal::connect_session().await?;
+            self.restore_with_portal(portal).await
+        }
+        #[cfg(not(feature = "pipewire-screencast"))]
+        {
+            self.cleanup();
+            Err(CaptureError::BackendUnavailable(
+                ScreenCastError::FeatureDisabled.to_string(),
+            ))
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        PipeWireCapture::is_running(self)
     }
 }
 
