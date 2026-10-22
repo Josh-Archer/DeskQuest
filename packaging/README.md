@@ -7,6 +7,7 @@ Files for running `linux-quest-host` as a background service on Ubuntu / systemd
 | `systemd/linux-quest-host.service` | systemd **user** unit running `linux-quest-host daemon` |
 | `systemd/linux-quest-tray.service` | systemd **user** unit running `linux-quest-host tray` |
 | `desktop/org.linuxquest.Desktop.desktop` | Desktop entry for the `linux-quest` app |
+| `icons/hicolor/512x512/apps/org.linuxquest.Desktop.png` | Linux Quest app icon for launchers and docks |
 | `udev/99-uinput.rules` | Grants the `input` group access to `/dev/uinput` |
 | `modules-load/linux-quest.conf` | Loads the `uinput` module at boot |
 | `debian/postinst`, `debian/copyright` | Debian maintainer script (reloads udev) and copyright file, used by `cargo deb` |
@@ -14,6 +15,36 @@ Files for running `linux-quest-host` as a background service on Ubuntu / systemd
 | `flatpak/` | Flatpak manifest and vendored Cargo source manifest |
 
 The tray icon (`linux-quest-host tray`) is part of every build. See [Tray icon](#tray-icon) below.
+
+## Ubuntu desktop app and logo
+
+The GTK desktop app embeds the logo so its window and header show it even when run
+directly with `cargo run -p linux-quest-desktop`. To install the app, launcher and
+icon for your user:
+
+```bash
+sudo apt-get install libgtk-4-dev libadwaita-1-dev libglib2.0-dev-bin
+cargo install --locked --path crates/desktop --bin linux-quest --root ~/.local
+install -Dm644 packaging/desktop/org.linuxquest.Desktop.desktop \
+  ~/.local/share/applications/org.linuxquest.Desktop.desktop
+install -Dm644 packaging/icons/hicolor/512x512/apps/org.linuxquest.Desktop.png \
+  ~/.local/share/icons/hicolor/512x512/apps/org.linuxquest.Desktop.png
+gtk-update-icon-cache --force --ignore-theme-index ~/.local/share/icons/hicolor
+```
+
+Put `~/.local/bin` on your `PATH` if it is not already there, then open **Linux
+Quest** from the application launcher. The daemon packages below do not include
+the desktop app.
+
+The full-resolution transparent logo is in
+[`assets/branding/linux-quest-logo.png`](../assets/branding/linux-quest-logo.png).
+To regenerate the 512-pixel desktop icon without changing the master, run:
+
+```bash
+ffmpeg -v error -y -i assets/branding/linux-quest-logo.png \
+  -vf scale=512:512:flags=lanczos -frames:v 1 -update 1 \
+  packaging/icons/hicolor/512x512/apps/org.linuxquest.Desktop.png
+```
 
 ## 1. Install the binary
 
