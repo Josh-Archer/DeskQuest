@@ -129,6 +129,8 @@ pub fn activate(app: &adw::Application) {
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
     toolbar.set_content(Some(&content));
+    let switcher_bar = adw::ViewSwitcherBar::builder().stack(&stack).build();
+    toolbar.add_bottom_bar(&switcher_bar);
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -137,7 +139,17 @@ pub fn activate(app: &adw::Application) {
         .default_height(760)
         .content(&toolbar)
         .build();
-    window.set_size_request(720, 520);
+    window.set_size_request(600, 520);
+    let compact = adw::Breakpoint::new(
+        adw::BreakpointCondition::parse("max-width: 850px").expect("navigation breakpoint"),
+    );
+    compact.add_setter(
+        &header,
+        "title-widget",
+        Some(&Option::<gtk::Widget>::None.to_value()),
+    );
+    compact.add_setter(&switcher_bar, "reveal", Some(&true.to_value()));
+    window.add_breakpoint(compact);
     window.add_css_class("linux-quest-window");
 
     if let Ok(page) = std::env::var("LINUX_QUEST_PAGE") {
