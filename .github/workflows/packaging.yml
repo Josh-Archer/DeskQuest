@@ -50,12 +50,18 @@ jobs:
         run: cargo install --locked cargo-deb cargo-generate-rpm
       - name: Build and verify desktop and host packages
         run: scripts/ci/build-ubuntu-packages.sh
+      - name: Record package source and checksums
+        run: |
+          git rev-parse HEAD > target/SOURCE_COMMIT
+          (cd target && sha256sum debian/*.deb generate-rpm/*.rpm SOURCE_COMMIT > SHA256SUMS)
       - uses: actions/upload-artifact@v4
         with:
           name: linux-quest-deb-rpm
           path: |
             target/debian/*.deb
             target/generate-rpm/*.rpm
+            target/SOURCE_COMMIT
+            target/SHA256SUMS
           if-no-files-found: error
           retention-days: 7
 

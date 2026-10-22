@@ -62,6 +62,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          while IFS= read -r checksum; do
+            (cd "$(dirname "$checksum")" && sha256sum --check --strict SHA256SUMS)
+          done < <(find artifacts -type f -name SHA256SUMS)
+          source_record=$(find artifacts -type f -name SOURCE_COMMIT -print -quit)
+          test -n "$source_record"
+          test "$(cat "$source_record")" = "$SOURCE_SHA"
           mkdir payload
           find artifacts -type f \( -name '*.deb' -o -name '*.rpm' -o -name '*.apk' -o -name '*.flatpak' -o -name '*.pkg.tar.zst' \) -exec cp -t payload/ {} +
           test -n "$(find payload -name 'linux-quest_*.deb' -print -quit)"
