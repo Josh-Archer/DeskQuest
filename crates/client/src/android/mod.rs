@@ -29,19 +29,6 @@ pub(crate) fn activity_jobject() -> *mut std::ffi::c_void {
 
 use std::net::{IpAddr, SocketAddr};
 
-/// Terminates the cloned per-connection input writer before its source can be reused by a new
-/// connection. Shutting down both socket directions wakes a writer blocked in socket I/O.
-#[cfg(any(target_os = "android", test))]
-fn shutdown_tcp_input_writer(
-    stream: &std::net::TcpStream,
-    writer: Option<std::thread::JoinHandle<()>>,
-) {
-    let _ = stream.shutdown(std::net::Shutdown::Both);
-    if let Some(writer) = writer {
-        let _ = writer.join();
-    }
-}
-
 use crate::config::{ClientConfig, TransportMode};
 use crate::input_sender::{
     input_sender_config, CombinedInputSource, InputSenderThread, KeyframeRequestFlags,
@@ -771,228 +758,81 @@ pub fn android_main(app: AndroidApp) {
         }))
     };
 
-    let receiver_handle = std::thread::spawn(move || {
-        match transport_mode {
-            crate::config::TransportMode::AdbReverseTcp => {
-                use std::io::{Read, Write};
-
-                while bg_running.load(std::sync::atomic::Ordering::Relaxed) {
-                    tracing::info!(host = ?host_addr, "Attempting TCP connection to host for USB/ADB streaming");
-                    let stream = match std::net::TcpStream::connect_timeout(
-                        &host_addr,
-                        Duration::from_millis(1000),
-                    ) {
-                        Ok(s) => s,
-                        Err(_) => {
-                            std::thread::sleep(Duration::from_millis(500));
-                            continue;
-                        }
-                    };
-                    let _ = stream.set_nodelay(true);
-                    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
-                    let mut stream = stream;
-                    if stream
-                        .write_all(linux_quest_transport::USB_TUNNEL_HELLO)
-                        .is_err()
-                    {
-                        std::thread::sleep(Duration::from_millis(500));
-                        continue;
-                    }
-                    let mut response = [0u8; linux_quest_transport::USB_TUNNEL_ACCEPT.len()];
-                    if stream.read_exact(&mut response).is_err()
-                        || &response != linux_quest_transport::USB_TUNNEL_ACCEPT
-                    {
-                        tracing::warn!("Host rejected USB tunnel negotiation");
-                        std::thread::sleep(Duration::from_millis(500));
-                        continue;
-                    }
-                    let mut input_writer = None;
-                    if let Some((source, _, _, _)) = &tcp_input_source {
-                        if let Ok(writer_stream) = stream.try_clone() {
-                            let writer_source = source.clone();
-                            let writer_running = bg_running.clone();
-                            input_writer = Some(std::thread::spawn(move || {
-                                use crate::input_sender::InputSource;
-                                let mut writer_stream = writer_stream;
-                                let mut sequence = 0u32;
-                                let mut last_keepalive = std::time::Instant::now();
-                                while writer_running.load(std::sync::atomic::Ordering::Relaxed) {
-                                    let events = writer_source
-                                        .lock()
-                                        .map(|mut source| source.poll())
-                                        .unwrap_or_default();
-                                    let keepalive =
-                                        last_keepalive.elapsed() >= Duration::from_millis(100);
-                                    if !events.is_empty() || keepalive {
-                                        let now_us = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_micros()
-                                            as u64;
-                                        let payload = linux_quest_protocol::InputBatch::new(
-                                            u64::from(sequence),
-                                            now_us,
-                                        )
-                                        .with_events(events)
-                                        .encode();
-                                        let header = linux_quest_protocol::PacketHeader::new(
-                                            linux_quest_protocol::PacketType::InputEvent,
-                                            0,
-                                            sequence,
-                                            now_us,
-                                            &payload,
-                                        );
-                                        let packet =
-                                            linux_quest_protocol::Packet::new(header, payload);
-                                        let frame = linux_quest_transport::TunnelFrame::Packet(
-                                            packet.to_bytes().to_vec(),
-                                        );
-                                        let body = match bincode::serialize(&frame) {
-                                            Ok(body) => body,
-                                            Err(error) => {
-                                                tracing::warn!(%error, "Could not encode USB input frame");
-                                                break;
-                                            }
-                                        };
-                                        let Ok(len) = u32::try_from(body.len()) else {
-                                            break;
-                                        };
-                                        if writer_stream.write_all(&len.to_be_bytes()).is_err()
-                                            || writer_stream.write_all(&body).is_err()
-                                        {
-                                            break;
-                                        }
-                                        sequence = sequence.wrapping_add(1);
-                                        last_keepalive = std::time::Instant::now();
-                                    }
-                                    std::thread::sleep(Duration::from_millis(4));
-                                }
-                            }));
-                        }
-                    }
-
-                    let mut temp_buf = [0u8; 16384];
-                    let mut read_buf = Vec::with_capacity(65536);
-                    while bg_running.load(std::sync::atomic::Ordering::Relaxed) {
-                        match stream.read(&mut temp_buf) {
-                            Ok(0) => {
-                                tracing::info!("TCP streaming connection closed by host");
-                                break;
-                            }
-                            Ok(n) => read_buf.extend_from_slice(&temp_buf[..n]),
-                            Err(e)
-                                if e.kind() == std::io::ErrorKind::WouldBlock
-                                    || e.kind() == std::io::ErrorKind::TimedOut =>
-                            {
-                                continue
-                            }
-                            Err(e) => {
-                                tracing::trace!(error = ?e, "TCP stream read error");
-                                break;
-                            }
-                        }
-                        loop {
-                            if read_buf.len() < 4 {
-                                break;
-                            }
-                            let frame_len =
-                                u32::from_be_bytes(read_buf[..4].try_into().unwrap()) as usize;
-                            if frame_len > linux_quest_transport::tcp_tunnel::MAX_TUNNEL_FRAME_SIZE
-                            {
-                                tracing::warn!(frame_len, "USB tunnel frame exceeds limit");
-                                read_buf.clear();
-                                break;
-                            }
-                            let frame_end = 4 + frame_len;
-                            if read_buf.len() < frame_end {
-                                break;
-                            }
-                            let body = read_buf[4..frame_end].to_vec();
-                            read_buf.drain(..frame_end);
-                            match bincode::deserialize::<linux_quest_transport::TunnelFrame>(&body)
-                            {
-                                Ok(linux_quest_transport::TunnelFrame::Packet(pkt_bytes)) => {
-                                    match linux_quest_protocol::packet::Packet::from_bytes(
-                                        &pkt_bytes,
-                                    ) {
-                                        Ok(packet) => {
-                                            let _ = packet_tx.try_send(packet);
-                                        }
-                                        Err(e) => {
-                                            tracing::trace!(error = ?e, "Invalid USB tunnel packet")
-                                        }
-                                    }
-                                }
-                                Ok(linux_quest_transport::TunnelFrame::Control(message)) => {
-                                    tracing::trace!(
-                                        ?message,
-                                        "Received USB tunnel control message"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "Invalid USB tunnel frame");
-                                    read_buf.clear();
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    // Closing both directions wakes the cloned writer socket immediately, so it
-                    // cannot keep sending keepalives or consume events after reconnect.
-                    shutdown_tcp_input_writer(&stream, input_writer);
-                }
-            }
-            crate::config::TransportMode::Udp => {
-                let socket = match std::net::UdpSocket::bind("0.0.0.0:48440") {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!(error = ?e, "Failed to bind UDP socket on 0.0.0.0:48440");
-                        return;
-                    }
-                };
-                // The default receive buffer holds ~10 ms of an 80 Mbit/s stream; any stall of
-                // this thread then drops datagrams in the kernel without a trace.
-                set_receive_buffer(&socket, UDP_RECEIVE_BUFFER_BYTES);
-                let _ = socket.set_read_timeout(Some(Duration::from_millis(100)));
-                let mut buf = [0u8; 65536];
-                let mut drop_warn = DropWarnLimiter::default();
-
-                while bg_running.load(std::sync::atomic::Ordering::Relaxed) {
-                    match socket.recv_from(&mut buf) {
-                        Ok((len, source)) => {
-                            if !accept_udp_source(udp_filter.as_deref(), source) {
-                                if drop_warn.should_warn(source.ip(), std::time::Instant::now()) {
-                                    tracing::warn!(
-                                        %source,
-                                        allowed = ?udp_filter,
-                                        "Dropping UDP datagram from a source that is not the host \
-                                         (further drops from this source are not logged for 60s)"
-                                    );
-                                }
-                                continue;
-                            }
-                            match linux_quest_protocol::packet::Packet::from_bytes(&buf[..len]) {
-                                Ok(packet) => {
-                                    if let Some(control) = &receiver_ack_control {
-                                        control.ack();
-                                    }
-                                    let _ = packet_tx.try_send(packet);
-                                }
-                                Err(e) => {
-                                    tracing::trace!(error = ?e, "Failed to parse incoming packet");
-                                }
-                            }
-                        }
-                        Err(ref e)
-                            if e.kind() == std::io::ErrorKind::WouldBlock
-                                || e.kind() == std::io::ErrorKind::TimedOut => {}
-                        Err(e) => {
-                            tracing::trace!(error = ?e, "UDP socket recv error");
-                        }
-                    }
-                }
+    // USB mode: video and input share one tunnel connection, which the tunnel thread reopens
+    // when it dies (see `crate::usb_tunnel`).
+    let usb_tunnel = tcp_input_source.as_ref().and_then(|(source, flag, _, _)| {
+        let input = crate::usb_tunnel::TunnelInput {
+            source: source.clone(),
+            keyframes: flag.clone(),
+        };
+        let tunnel_tx = packet_tx.clone();
+        match crate::usb_tunnel::UsbTunnel::spawn(
+            crate::usb_tunnel::UsbTunnelConfig::new(host_addr),
+            Some(input),
+            move |packet| {
+                let _ = tunnel_tx.try_send(packet);
+            },
+        ) {
+            Ok(tunnel) => Some(tunnel),
+            Err(e) => {
+                tracing::warn!(error = ?e, "could not start the USB tunnel thread");
+                None
             }
         }
+    });
+    let tunnel_reconnect = usb_tunnel.as_ref().map(|tunnel| tunnel.reconnect_handle());
+
+    let receiver_handle = (transport_mode == TransportMode::Udp).then(|| {
+        std::thread::spawn(move || {
+            let socket = match std::net::UdpSocket::bind("0.0.0.0:48440") {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = ?e, "Failed to bind UDP socket on 0.0.0.0:48440");
+                    return;
+                }
+            };
+            // The default receive buffer holds ~10 ms of an 80 Mbit/s stream; any stall of
+            // this thread then drops datagrams in the kernel without a trace.
+            set_receive_buffer(&socket, UDP_RECEIVE_BUFFER_BYTES);
+            let _ = socket.set_read_timeout(Some(Duration::from_millis(100)));
+            let mut buf = [0u8; 65536];
+            let mut drop_warn = DropWarnLimiter::default();
+
+            while bg_running.load(std::sync::atomic::Ordering::Relaxed) {
+                match socket.recv_from(&mut buf) {
+                    Ok((len, source)) => {
+                        if !accept_udp_source(udp_filter.as_deref(), source) {
+                            if drop_warn.should_warn(source.ip(), std::time::Instant::now()) {
+                                tracing::warn!(
+                                    %source,
+                                    allowed = ?udp_filter,
+                                    "Dropping UDP datagram from a source that is not the host \
+                                     (further drops from this source are not logged for 60s)"
+                                );
+                            }
+                            continue;
+                        }
+                        match linux_quest_protocol::packet::Packet::from_bytes(&buf[..len]) {
+                            Ok(packet) => {
+                                if let Some(control) = &receiver_ack_control {
+                                    control.ack();
+                                }
+                                let _ = packet_tx.try_send(packet);
+                            }
+                            Err(e) => {
+                                tracing::trace!(error = ?e, "Failed to parse incoming packet");
+                            }
+                        }
+                    }
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(e) => {
+                        tracing::trace!(error = ?e, "UDP socket recv error");
+                    }
+                }
+            }
+        })
     });
 
     // The XR session is created only once the activity has a window and is resumed (Horizon OS
@@ -1037,6 +877,15 @@ pub fn android_main(app: AndroidApp) {
                 }
             },
         );
+
+        // After a pause (the headset slept, or the app was in the background) the USB tunnel can
+        // look open on both ends while it carries nothing, so it is reopened.
+        if lifecycle.take_resumed_after_pause() {
+            if let Some(reconnect) = &tunnel_reconnect {
+                tracing::info!("{LOG_TAG}: resumed after a pause; reopening the USB tunnel");
+                reconnect.request();
+            }
+        }
 
         // Drain Bluetooth/USB keyboard input on the NativeActivity thread and forward it through
         // the same low-latency UDP input channel used by the host injector.
@@ -1169,7 +1018,12 @@ pub fn android_main(app: AndroidApp) {
     drop(runtime);
 
     running_flag.store(false, std::sync::atomic::Ordering::Relaxed);
-    let _ = receiver_handle.join();
+    if let Some(handle) = receiver_handle {
+        let _ = handle.join();
+    }
+    if let Some(tunnel) = usb_tunnel {
+        tunnel.stop();
+    }
     if let Some(link) = host_link {
         link.stop();
     }
@@ -1191,28 +1045,6 @@ pub fn simulated_android_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn reconnect_shutdown_joins_the_previous_input_writer() {
-        use std::io::Write;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (stream, _) = listener.accept().unwrap();
-        let writer_stream = stream.try_clone().unwrap();
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let writer = std::thread::spawn(move || {
-            let mut writer_stream = writer_stream;
-            started_tx.send(()).unwrap();
-            while writer_stream.write_all(b"keepalive").is_ok() {
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-        });
-        started_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap();
-        shutdown_tcp_input_writer(&stream, Some(writer));
-        drop(peer);
-    }
 
     #[test]
     fn udp_filter_uses_host_ip_only_in_udp_mode() {

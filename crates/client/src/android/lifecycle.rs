@@ -65,6 +65,11 @@ pub struct AppLifecycle {
     swapchains_created: bool,
     /// EXITING / LOSS_PENDING seen.
     exit_requested: bool,
+    /// A `Pause` came after the last `Resume`.
+    paused: bool,
+    /// A `Resume` followed a `Pause` and nobody has taken it yet (see
+    /// [`AppLifecycle::take_resumed_after_pause`]).
+    resumed_after_pause: bool,
 }
 
 impl AppLifecycle {
@@ -98,8 +103,16 @@ impl AppLifecycle {
         match event {
             LifecycleEvent::InitWindow => self.window_ready = true,
             LifecycleEvent::TermWindow => self.window_ready = false,
-            LifecycleEvent::Resume => self.resumed = true,
-            LifecycleEvent::Pause => self.resumed = false,
+            LifecycleEvent::Resume => {
+                self.resumed = true;
+                if std::mem::take(&mut self.paused) {
+                    self.resumed_after_pause = true;
+                }
+            }
+            LifecycleEvent::Pause => {
+                self.resumed = false;
+                self.paused = true;
+            }
             LifecycleEvent::GainedFocus => self.focused = true,
             LifecycleEvent::LostFocus => self.focused = false,
             LifecycleEvent::Destroy => {
@@ -117,6 +130,13 @@ impl AppLifecycle {
             focused = self.focused,
             "{LOG_TAG}: activity event"
         );
+    }
+
+    /// True once for each `Resume` that follows a `Pause`, the first `Resume` after launch
+    /// excluded. The app was in the background or the headset slept, so connections opened
+    /// before may be dead while still looking open.
+    pub fn take_resumed_after_pause(&mut self) -> bool {
+        std::mem::take(&mut self.resumed_after_pause)
     }
 
     /// Records that the not-yet-running session was dropped (see [`NextAction::DiscardSession`]).
@@ -204,6 +224,31 @@ mod tests {
             s.on_event(*e);
         }
         s
+    }
+
+    #[test]
+    fn resume_after_pause_is_reported_once_and_not_at_launch() {
+        let mut s = run(&[InitWindow, Resume, GainedFocus]);
+        assert!(
+            !s.take_resumed_after_pause(),
+            "the launch resume is not a return"
+        );
+        s.on_event(LostFocus);
+        s.on_event(GainedFocus);
+        assert!(
+            !s.take_resumed_after_pause(),
+            "focus changes are not a pause"
+        );
+        s.on_event(Pause);
+        assert!(!s.take_resumed_after_pause(), "still paused");
+        s.on_event(Resume);
+        assert!(s.take_resumed_after_pause());
+        assert!(!s.take_resumed_after_pause(), "reported once");
+        s.on_event(Resume);
+        assert!(
+            !s.take_resumed_after_pause(),
+            "a repeated resume without a pause"
+        );
     }
 
     #[test]
