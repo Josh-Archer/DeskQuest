@@ -113,8 +113,8 @@ pub fn start_input_sender(
     let Some(sender_config) = input_sender_config(config) else {
         match config.transport_mode {
             TransportMode::AdbReverseTcp => tracing::info!(
-                "input sender not started: adb reverse carries TCP only, so no UDP input is sent \
-                 in USB mode"
+                "UDP input sender not started in USB mode: input goes over the USB TCP tunnel \
+                 instead (adb reverse carries TCP only)"
             ),
             TransportMode::Udp => tracing::warn!(
                 host = %config.host_addr,

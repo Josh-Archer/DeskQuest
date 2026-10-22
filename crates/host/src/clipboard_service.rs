@@ -588,16 +588,63 @@ impl HostClipboardService<AutoClipboardBackend> {
         self.listener.as_ref().and_then(|l| l.local_addr().ok())
     }
 
+    /// Default number of bind attempts for the control listener (see [`Self::bind_auto`]).
+    pub const BIND_ATTEMPTS: u32 = 10;
+    /// Default delay between control listener bind attempts.
+    pub const BIND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
     /// Binds a TCP listener to `bind_addr` for accepting client control channel connections.
+    ///
+    /// Sets `SO_REUSEADDR` so a fast daemon restart can rebind past `TIME_WAIT`, and retries
+    /// `EADDRINUSE` for about 3 s in total. Returns the last error if the port stays taken.
     pub async fn bind_auto(bind_addr: SocketAddr) -> Result<Self, HostError> {
-        let listener = TcpListener::bind(bind_addr)
-            .await
-            .map_err(|e| HostError::Transport(TransportError::Io(e)))?;
+        Self::bind_auto_with_retry(bind_addr, Self::BIND_ATTEMPTS, Self::BIND_RETRY_DELAY).await
+    }
+
+    /// [`Self::bind_auto`] with an explicit bounded retry: `attempts` tries (at least one),
+    /// `delay` apart. Only `AddrInUse` is retried.
+    pub async fn bind_auto_with_retry(
+        bind_addr: SocketAddr,
+        attempts: u32,
+        delay: std::time::Duration,
+    ) -> Result<Self, HostError> {
+        let attempts = attempts.max(1);
+        let mut attempt = 1;
+        let listener = loop {
+            match bind_reuseaddr(bind_addr) {
+                Ok(l) => break l,
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempt < attempts => {
+                    tracing::info!(
+                        addr = %bind_addr,
+                        attempt,
+                        attempts,
+                        "Control port in use; retrying bind"
+                    );
+                    attempt += 1;
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => return Err(HostError::Transport(TransportError::Io(e))),
+            }
+        };
 
         let (mut service, _, _) = Self::new_auto();
         service.listener = Some(listener);
         Ok(service)
     }
+}
+
+/// Binds a non-blocking tokio listener with `SO_REUSEADDR` set.
+fn bind_reuseaddr(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(128)?;
+    TcpListener::from_std(socket.into())
 }
 
 #[cfg(test)]
@@ -608,6 +655,36 @@ mod tests {
     use linux_quest_protocol::{PacketHeader, PacketType};
     use linux_quest_transport::{negotiate_client, recv_frame, ControlMessage, TunnelFrame};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn bind_auto_fails_when_port_is_held() {
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = holder.local_addr().unwrap();
+        let start = std::time::Instant::now();
+        let result = HostClipboardService::bind_auto_with_retry(
+            addr,
+            3,
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+        let Err(HostError::Transport(TransportError::Io(e))) = result else {
+            panic!("expected an AddrInUse error while the port is held");
+        };
+        assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(40),
+            "should retry"
+        );
+        drop(holder);
+        let svc = HostClipboardService::bind_auto_with_retry(
+            addr,
+            3,
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .expect("binds once the port is free");
+        assert_eq!(svc.local_addr(), Some(addr));
+    }
 
     #[tokio::test]
     async fn test_control_keepalive_is_enabled_on_accepted_socket() {

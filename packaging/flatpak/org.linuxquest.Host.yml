@@ -16,6 +16,7 @@ modules:
       append-path: /usr/lib/sdk/rust-stable/bin
       env:
         CARGO_HOME: /run/build/linux-quest-host/cargo
+        CMAKE_POLICY_VERSION_MINIMUM: '3.5'
     build-commands:
       - cargo build --release --locked --offline -p linux-quest-host --features mdns
       - install -Dm755 target/release/linux-quest-host /app/bin/linux-quest-host

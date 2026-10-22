@@ -91,7 +91,8 @@ References:
    Horizon developer dashboard. Confirm the app ID, package name, supported
    devices and distribution agreement.
 2. Establish a persistent release-signing key and back it up outside CI. The
-   current Android build harness generates a debug keystore, even with
+   current Android build harness signs with a per-user debug keystore
+   (`LINUX_QUEST_KEYSTORE`, default `~/.local/share/linux-quest/debug.keystore`), even with
    `--release`; that optimized APK is for sideload testing, not a store upload.
    Add an explicit store-signing mode before connecting upload credentials.
 3. Use a monotonically increasing Android `versionCode`, release `versionName`,

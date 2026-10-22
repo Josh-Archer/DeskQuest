@@ -461,7 +461,7 @@ async fn start_stream_services(
     headset: Arc<HeadsetHub>,
 ) -> (Option<u16>, Option<u16>) {
     let mut input_port = None;
-    let mut control_port = None;
+    let control_port;
     let mut usb_packet_handler: Option<Arc<dyn Fn(linux_quest_protocol::Packet) + Send + Sync>> =
         None;
     let input_bind_addr =
@@ -576,10 +576,18 @@ async fn start_stream_services(
             });
         }
         Err(e) => {
-            tracing::warn!(
+            // 48444 carries the USB tunnel (video, input, settings) as well as LAN control, so a
+            // daemon without it cannot serve a USB headset. Exit so systemd can restart us.
+            tracing::error!(
                 error = %e,
-                "Failed to bind control channel on {control_bind_addr}; clipboard synchronization disabled"
+                "Failed to bind control channel on {control_bind_addr} after retrying; the USB \
+                 tunnel, settings and clipboard cannot work. Is another linux-quest-host running? Exiting."
             );
+            eprintln!(
+                "error: could not bind control port {control_bind_addr}: {e}. \
+                 Another linux-quest-host may be running."
+            );
+            std::process::exit(1);
         }
     }
 
