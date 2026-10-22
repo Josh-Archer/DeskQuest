@@ -1670,6 +1670,18 @@ impl OpenXrContext {
     }
 
     /// Locates all 26 skeletal hand joints for the specified hand at the given display time.
+    /// Where the head is in the stage space at `display_time`, when tracked.
+    pub fn head_position(&self, display_time: Time) -> Option<crate::spatial::Vec3> {
+        let (view, stage) = (self.view_space.as_ref()?, self.stage_space.as_ref()?);
+        view.locate(stage, display_time)
+            .ok()
+            .filter(|l| {
+                l.location_flags
+                    .contains(openxr::SpaceLocationFlags::POSITION_VALID)
+            })
+            .map(|l| crate::spatial::Vec3::from(l.pose.position))
+    }
+
     pub fn locate_hand_joints(
         &mut self,
         hand: Handedness,

@@ -419,7 +419,10 @@ impl InteractionInput {
             if let Some(grip) = system.grip_pose {
                 input.grab_pose = Some(grip);
             }
-            input.is_selecting |= system.is_selecting();
+            // The system's pinch, when it reports one, decides alone: the joints' own pinch
+            // threshold can stay closed on a relaxed hand.
+            input.is_selecting = system.is_selecting();
+            input.is_grabbing = false;
         }
         input
     }

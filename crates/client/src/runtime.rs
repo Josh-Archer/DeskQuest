@@ -468,6 +468,10 @@ impl QuestClientRuntime {
 
         // 2a. Poll controller actions and skeletal hand tracking
         let _ = self.openxr_context.poll_interaction(display_time);
+        // A window being moved turns to face the head.
+        if let Some(head) = self.openxr_context.head_position(display_time) {
+            self.interaction_state_machine.set_viewer(head);
+        }
 
         let dt_seconds = 1.0 / self.config.target_refresh_rate.max(1.0);
 
@@ -631,12 +635,9 @@ impl QuestClientRuntime {
                 crate::spatial::InteractionSource::Controller(Handedness::Left) => {
                     left_ctrl.as_ref().is_some_and(|c| c.thumbstick_clicked)
                 }
-                crate::spatial::InteractionSource::Hand(Handedness::Right) => {
-                    right_gesture.as_ref().is_some_and(|g| g.is_grabbing)
-                }
-                crate::spatial::InteractionSource::Hand(Handedness::Left) => {
-                    left_gesture.as_ref().is_some_and(|g| g.is_grabbing)
-                }
+                // No right-click for hands: the fist detector also reads a relaxed hand as a
+                // fist, which right-clicked at random (and held grabs open).
+                crate::spatial::InteractionSource::Hand(_) => false,
             };
             // A grab in progress, or a hand pinching a window's handle, is not a click.
             let mut pointer_source = input;
@@ -670,8 +671,11 @@ impl QuestClientRuntime {
                     .iter()
                     .filter_map(|opt| opt.as_ref())
                     .find(|inp| {
-                        (inp.is_grabbing || (!inp.source.is_controller() && inp.is_selecting))
-                            && inp.grab_pose.is_some()
+                        (if inp.source.is_controller() {
+                            inp.is_grabbing
+                        } else {
+                            inp.is_selecting
+                        }) && inp.grab_pose.is_some()
                             && inp.source != session.source
                             && inp.source.handedness() != session.source.handedness()
                     })
@@ -684,9 +688,11 @@ impl QuestClientRuntime {
                 InteractionState::Grabbing(session) if session.source == input.source
             );
             // Controllers grab a window anywhere with the grip. Hands grab as on Horizon OS:
-            // a pinch (or fist) on the window's handles, just outside the screen, held for as
-            // long as the drag lasts; a pinch on the screen itself clicks the desktop.
-            let hand_holds = |i: &InteractionInput| i.is_grabbing || i.is_selecting;
+            // a pinch on the window's handles, just outside the screen, held for as long as
+            // the drag lasts; a pinch on the screen itself clicks the desktop. Only the pinch
+            // counts: the fist detector also reads a relaxed hand as a fist, so a fist-held
+            // grab never let go.
+            let hand_holds = |i: &InteractionInput| i.is_selecting;
             if !input.source.is_controller() {
                 manipulation_input.is_grabbing = hand_holds(&input)
                     && (self.interaction_state_machine.hovering_handle() || continuing_hand_grab);
@@ -1735,5 +1741,55 @@ mod tests {
             runtime.interaction_state(),
             InteractionState::Grabbing(_)
         ));
+    }
+
+    #[test]
+    fn a_hand_grab_lets_go_when_the_pinch_ends_even_if_the_hand_looks_like_a_fist() {
+        use crate::openxr::{MockHandTrackingBackend, MockInteractionBackend};
+        use crate::spatial::{ControllerInputState, Quat, ScreenPose};
+        let mut runtime = QuestClientRuntime::new(ClientConfig::default()).unwrap();
+        let screen = runtime.screen_transform().clone();
+        let (_, h) = screen.size_m();
+        let below = Vec3::new(0.0, screen.position.y - h * 0.5 - 0.05, -0.4);
+        // A relaxed hand: fingertips close to the palm, which the fist detector reads as a
+        // fist. Only the system's pinch should hold a grab.
+        let step = |runtime: &mut QuestClientRuntime, pinch: bool| {
+            let mut hands = MockHandTrackingBackend::new(true);
+            hands.simulate_fist_grab(Handedness::Right, below, 0.04);
+            runtime
+                .openxr_context_mut()
+                .set_hand_tracking_backend(Box::new(hands));
+            let mut system = MockInteractionBackend::new();
+            system.set_controller_state(
+                Handedness::Right,
+                Some(ControllerInputState {
+                    aim_pose: Some(ScreenPose::new(below, Quat::IDENTITY)),
+                    grip_pose: Some(ScreenPose::new(below, Quat::IDENTITY)),
+                    trigger_value: if pinch { 1.0 } else { 0.0 },
+                    trigger_clicked: pinch,
+                    ..Default::default()
+                }),
+            );
+            runtime
+                .openxr_context_mut()
+                .set_interaction_backend(Box::new(system));
+            runtime.step_frame().unwrap();
+        };
+        step(&mut runtime, false);
+        assert!(
+            !matches!(runtime.interaction_state(), InteractionState::Grabbing(_)),
+            "a fist alone does not grab"
+        );
+        step(&mut runtime, true);
+        assert!(matches!(
+            runtime.interaction_state(),
+            InteractionState::Grabbing(_)
+        ));
+        step(&mut runtime, false);
+        assert!(
+            !matches!(runtime.interaction_state(), InteractionState::Grabbing(_)),
+            "releasing the pinch ends the grab: {:?}",
+            runtime.interaction_state()
+        );
     }
 }
