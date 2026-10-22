@@ -12,6 +12,7 @@
 
 mod daemon;
 mod format;
+mod headset;
 mod topdown;
 mod ui;
 
