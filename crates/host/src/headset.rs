@@ -9,7 +9,7 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use linux_quest_protocol::{HeadsetSettings, HeadsetStatus, ScreenPlacement};
+use linux_quest_protocol::{HeadsetSettings, HeadsetSettingsPatch, HeadsetStatus, ScreenPlacement};
 use linux_quest_transport::ControlMessage;
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, watch};
@@ -166,6 +166,22 @@ impl HeadsetHub {
                 .ok_or(HeadsetError::NotConnected),
             _ => Err(HeadsetError::NoAnswer(timeout)),
         }
+    }
+
+    /// Changes only the settings `patch` carries. The other fields are filled from the
+    /// headset's own last report, never from host-side values, so a one-field change cannot
+    /// reset, for example, the headset's bitrate.
+    pub async fn apply_settings_patch(
+        &self,
+        patch: HeadsetSettingsPatch,
+        timeout: Duration,
+    ) -> Result<HeadsetStatus, HeadsetError> {
+        let (current, _, _) = self.status().ok_or(HeadsetError::NotConnected)?;
+        if patch.is_empty() {
+            return Ok(current);
+        }
+        self.apply_settings(patch.applied_to(&current.settings), timeout)
+            .await
     }
 
     /// Asks the headset to place `screens`, and returns the layout it then reports.

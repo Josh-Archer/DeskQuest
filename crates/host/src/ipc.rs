@@ -13,7 +13,8 @@ use crate::video_sender::control::{CaptureKind, VideoControl, CHOOSE_SCREEN_TIME
 use crate::MultiDisplayHost;
 use linux_quest_display::{DisplayLayoutMode, VirtualMonitor, VirtualMonitorConfig};
 use linux_quest_protocol::{
-    ClientConnectionMode, HeadsetSettings, HeadsetStats, HeadsetStatus, ScreenPlacement,
+    ClientConnectionMode, HeadsetSettings, HeadsetSettingsPatch, HeadsetStats, HeadsetStatus,
+    ScreenPlacement,
 };
 
 /// Request sent from a client (CLI, tray, desktop app) to the background daemon.
@@ -64,6 +65,12 @@ pub enum DaemonRequest {
     /// Shows GNOME's screen-share dialog so the user can pick what the desktop screen shows.
     /// The answer comes once they picked or cancelled, up to about five minutes later.
     ChooseScreen,
+    /// Changes only the headset settings `patch` carries; the rest keep the values the headset
+    /// last reported. The host's video bitrate follows only when the patch changes the
+    /// bitrate. Answered with the headset's new status.
+    PatchHeadsetSettings {
+        patch: HeadsetSettingsPatch,
+    },
 }
 
 /// Response returned from the daemon. New variants go at the end.
@@ -501,6 +508,18 @@ pub async fn handle_request(ctx: &IpcContext, req: DaemonRequest) -> DaemonRespo
             }
             headset_answer(ctx.headset.apply_settings(settings, APPLY_TIMEOUT).await)
         }
+        DaemonRequest::PatchHeadsetSettings { patch } => {
+            let applied = ctx.headset.apply_settings_patch(patch, APPLY_TIMEOUT).await;
+            if let (Ok(status), Some(rate)) = (&applied, &ctx.rate) {
+                if patch.touches_bitrate() {
+                    rate.set_limit(
+                        status.settings.bitrate_mbps.saturating_mul(1000),
+                        status.settings.adaptive_bitrate,
+                    );
+                }
+            }
+            headset_answer(applied)
+        }
         DaemonRequest::SetBitrate { mbps, adaptive } => match &ctx.rate {
             _ if !(1..=500).contains(&mbps) => {
                 DaemonResponse::Error(format!("bitrate {mbps} Mbit/s is outside 1 to 500"))
@@ -872,6 +891,53 @@ mod tests {
         headset.await.unwrap();
     }
 
+    /// Issue #114: changing one setting must not overwrite the headset's bitrate (80) with
+    /// the host's (30), on the headset or in the host's encoder.
+    #[tokio::test]
+    async fn a_settings_patch_keeps_the_headsets_bitrate_and_the_hosts_rate() {
+        let ctx = context();
+        let rate = ctx.rate.as_ref().unwrap().clone();
+        let host_rate = (rate.max_kbps(), rate.is_adaptive());
+        let reported = crate::headset::tests::status("Quest 3");
+        assert_eq!(reported.settings.bitrate_mbps, 80);
+        assert_ne!(host_rate.0, 80_000);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let peer: std::net::SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let id = ctx.headset.next_peer_id();
+        ctx.headset.status_received(id, peer, &tx, reported.clone());
+        let hub = ctx.headset.clone();
+        let headset = tokio::spawn(async move {
+            let Some(linux_quest_transport::ControlMessage::SetHeadsetSettings(settings)) =
+                rx.recv().await
+            else {
+                panic!("expected settings")
+            };
+            let mut next = crate::headset::tests::status("Quest 3");
+            next.settings = settings;
+            hub.status_received(id, peer, &tx, next);
+            settings
+        });
+        let patch = HeadsetSettingsPatch {
+            hud: Some(!reported.settings.hud),
+            ..Default::default()
+        };
+        let resp = handle_request(&ctx, DaemonRequest::PatchHeadsetSettings { patch }).await;
+        let DaemonResponse::Headset(Some(report)) = resp else {
+            panic!("expected the headset's report, got {resp:?}")
+        };
+        let sent = headset.await.unwrap();
+        assert_eq!(
+            sent,
+            HeadsetSettings {
+                hud: !reported.settings.hud,
+                ..reported.settings
+            },
+            "only the HUD may change"
+        );
+        assert_eq!(report.status.settings.bitrate_mbps, 80);
+        assert_eq!((rate.max_kbps(), rate.is_adaptive()), host_rate);
+    }
+
     #[tokio::test]
     async fn choose_screen_needs_a_screen_capture_and_relays_its_answer() {
         let ctx = context();
@@ -939,6 +1005,12 @@ mod tests {
         assert_eq!(index(&DaemonRequest::DashboardSnapshot), 4);
         assert_eq!(index(&DaemonRequest::Status), 5);
         assert_eq!(index(&DaemonRequest::ChooseScreen), 11);
+        assert_eq!(
+            index(&DaemonRequest::PatchHeadsetSettings {
+                patch: HeadsetSettingsPatch::default()
+            }),
+            12
+        );
     }
 
     #[test]
