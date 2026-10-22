@@ -48,8 +48,9 @@ pub use quic::{
 };
 pub use tcp::TcpEndpoint;
 pub use tcp_tunnel::{
-    negotiate_client, negotiate_server, recv_frame, send_frame, TunnelError, TunnelFrame,
-    USB_TUNNEL_ACCEPT, USB_TUNNEL_HELLO,
+    encode_frame, negotiate_client, negotiate_client_blocking, negotiate_server, recv_frame,
+    send_frame, TunnelError, TunnelFrame, TunnelFrameDecoder, TUNNEL_HEARTBEAT_INTERVAL,
+    TUNNEL_IDLE_TIMEOUT, USB_TUNNEL_ACCEPT, USB_TUNNEL_HELLO,
 };
 pub use udp::{PacedUdpEndpoint, DEFAULT_UDP_MTU};
 

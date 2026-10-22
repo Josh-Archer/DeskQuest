@@ -21,6 +21,7 @@ pub mod settings;
 pub mod spatial;
 pub mod storage;
 pub mod streams;
+pub mod usb_tunnel;
 
 #[cfg(target_os = "android")]
 pub use audio::AAudioSink;

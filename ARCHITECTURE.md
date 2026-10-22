@@ -145,6 +145,13 @@ streamed to a headset implicitly. The video sender is not started under `--tui`.
 - **Shutdown** (SIGINT/SIGTERM, or leaving the TUI) removes the reverse mapping on a best-effort
   basis (3 s limit) and marks the tunnel down. After a crash the mapping can survive in the adb
   server; the next start re-applies it, replacing the old one.
+- **Tunnel liveness.** `adb reverse` can leave a tunnel connection open on both ends while it
+  carries nothing (seen after the headset sleeps and wakes). The daemon sends a heartbeat on each
+  tunnel connection every second, and drops a connection that sends nothing (the headset sends an
+  input keepalive every 100 ms) or stops reading for 5 s. The headset
+  (`crates/client/src/usb_tunnel.rs`) opens a new connection when a host that heartbeats has sent
+  nothing for 5 s, when the connection closes or a write fails, and whenever the app resumes after
+  a pause. After reconnecting it asks for a keyframe on every stream it has received.
 
 #### What works over USB today
 

@@ -34,6 +34,39 @@ pub const CONTROL_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
 /// Unanswered probes before the kernel resets the connection (about 9s of silence in total).
 pub const CONTROL_KEEPALIVE_RETRIES: u32 = 2;
 
+/// Liveness timing of USB tunnel peers (see `linux_quest_transport::tcp_tunnel`).
+#[derive(Debug, Clone, Copy)]
+struct TunnelTiming {
+    /// A heartbeat goes to the headset this often, so it can tell a static screen from a dead
+    /// tunnel.
+    heartbeat: Duration,
+    /// A headset that sends nothing for this long (it sends input keepalives every 100 ms),
+    /// or that stops reading for this long, is dropped.
+    idle_timeout: Duration,
+}
+
+impl Default for TunnelTiming {
+    fn default() -> Self {
+        Self {
+            heartbeat: linux_quest_transport::TUNNEL_HEARTBEAT_INTERVAL,
+            idle_timeout: linux_quest_transport::TUNNEL_IDLE_TIMEOUT,
+        }
+    }
+}
+
+/// Why a USB tunnel peer's connection ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TunnelEnd {
+    Stopped,
+    Closed,
+    Disconnected,
+    WriteFailed,
+    /// A write did not finish within the idle timeout: the headset stopped reading.
+    Stalled,
+    /// Nothing arrived within the idle timeout.
+    Silent,
+}
+
 /// Enables short-interval TCP keepalive so a headset that vanishes without a FIN
 /// (Wi-Fi drop, power off) is detected within seconds instead of the kernel default of hours.
 pub fn enable_control_keepalive(stream: &TcpStream) -> std::io::Result<()> {
@@ -68,6 +101,7 @@ pub struct HostClipboardService<B: ClipboardBackend + 'static = AutoClipboardBac
     tunnel_packet_handler: Option<Arc<dyn Fn(Packet) + Send + Sync>>,
     tunnel_video: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
     tunnel_keyframe_request: Option<Arc<dyn Fn() + Send + Sync>>,
+    tunnel_timing: TunnelTiming,
     headset: Option<Arc<HeadsetHub>>,
 }
 
@@ -100,6 +134,7 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
             tunnel_packet_handler: None,
             tunnel_video: None,
             tunnel_keyframe_request: None,
+            tunnel_timing: TunnelTiming::default(),
             headset: None,
         }
     }
@@ -257,6 +292,7 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
             tunnel_packet_handler: self.tunnel_packet_handler.clone(),
             tunnel_video: self.tunnel_video.clone(),
             tunnel_keyframe_request: self.tunnel_keyframe_request.clone(),
+            tunnel_timing: self.tunnel_timing,
         }
     }
 
@@ -292,6 +328,7 @@ struct PeerContext<B: ClipboardBackend + 'static> {
     tunnel_packet_handler: Option<Arc<dyn Fn(Packet) + Send + Sync>>,
     tunnel_video: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
     tunnel_keyframe_request: Option<Arc<dyn Fn() + Send + Sync>>,
+    tunnel_timing: TunnelTiming,
 }
 
 impl<B: ClipboardBackend + 'static> PeerContext<B> {
@@ -328,6 +365,7 @@ impl<B: ClipboardBackend + 'static> PeerContext<B> {
         let backend = self.backend.clone();
         let packet_handler = self.tunnel_packet_handler.clone();
         let keyframe_request = self.tunnel_keyframe_request.clone();
+        let timing = self.tunnel_timing;
         let mut video_rx = self.tunnel_video.as_ref().map(|tx| tx.subscribe());
         let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<ControlMessage>();
         self.peer_writers.lock().push(peer_tx.clone());
@@ -377,8 +415,13 @@ impl<B: ClipboardBackend + 'static> PeerContext<B> {
                     }
                     return;
                 }
+                tracing::info!(peer = %peer_addr, "USB tunnel client connected");
+                // A headset that reconnects lost the frames sent into its previous connection.
+                if let Some(request) = &keyframe_request {
+                    request();
+                }
                 let (incoming_tx, mut incoming_rx) = mpsc::channel(32);
-                tokio::spawn(async move {
+                let reader_task = tokio::spawn(async move {
                     let mut reader = BufReader::new(reader);
                     loop {
                         let result = recv_frame(&mut reader).await;
@@ -388,14 +431,24 @@ impl<B: ClipboardBackend + 'static> PeerContext<B> {
                         }
                     }
                 });
-                while running.load(Ordering::Relaxed) {
+                let mut heartbeat = tokio::time::interval_at(
+                    tokio::time::Instant::now() + timing.heartbeat,
+                    timing.heartbeat,
+                );
+                heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut heartbeat_sequence = 0u64;
+                let mut last_received = Instant::now();
+                let ended = loop {
+                    if !running.load(Ordering::Relaxed) {
+                        break TunnelEnd::Stopped;
+                    }
                     let received = tokio::select! {
                         outgoing = peer_rx.recv() => match outgoing {
                             Some(message) => {
-                                if send_frame(&mut writer, &TunnelFrame::Control(message)).await.is_err() { break; }
+                                if let Err(end) = send_tunnel_frame(&mut writer, &TunnelFrame::Control(message), timing.idle_timeout).await { break end; }
                                 continue;
                             }
-                            None => break,
+                            None => break TunnelEnd::Stopped,
                         },
                         video = async {
                             match video_rx.as_mut() {
@@ -406,26 +459,45 @@ impl<B: ClipboardBackend + 'static> PeerContext<B> {
                             match video {
                                 Some(result) => {
                                     let (packet, closed) = handle_video_result(result, keyframe_request.as_ref());
-                                    if closed { break; }
+                                    if closed { break TunnelEnd::Stopped; }
                                     if let Some(bytes) = packet {
-                                        if send_frame(&mut writer, &TunnelFrame::Packet(bytes)).await.is_err() { break; }
+                                        if let Err(end) = send_tunnel_frame(&mut writer, &TunnelFrame::Packet(bytes), timing.idle_timeout).await { break end; }
                                     }
                                 }
-                                None => break,
+                                None => break TunnelEnd::Stopped,
                             }
+                            continue;
+                        },
+                        _ = heartbeat.tick() => {
+                            if last_received.elapsed() >= timing.idle_timeout {
+                                break TunnelEnd::Silent;
+                            }
+                            heartbeat_sequence += 1;
+                            let beat = ControlMessage::Heartbeat {
+                                sequence: heartbeat_sequence,
+                                timestamp_us: unix_time_us(),
+                            };
+                            if let Err(end) = send_tunnel_frame(&mut writer, &TunnelFrame::Control(beat), timing.idle_timeout).await { break end; }
                             continue;
                         },
                         incoming = incoming_rx.recv() => incoming,
                     };
-                    let Some(received) = received else { break };
-                    if let (Ok(_), Some(link)) = (&received, &link) {
-                        link.lock().control_activity(Instant::now());
+                    let Some(received) = received else {
+                        break TunnelEnd::Closed;
+                    };
+                    if received.is_ok() {
+                        last_received = Instant::now();
+                        if let Some(link) = &link {
+                            link.lock().control_activity(last_received);
+                        }
                     }
                     match received {
                         Ok(TunnelFrame::Control(ControlMessage::Clipboard(clip_msg))) => {
                             apply_clipboard_message(&sync_engine, &backend, clip_msg);
                         }
-                        Ok(TunnelFrame::Control(ControlMessage::Disconnect { .. })) => break,
+                        Ok(TunnelFrame::Control(ControlMessage::Disconnect { .. })) => {
+                            break TunnelEnd::Disconnected
+                        }
                         Ok(TunnelFrame::Packet(bytes)) => {
                             if let (Some(handler), Ok(packet)) =
                                 (&packet_handler, Packet::from_bytes(&bytes))
@@ -434,7 +506,21 @@ impl<B: ClipboardBackend + 'static> PeerContext<B> {
                             }
                         }
                         Ok(TunnelFrame::Control(_)) => {}
-                        Err(_) => break,
+                        Err(_) => break TunnelEnd::Closed,
+                    }
+                };
+                // A dead headset never sends EOF: stop reading so the socket closes now.
+                reader_task.abort();
+                match ended {
+                    TunnelEnd::Stalled | TunnelEnd::Silent => tracing::warn!(
+                        peer = %peer_addr,
+                        reason = ?ended,
+                        timeout_ms = timing.idle_timeout.as_millis() as u64,
+                        "USB tunnel client dropped: the connection stopped carrying data; the \
+                         headset reconnects on a new one"
+                    ),
+                    _ => {
+                        tracing::info!(peer = %peer_addr, reason = ?ended, "USB tunnel client disconnected")
                     }
                 }
                 if let Some(link) = link {
@@ -456,6 +542,26 @@ impl<B: ClipboardBackend + 'static> PeerContext<B> {
             }
         });
     }
+}
+
+/// Sends one frame, giving up when the headset has not taken it within `stall`.
+async fn send_tunnel_frame<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &TunnelFrame,
+    stall: Duration,
+) -> Result<(), TunnelEnd> {
+    match tokio::time::timeout(stall, send_frame(writer, frame)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(TunnelEnd::WriteFailed),
+        Err(_) => Err(TunnelEnd::Stalled),
+    }
+}
+
+fn unix_time_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64
 }
 
 fn handle_video_result(
@@ -654,7 +760,7 @@ mod tests {
     use linux_quest_input::MockClipboardBackend;
     use linux_quest_protocol::{PacketHeader, PacketType};
     use linux_quest_transport::{negotiate_client, recv_frame, ControlMessage, TunnelFrame};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[tokio::test]
     async fn bind_auto_fails_when_port_is_held() {
@@ -886,6 +992,184 @@ mod tests {
         );
         running.store(false, Ordering::SeqCst);
         task.abort();
+    }
+
+    /// A control service accepting USB tunnel peers, with `timing` for their liveness.
+    struct TunnelHost {
+        addr: SocketAddr,
+        link: crate::link_status::SharedLinkTracker,
+        video: broadcast::Sender<Vec<u8>>,
+        keyframe_requests: Arc<AtomicUsize>,
+        running: Arc<AtomicBool>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl TunnelHost {
+        async fn start(timing: TunnelTiming) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let backend = Arc::new(Mutex::new(MockClipboardBackend::new()));
+            let sync = Arc::new(Mutex::new(ClipboardSyncEngine::new(7)));
+            let (outgoing, _) = mpsc::unbounded_channel::<ControlMessage>();
+            let (_, incoming) = mpsc::unbounded_channel::<ClipboardMessage>();
+            let link = crate::link_status::new_shared_link_tracker(
+                crate::link_status::DEFAULT_INPUT_LIVENESS,
+            );
+            let (video, _) = broadcast::channel(64);
+            let keyframe_requests = Arc::new(AtomicUsize::new(0));
+            let count = keyframe_requests.clone();
+            let mut service = HostClipboardService::new(backend, sync, outgoing, incoming)
+                .with_link_tracker(link.clone())
+                .with_tunnel_video(video.clone())
+                .with_tunnel_keyframe_request(Arc::new(move || {
+                    count.fetch_add(1, Ordering::Relaxed);
+                }));
+            service.listener = Some(listener);
+            service.tunnel_timing = timing;
+            let running = service.running_flag();
+            let task = tokio::spawn(async move { service.run().await.unwrap() });
+            Self {
+                addr,
+                link,
+                video,
+                keyframe_requests,
+                running,
+                task,
+            }
+        }
+
+        async fn connect(
+            &self,
+        ) -> (
+            tokio::net::tcp::OwnedReadHalf,
+            tokio::net::tcp::OwnedWriteHalf,
+        ) {
+            let stream = TcpStream::connect(self.addr).await.unwrap();
+            let (mut reader, mut writer) = stream.into_split();
+            negotiate_client(&mut reader, &mut writer).await.unwrap();
+            (reader, writer)
+        }
+
+        /// Waits until the host has no control peer left.
+        async fn wait_until_peer_dropped(&self, within: Duration) -> bool {
+            tokio::time::timeout(within, async {
+                while self.link.lock().status(Instant::now()).peer.is_some() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok()
+        }
+    }
+
+    impl Drop for TunnelHost {
+        fn drop(&mut self) {
+            self.running.store(false, Ordering::SeqCst);
+            self.task.abort();
+        }
+    }
+
+    fn input_keepalive() -> TunnelFrame {
+        let packet = linux_quest_protocol::Packet::new(
+            PacketHeader::new(PacketType::InputEvent, 0, 1, 10, b"keepalive"),
+            Bytes::from_static(b"keepalive"),
+        );
+        TunnelFrame::Packet(packet.to_bytes().to_vec())
+    }
+
+    #[tokio::test]
+    async fn tunnel_peer_gets_heartbeats_on_a_static_screen_and_a_keyframe_on_connect() {
+        let host = TunnelHost::start(TunnelTiming {
+            heartbeat: Duration::from_millis(50),
+            idle_timeout: Duration::from_secs(5),
+        })
+        .await;
+        let (mut reader, _writer) = host.connect().await;
+        // No video is sent, yet the tunnel carries data the headset can watch for.
+        for expected in 1..=2 {
+            let frame = tokio::time::timeout(Duration::from_secs(1), recv_frame(&mut reader))
+                .await
+                .expect("no heartbeat")
+                .unwrap();
+            assert!(
+                matches!(frame, TunnelFrame::Control(ControlMessage::Heartbeat { sequence, .. }) if sequence == expected),
+                "unexpected frame {frame:?}"
+            );
+        }
+        // A reconnecting headset lost the frames sent into its old connection.
+        assert_eq!(host.keyframe_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn tunnel_peer_that_goes_silent_is_dropped_and_its_socket_closed() {
+        let host = TunnelHost::start(TunnelTiming {
+            heartbeat: Duration::from_millis(20),
+            idle_timeout: Duration::from_millis(200),
+        })
+        .await;
+        let (mut reader, mut writer) = host.connect().await;
+        send_frame(&mut writer, &input_keepalive()).await.unwrap();
+        // Then nothing more, as from a headset whose tunnel died without a FIN.
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            while recv_frame(&mut reader).await.is_ok() {}
+        })
+        .await;
+        assert!(closed.is_ok(), "the host kept a silent tunnel peer");
+        assert!(host.wait_until_peer_dropped(Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn tunnel_peer_that_keeps_sending_is_kept() {
+        let host = TunnelHost::start(TunnelTiming {
+            heartbeat: Duration::from_millis(20),
+            idle_timeout: Duration::from_millis(200),
+        })
+        .await;
+        let (mut reader, mut writer) = host.connect().await;
+        let deadline = Instant::now() + Duration::from_millis(800);
+        while Instant::now() < deadline {
+            send_frame(&mut writer, &input_keepalive()).await.unwrap();
+            // Drain heartbeats so the host's writes never stall.
+            while let Ok(Ok(_)) =
+                tokio::time::timeout(Duration::from_millis(1), recv_frame(&mut reader)).await
+            {
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(host
+            .link
+            .lock()
+            .status(Instant::now())
+            .peer
+            .is_some_and(|peer| peer.ip().is_loopback()));
+    }
+
+    #[tokio::test]
+    async fn tunnel_peer_that_stops_reading_is_dropped() {
+        let host = TunnelHost::start(TunnelTiming {
+            heartbeat: Duration::from_millis(20),
+            idle_timeout: Duration::from_millis(300),
+        })
+        .await;
+        let (reader, mut writer) = host.connect().await;
+        // The headset keeps sending keepalives but no longer reads, so video fills the
+        // socket buffers and the host's writes stall.
+        let keepalives = tokio::spawn(async move {
+            while send_frame(&mut writer, &input_keepalive()).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let chunk = vec![0u8; 256 * 1024];
+        let dropped = tokio::time::timeout(Duration::from_secs(10), async {
+            while host.link.lock().status(Instant::now()).peer.is_some() {
+                let _ = host.video.send(chunk.clone());
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(dropped.is_ok(), "the host kept a peer that stopped reading");
+        keepalives.abort();
+        drop(reader);
     }
 
     #[test]
