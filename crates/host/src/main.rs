@@ -440,7 +440,12 @@ async fn run_service_command(args: ServiceArgs) -> Result<(), String> {
 
 /// Resolves on SIGINT (Ctrl-C) or when the pre-registered SIGTERM stream fires.
 /// SIGTERM is what systemd sends on `systemctl --user stop`.
+#[cfg(test)]
 async fn wait_for_shutdown_signal(mut term: tokio::signal::unix::Signal) {
+    wait_for_shutdown_signal_ref(&mut term).await;
+}
+
+async fn wait_for_shutdown_signal_ref(term: &mut tokio::signal::unix::Signal) {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = term.recv() => {}
@@ -461,7 +466,7 @@ async fn start_stream_services(
     headset: Arc<HeadsetHub>,
 ) -> (Option<u16>, Option<u16>) {
     let mut input_port = None;
-    let mut control_port = None;
+    let control_port;
     let mut usb_packet_handler: Option<Arc<dyn Fn(linux_quest_protocol::Packet) + Send + Sync>> =
         None;
     let input_bind_addr =
@@ -576,10 +581,18 @@ async fn start_stream_services(
             });
         }
         Err(e) => {
-            tracing::warn!(
+            // 48444 carries the USB tunnel (video, input, settings) as well as LAN control, so a
+            // daemon without it cannot serve a USB headset. Exit so systemd can restart us.
+            tracing::error!(
                 error = %e,
-                "Failed to bind control channel on {control_bind_addr}; clipboard synchronization disabled"
+                "Failed to bind control channel on {control_bind_addr} after retrying; the USB \
+                 tunnel, settings and clipboard cannot work. Is another linux-quest-host running? Exiting."
             );
+            eprintln!(
+                "error: could not bind control port {control_bind_addr}: {e}. \
+                 Another linux-quest-host may be running."
+            );
+            std::process::exit(1);
         }
     }
 
@@ -690,7 +703,7 @@ fn start_adb_bridge(
 /// cannot block daemon exit.
 async fn finish_adb_bridge(handle: Option<tokio::task::JoinHandle<()>>) {
     if let Some(handle) = handle {
-        if tokio::time::timeout(Duration::from_secs(10), handle)
+        if tokio::time::timeout(Duration::from_secs(3), handle)
             .await
             .is_err()
         {
@@ -699,8 +712,38 @@ async fn finish_adb_bridge(handle: Option<tokio::task::JoinHandle<()>>) {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// How long the daemon may take to stop after SIGTERM/SIGINT before it exits anyway.
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
+/// How long runtime teardown waits for blocking threads (a clipboard tool, an encoder probe).
+const RUNTIME_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Exits the process if a clean stop has not finished within `deadline`. A stuck task or a
+/// blocking call must never leave the daemon needing `kill -9`.
+fn arm_shutdown_watchdog(deadline: Duration) {
+    std::thread::Builder::new()
+        .name("shutdown-watchdog".into())
+        .spawn(move || {
+            std::thread::sleep(deadline);
+            tracing::error!(
+                ?deadline,
+                "Daemon did not stop in time after a shutdown signal; exiting"
+            );
+            std::process::exit(1);
+        })
+        .ok();
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(async_main());
+    // Do not wait forever for blocking threads that are still inside a hung call.
+    runtime.shutdown_timeout(RUNTIME_TEARDOWN_TIMEOUT);
+    result
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
 
     let is_tui = cli.tui
@@ -835,9 +878,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let term_signal =
                     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
                 tokio::spawn(async move {
-                    wait_for_shutdown_signal(term_signal).await;
+                    let mut term_signal = term_signal;
+                    wait_for_shutdown_signal_ref(&mut term_signal).await;
                     info!("Shutdown signal received; stopping daemon...");
+                    arm_shutdown_watchdog(SHUTDOWN_DEADLINE);
                     let _ = shutdown_tx_clone.send(());
+                    // A second signal means "now".
+                    wait_for_shutdown_signal_ref(&mut term_signal).await;
+                    tracing::warn!("Second shutdown signal; exiting immediately");
+                    std::process::exit(1);
                 });
 
                 // Client keyframe requests: set by the input receiver, consumed by the video sender.
@@ -914,11 +963,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 // The IPC server may have ended on its own; make sure the bridge stops too.
                 let _ = shutdown_tx.send(());
                 finish_adb_bridge(adb_handle).await;
+                // Each stop step is bounded so one stuck component cannot hold up exit.
                 if let Some(advertiser) = advertiser {
-                    advertiser.stop().await;
+                    if tokio::time::timeout(Duration::from_secs(1), advertiser.stop())
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!("mDNS advertiser did not stop in time; leaving it");
+                    }
                 }
                 if let Some(video) = video {
-                    video.stop().await;
+                    if tokio::time::timeout(Duration::from_secs(1), video.stop())
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!("Video sender did not stop in time; leaving it");
+                    }
                 }
                 served?;
                 info!("Daemon stopped cleanly.");

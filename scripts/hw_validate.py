@@ -268,7 +268,7 @@ def main():
                "CPU is process CPU: 100% = one logical core; machine percent divides by logical CPU count.",
                "GPU utilization is for the entire NVIDIA device, including other applications.",
                "host_gpu is PID-filtered NVIDIA pmon telemetry; unavailable '-' values remain null.",
-               "HUD M2P is a software estimate, not optical latency. Surface releases are not photons.",
+               "HUD Est is a software estimate, not optical latency. Surface releases are not photons.",
                "Decoder drops omit packets lost before decoding; packet loss and compositor stale frames are separate.",
                "VrApi FPS/Stale come only from the client PID. Stale sum is a sum of periodic runtime reports.",
                "Raw evidence: samples.jsonl, logcat.txt, metadata.json, summary.json and optional host.log."]

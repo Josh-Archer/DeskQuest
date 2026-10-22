@@ -27,7 +27,7 @@ const GRAB_PX: f64 = 14.0;
 /// that crossed the edit does not make the screen jump back.
 const EDIT_SETTLE: Duration = Duration::from_millis(1500);
 /// Adwaita's blue, for the selected screen.
-const ACCENT: (f64, f64, f64) = (0.21, 0.52, 0.89);
+const ACCENT: (f64, f64, f64) = (0.0, 100.0 / 255.0, 237.0 / 255.0);
 
 const RESOLUTIONS: [(u32, u32); 3] = [(1920, 1080), (2560, 1440), (3840, 2160)];
 const MONITOR_RATES: [u32; 4] = [60, 72, 90, 120];

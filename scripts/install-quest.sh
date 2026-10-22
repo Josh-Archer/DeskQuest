@@ -22,6 +22,18 @@ if ! command -v adb >/dev/null 2>&1; then
     die "adb not found on PATH. Install Android platform-tools (e.g. 'sudo pacman -S android-tools' or 'sudo apt install adb')."
 fi
 
+# The installed app was signed with a different key (for example an APK built before the
+# per-user keystore, or on another machine). Android refuses to upgrade across signers.
+signature_hint() {
+    if grep -q 'INSTALL_FAILED_UPDATE_INCOMPATIBLE' <<<"${INSTALL_OUTPUT}"; then
+        echo "HINT: the installed com.linuxquest.client was signed with a different key." >&2
+        echo "HINT: uninstall it once (this clears its app data), then rerun this script:" >&2
+        echo "HINT:   adb uninstall com.linuxquest.client" >&2
+        echo "HINT: later builds reuse the per-user keystore (LINUX_QUEST_KEYSTORE, default" >&2
+        echo "HINT: \${XDG_DATA_HOME:-~/.local/share}/linux-quest/debug.keystore), so -r upgrades work." >&2
+    fi
+}
+
 APK="${1:-}"
 if [[ -z "${APK}" ]]; then
     RELEASE_APK="${APK_DIR}/linux-quest-release.apk"
@@ -76,12 +88,14 @@ echo "Installing ${APK} on device(s): $(printf '%s' "${READY_SERIALS}" | tr '\n'
 # trips 'unbound variable' under set -u on bash 3.2 and 4.3.
 INSTALL_OUTPUT="$(adb ${ADB_ARGS[@]+"${ADB_ARGS[@]}"} install -r "${APK}" 2>&1)" || {
     echo "${INSTALL_OUTPUT}" >&2
+    signature_hint
     die "adb install failed."
 }
 echo "${INSTALL_OUTPUT}"
 
 # Older adb builds can exit 0 while printing Failure; check the output too.
 if ! grep -q '^Success' <<<"${INSTALL_OUTPUT}"; then
+    signature_hint
     die "adb install did not report Success."
 fi
 

@@ -12,7 +12,9 @@ pub struct FramePacingMetrics {
     pub wait_frame_duration_us: u64,
     /// Time spent rendering and composing layers in microseconds.
     pub render_duration_us: u64,
-    /// Estimated motion-to-photon latency in microseconds.
+    /// Software estimate in microseconds: the refresh-rate frame budget plus render time.
+    /// Not a measurement and not glass-to-glass latency (no capture, encode, transport or
+    /// panel scanout).
     pub motion_to_photon_latency_us: u64,
     /// Predicted display presentation time.
     pub predicted_display_time: i64,

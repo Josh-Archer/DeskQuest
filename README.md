@@ -1,5 +1,9 @@
 # linux-quest
 
+<p align="center">
+  <img src="assets/branding/linux-quest-logo.png" alt="Linux Quest penguin wearing a blue VR visor" width="240" height="240">
+</p>
+
 **High-performance, ultra-low latency spatial multi-monitor desktop streamer from Linux (Ubuntu) to Meta Quest — written entirely in Rust.**
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20or%20Apache--2.0-blue.svg)](LICENSE)
@@ -273,3 +277,9 @@ Dual-licensed under either:
 * MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
 
 at your option.
+
+## Packages and publishing
+
+The desktop app and tray use the penguin logo and its blue/cyan palette.
+See [packaging and store preparation](docs/publishing.md) for Ubuntu desktop and
+host packages, ARC builds through Home, draft releases, and Meta/Ubuntu publishing.

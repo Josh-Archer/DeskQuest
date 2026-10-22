@@ -113,8 +113,8 @@ pub fn start_input_sender(
     let Some(sender_config) = input_sender_config(config) else {
         match config.transport_mode {
             TransportMode::AdbReverseTcp => tracing::info!(
-                "input sender not started: adb reverse carries TCP only, so no UDP input is sent \
-                 in USB mode"
+                "UDP input sender not started in USB mode: input goes over the USB TCP tunnel \
+                 instead (adb reverse carries TCP only)"
             ),
             TransportMode::Udp => tracing::warn!(
                 host = %config.host_addr,
@@ -681,6 +681,20 @@ pub fn android_main(app: AndroidApp) {
         config = autodiscover_config(config);
     }
 
+    // Settings and screen layout persist in the app's internal files directory. Without this
+    // every change was lost on restart (issue #114).
+    let storage = match crate::storage::ClientStorage::for_android(app.internal_data_path()) {
+        Ok(storage) => {
+            tracing::info!(dir = ?storage.dir(), "persisting settings and layout");
+            storage.configure(&mut config);
+            Some(storage)
+        }
+        Err(e) => {
+            tracing::warn!(error = ?e, "no storage for settings and layout; changes will not persist");
+            None
+        }
+    };
+
     // Settings channel to the host: it can read and change the layout and settings. Kept
     // across OpenXR session restarts.
     let host_link = match crate::host_control::HostLink::spawn(
@@ -1062,6 +1076,9 @@ pub fn android_main(app: AndroidApp) {
                     tracing::info!("{LOG_TAG}: window ready and resumed, creating OpenXR session");
                     match QuestClientRuntime::new(config.clone()) {
                         Ok(mut rt) => {
+                            if let Some(storage) = &storage {
+                                storage.attach(&mut rt);
+                            }
                             rt.set_device_name(device_name.clone());
                             if let Some(request) = keyframe_requester() {
                                 rt.set_keyframe_requester(request);

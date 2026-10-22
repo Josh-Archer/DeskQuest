@@ -107,6 +107,10 @@ pub fn activate(app: &adw::Application) {
         .build();
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&switcher));
+    let logo = gtk::Image::from_icon_name(crate::APP_ID);
+    logo.set_pixel_size(32);
+    logo.set_tooltip_text(Some("Linux Quest"));
+    header.pack_start(&logo);
     let choose = gtk::Button::builder()
         .label("Choose Screen…")
         .tooltip_text("Pick the screen or window the headset shows (GNOME asks you which)")
@@ -133,6 +137,7 @@ pub fn activate(app: &adw::Application) {
         .content(&toolbar)
         .build();
     window.set_size_request(720, 520);
+    window.add_css_class("linux-quest-window");
 
     if let Ok(page) = std::env::var("LINUX_QUEST_PAGE") {
         stack.set_visible_child_name(&page);

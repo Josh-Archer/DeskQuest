@@ -182,6 +182,59 @@ pub struct HeadsetSettings {
     pub passthrough: bool,
 }
 
+/// A change to some of the headset's settings: only the fields that are `Some` change, so
+/// changing one setting cannot reset another (such as the bitrate) to someone else's value.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct HeadsetSettingsPatch {
+    pub bitrate_mbps: Option<u32>,
+    pub adaptive_bitrate: Option<bool>,
+    pub codec: Option<HeadsetCodec>,
+    pub refresh_rate_hz: Option<f32>,
+    pub curve: Option<ScreenCurve>,
+    pub hud: Option<bool>,
+    pub passthrough: Option<bool>,
+}
+
+impl HeadsetSettingsPatch {
+    /// The fields of `to` that differ from `from`.
+    pub fn between(from: &HeadsetSettings, to: &HeadsetSettings) -> Self {
+        fn changed<T: PartialEq + Copy>(a: T, b: T) -> Option<T> {
+            (a != b).then_some(b)
+        }
+        Self {
+            bitrate_mbps: changed(from.bitrate_mbps, to.bitrate_mbps),
+            adaptive_bitrate: changed(from.adaptive_bitrate, to.adaptive_bitrate),
+            codec: changed(from.codec, to.codec),
+            refresh_rate_hz: changed(from.refresh_rate_hz, to.refresh_rate_hz),
+            curve: changed(from.curve, to.curve),
+            hud: changed(from.hud, to.hud),
+            passthrough: changed(from.passthrough, to.passthrough),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// True when the patch changes the bitrate or its mode.
+    pub fn touches_bitrate(&self) -> bool {
+        self.bitrate_mbps.is_some() || self.adaptive_bitrate.is_some()
+    }
+
+    /// `base` with this patch's fields applied; every other field keeps `base`'s value.
+    pub fn applied_to(&self, base: &HeadsetSettings) -> HeadsetSettings {
+        HeadsetSettings {
+            bitrate_mbps: self.bitrate_mbps.unwrap_or(base.bitrate_mbps),
+            adaptive_bitrate: self.adaptive_bitrate.unwrap_or(base.adaptive_bitrate),
+            codec: self.codec.unwrap_or(base.codec),
+            refresh_rate_hz: self.refresh_rate_hz.unwrap_or(base.refresh_rate_hz),
+            curve: self.curve.unwrap_or(base.curve),
+            hud: self.hud.unwrap_or(base.hud),
+            passthrough: self.passthrough.unwrap_or(base.passthrough),
+        }
+    }
+}
+
 /// Counters from the headset's own view of the stream, for the host's status pages.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct HeadsetStats {
@@ -226,6 +279,38 @@ impl HeadsetStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_patch_changes_only_the_fields_it_carries() {
+        let headset = HeadsetSettings {
+            bitrate_mbps: 80,
+            adaptive_bitrate: true,
+            codec: HeadsetCodec::Av1,
+            refresh_rate_hz: 90.0,
+            curve: ScreenCurve::Flat,
+            hud: true,
+            passthrough: false,
+        };
+        let patch = HeadsetSettingsPatch {
+            hud: Some(false),
+            ..Default::default()
+        };
+        let next = patch.applied_to(&headset);
+        assert_eq!(
+            next.bitrate_mbps, 80,
+            "bitrate must keep the headset's value"
+        );
+        assert_eq!(
+            next,
+            HeadsetSettings {
+                hud: false,
+                ..headset
+            }
+        );
+        assert!(!patch.touches_bitrate());
+        assert_eq!(HeadsetSettingsPatch::between(&headset, &next), patch);
+        assert!(HeadsetSettingsPatch::between(&headset, &headset).is_empty());
+    }
 
     fn close(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-4

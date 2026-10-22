@@ -7,6 +7,7 @@ Files for running `linux-quest-host` as a background service on Ubuntu / systemd
 | `systemd/linux-quest-host.service` | systemd **user** unit running `linux-quest-host daemon` |
 | `systemd/linux-quest-tray.service` | systemd **user** unit running `linux-quest-host tray` |
 | `desktop/org.linuxquest.Desktop.desktop` | Desktop entry for the `linux-quest` app |
+| `icons/hicolor/512x512/apps/org.linuxquest.Desktop.png` | Linux Quest app icon for launchers and docks |
 | `udev/99-uinput.rules` | Grants the `input` group access to `/dev/uinput` |
 | `modules-load/linux-quest.conf` | Loads the `uinput` module at boot |
 | `debian/postinst`, `debian/copyright` | Debian maintainer script (reloads udev) and copyright file, used by `cargo deb` |
@@ -14,6 +15,36 @@ Files for running `linux-quest-host` as a background service on Ubuntu / systemd
 | `flatpak/` | Flatpak manifest and vendored Cargo source manifest |
 
 The tray icon (`linux-quest-host tray`) is part of every build. See [Tray icon](#tray-icon) below.
+
+## Ubuntu desktop app and logo
+
+The GTK desktop app embeds the logo so its window and header show it even when run
+directly with `cargo run -p linux-quest-desktop`. To install the app, launcher and
+icon for your user:
+
+```bash
+sudo apt-get install libgtk-4-dev libadwaita-1-dev libglib2.0-dev-bin
+cargo install --locked --path crates/desktop --bin linux-quest --root ~/.local
+install -Dm644 packaging/desktop/org.linuxquest.Desktop.desktop \
+  ~/.local/share/applications/org.linuxquest.Desktop.desktop
+install -Dm644 packaging/icons/hicolor/512x512/apps/org.linuxquest.Desktop.png \
+  ~/.local/share/icons/hicolor/512x512/apps/org.linuxquest.Desktop.png
+gtk-update-icon-cache --force --ignore-theme-index ~/.local/share/icons/hicolor
+```
+
+Put `~/.local/bin` on your `PATH` if it is not already there, then open **Linux
+Quest** from the application launcher. The daemon packages below do not include
+the desktop app.
+
+The full-resolution transparent logo is in
+[`assets/branding/linux-quest-logo.png`](../assets/branding/linux-quest-logo.png).
+To regenerate the 512-pixel desktop icon without changing the master, run:
+
+```bash
+ffmpeg -v error -y -i assets/branding/linux-quest-logo.png \
+  -vf scale=512:512:flags=lanczos -frames:v 1 -update 1 \
+  packaging/icons/hicolor/512x512/apps/org.linuxquest.Desktop.png
+```
 
 ## 1. Install the binary
 
@@ -105,7 +136,7 @@ systemctl --user disable --now linux-quest-host
 
 ## Tray icon
 
-`linux-quest-host tray` puts a status icon in the system tray. The icon is green for USB, blue for Wi-Fi, grey when no headset is connected, and a hollow ring when the daemon is not running. Its menu has:
+`linux-quest-host tray` puts a status icon in the system tray. The penguin logo has a cyan badge for USB, blue for Wi-Fi, amber when no headset is connected, and a grey ring when the daemon is not running. Disconnected and offline logos are desaturated. Its menu has:
 
 - **Status**: the connection, and below it what is streaming and at what bitrate (or that it is paused), as disabled rows.
 - **Pause Streaming / Resume Streaming**: stops or restarts video to the headset. Capture keeps running, so resuming is immediate. Shown only by a daemon new enough to report it.
@@ -159,18 +190,18 @@ Install Rust and the native build prerequisites, then run:
 
 ```bash
 cargo install --locked cargo-deb
-cargo build --release --locked -p linux-quest-host --features mdns
+cargo build --release --locked -p linux-quest-host --features mdns,pipewire-capture
 cargo deb -p linux-quest-host --no-build
 ```
 
-The `.deb` is written under `target/debian/`. It installs the daemon, `/dev/uinput`
+The host `.deb` is written under `target/debian/`. It installs the daemon, `/dev/uinput`
 udev rule, boot-time module configuration, systemd user unit and licenses.
 
 ### RPM package
 
 ```bash
 cargo install --locked cargo-generate-rpm
-cargo build --release --locked -p linux-quest-host --features mdns
+cargo build --release --locked -p linux-quest-host --features mdns,pipewire-capture
 cargo generate-rpm -p crates/host
 ```
 
@@ -228,6 +259,14 @@ The APK is `crates/client/target/android-apk/linux-quest-release.apk`. It is
 debug-signed for sideload testing, not signed for store distribution. Install it
 on a connected Quest with `scripts/install-quest.sh` (or pass the APK path).
 
+The signing key is per user, not per checkout: the first build generates
+`${XDG_DATA_HOME:-~/.local/share}/linux-quest/debug.keystore` and every later
+build, from any checkout, reuses it, so `adb install -r` upgrades in place. Set
+`LINUX_QUEST_KEYSTORE=/path/to/debug.keystore` to use another one (for example
+to share one key across machines). Never commit it. The build also sets
+`CMAKE_POLICY_VERSION_MINIMUM=3.5` (as does `.cargo/config.toml`) so the bundled
+opus builds with CMake 4.x.
+
 ## Quest sideloading
 
 The `.deb` and `.rpm` run `udevadm control --reload` and `udevadm trigger` after
@@ -248,10 +287,15 @@ ANDROID_SERIAL=<serial> scripts/install-quest.sh   # pick one device when severa
 
 With no path argument, the script installs the newer of `linux-quest-release.apk` and `linux-quest-debug.apk` and warns when both exist. It needs `adb` on `PATH` and accepts the headset's "Allow USB debugging" prompt.
 
+If it fails with `INSTALL_FAILED_UPDATE_INCOMPATIBLE`, the installed app was signed
+with a different key (for example an APK from before the per-user keystore). Run
+`adb uninstall com.linuxquest.client` once (this clears the app's data) and install
+again; later upgrades keep working.
+
 ### Testing LAN discovery on a real Quest (no IP address)
 
 The host package recipes and Quest APK use the `mdns` feature. A source build needs
-it explicitly: `cargo build --release -p linux-quest-host --features mdns` and
+it explicitly: `cargo build --release -p linux-quest-host --features mdns,pipewire-capture` and
 `crates/client/android/build.sh` (which already passes `--features mdns`).
 
 1. Put the PC and the Quest on the same Wi-Fi network (same subnet; guest/isolated SSIDs and some mesh "AP isolation" settings block multicast). Allow UDP `5353` (mDNS), TCP `48444`, UDP `48442` and UDP `48440` through the PC firewall, for example `sudo ufw allow from 192.168.1.0/24`.
@@ -268,3 +312,14 @@ Troubleshooting:
 - With a USB tunnel up (`adb reverse tcp:48444 tcp:48444`), discovery is skipped and the cable is used.
 
 SSDP/UPnP is not implemented; mDNS is the only discovery protocol.
+
+## Complete Ubuntu app packages and release staging
+
+Use `scripts/ci/build-ubuntu-packages.sh` with the native dependencies in
+`packaging/ubuntu/Dockerfile` to build both the GUI and daemon packages. The GUI
+package includes the application launcher and penguin icon. For a user-local
+source install with a desktop shortcut, run `scripts/install-desktop.sh
+--desktop-shortcut --tray`. The tray starts automatically at your next login;
+Ubuntu needs its AppIndicators extension enabled to show it in the top bar. The app uses blue/cyan accents from the logo while retaining
+native light/dark mode. See [publishing.md](../docs/publishing.md) for ARC builds,
+draft releases and the remaining Meta/Ubuntu store requirements.

@@ -27,7 +27,33 @@ fn main() -> gtk::glib::ExitCode {
                 .add_directive(tracing::Level::INFO.into()),
         )
         .init();
+    gtk::gio::resources_register_include!("linux-quest.gresource")
+        .expect("could not register the desktop icon resource");
     let app = adw::Application::builder().application_id(APP_ID).build();
+    app.connect_startup(|_| {
+        gtk::Window::set_default_icon_name(APP_ID);
+        if let Some(display) = gtk::gdk::Display::default() {
+            gtk::IconTheme::for_display(&display)
+                .add_resource_path("/org/linuxquest/Desktop/icons");
+            let css = gtk::CssProvider::new();
+            css.load_from_resource("/org/linuxquest/Desktop/theme.css");
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &css,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+            // Newer Adwaita uses CSS variables; Ubuntu 24.04's GTK uses named colours.
+            if gtk::minor_version() >= 16 {
+                let css = gtk::CssProvider::new();
+                css.load_from_resource("/org/linuxquest/Desktop/theme-modern.css");
+                gtk::style_context_add_provider_for_display(
+                    &display,
+                    &css,
+                    gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+                );
+            }
+        }
+    });
     app.connect_activate(ui::activate);
     // The app takes no command-line options; GApplication would reject unknown ones.
     app.run_with_args::<&str>(&[])

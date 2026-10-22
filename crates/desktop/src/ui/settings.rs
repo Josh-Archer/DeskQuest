@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::glib;
-use linux_quest_protocol::{HeadsetCodec, HeadsetSettings, ScreenCurve};
+use linux_quest_protocol::{HeadsetCodec, HeadsetSettings, HeadsetSettingsPatch, ScreenCurve};
 
 use super::Shell;
 use crate::daemon::{self, Snapshot};
@@ -250,9 +250,13 @@ impl SettingsPage {
         let this = self.clone();
         glib::spawn_future_local(async move {
             let result = match reported {
-                Some(_) => daemon::spawn(daemon::set_settings(wanted))
-                    .await
-                    .map(|report| report.map(|r| r.status.settings)),
+                // Send only what the user changed, so one row cannot reset the others (the
+                // headset's bitrate in particular) to stale or host-side values.
+                Some(reported) => daemon::spawn(daemon::patch_settings(
+                    HeadsetSettingsPatch::between(&reported, &wanted),
+                ))
+                .await
+                .map(|report| report.map(|r| r.status.settings)),
                 // No headset: only the host's bitrate can change.
                 None => daemon::spawn(daemon::set_bitrate(
                     wanted.bitrate_mbps,

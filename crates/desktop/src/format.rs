@@ -69,9 +69,12 @@ pub fn latency(snapshot: Option<&DashboardSnapshot>) -> String {
     match (total, decode) {
         (0, 0) => "—".to_string(),
         (0, d) => format!("decode {:.1} ms", f64::from(d) / 1000.0),
-        (t, 0) => format!("{:.0} ms motion to photon", f64::from(t) / 1000.0),
+        (t, 0) => format!(
+            "{:.0} ms est. (software, not glass-to-glass)",
+            f64::from(t) / 1000.0
+        ),
         (t, d) => format!(
-            "{:.0} ms motion to photon, decode {:.1} ms",
+            "{:.0} ms est. (software, not glass-to-glass), decode {:.1} ms",
             f64::from(t) / 1000.0,
             f64::from(d) / 1000.0
         ),
@@ -174,7 +177,7 @@ mod tests {
         snap.video_latency.client_decode_duration_us = 2_500;
         assert_eq!(
             latency(Some(&snap)),
-            "31 ms motion to photon, decode 2.5 ms"
+            "31 ms est. (software, not glass-to-glass), decode 2.5 ms"
         );
         snap.client.packets_recv = 9_990;
         snap.client.packets_lost = 10;

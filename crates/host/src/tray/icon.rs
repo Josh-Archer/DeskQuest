@@ -1,145 +1,157 @@
-//! Tray icon pixels, generated in code so there are no image assets to ship.
-//!
-//! Each state is a round badge: a filled disk with a white centre dot when a
-//! headset is connected or the daemon is up, and a hollow ring when the daemon
-//! cannot be reached. Colour carries the transport: green for USB, blue for Wi-Fi,
-//! grey otherwise.
+//! The Linux Quest logo with a connection badge, embedded as small RGBA buffers.
+//! No image decoder, installed icon theme, or filesystem access is needed.
 
 use super::model::ConnectionState;
 
-/// Pixmap sizes offered to the tray host. Hosts pick whichever suits their panel.
 pub const ICON_SIZES: [u32; 2] = [22, 32];
+const LOGO_22: &[u8; 22 * 22 * 4] =
+    include_bytes!("../../../../packaging/icons/tray/linux-quest-22.rgba");
+const LOGO_32: &[u8; 32 * 32 * 4] =
+    include_bytes!("../../../../packaging/icons/tray/linux-quest-32.rgba");
 
-const GREY: [u8; 3] = [0x80, 0x80, 0x80];
-const GREEN: [u8; 3] = [0x2e, 0x9e, 0x4f];
-const BLUE: [u8; 3] = [0x2f, 0x7b, 0xd9];
+const BLUE: [u8; 3] = [0x00, 0x64, 0xed];
+const CYAN: [u8; 3] = [0x00, 0xd2, 0xf0];
+const AMBER: [u8; 3] = [0xff, 0xb2, 0x16];
+const GREY: [u8; 3] = [0x80, 0x8b, 0x9b];
+const NAVY: [u8; 3] = [0x0f, 0x18, 0x28];
 const WHITE: [u8; 3] = [0xff, 0xff, 0xff];
 
-fn disk_colour(state: ConnectionState) -> [u8; 3] {
-    match state {
-        ConnectionState::DaemonOffline | ConnectionState::Disconnected => GREY,
-        ConnectionState::Usb => GREEN,
-        ConnectionState::Wifi => BLUE,
+fn coverage(distance: f32, radius: f32) -> f32 {
+    (radius - distance + 0.5).clamp(0.0, 1.0)
+}
+
+/// Composites a straight-alpha colour over an SNI pixel (A, R, G, B).
+fn over(pixel: &mut [u8], colour: [u8; 3], alpha: f32) {
+    let background = f32::from(pixel[0]) / 255.0;
+    let combined = alpha + background * (1.0 - alpha);
+    if combined == 0.0 {
+        return;
     }
+    for (channel, foreground) in pixel[1..].iter_mut().zip(colour) {
+        *channel = ((f32::from(foreground) * alpha
+            + f32::from(*channel) * background * (1.0 - alpha))
+            / combined)
+            .round() as u8;
+    }
+    pixel[0] = (combined * 255.0).round() as u8;
 }
 
-/// Anti-aliased coverage of a disk of `radius` at distance `d` from its centre.
-fn coverage(d: f32, radius: f32) -> f32 {
-    (radius - d + 0.5).clamp(0.0, 1.0)
-}
-
-/// Renders `state` as a `size` x `size` ARGB32 image in SNI order (A, R, G, B per
-/// pixel, rows top to bottom), with non-premultiplied alpha.
+/// Renders the logo in non-premultiplied SNI ARGB32 order. The badge is cyan for
+/// USB, blue for Wi-Fi, amber when disconnected, and a grey ring when offline.
+/// Disconnected/offline logos are desaturated; menu text also names the state.
 pub fn render_argb(state: ConnectionState, size: u32) -> Vec<u8> {
-    let centre = size as f32 / 2.0;
-    let outer = centre - 1.0;
-    let dot = outer * 0.35;
-    let hole = outer * 0.6;
-    let disk = disk_colour(state);
-
+    let (source, source_size): (&[u8], u32) = if size == 22 {
+        (LOGO_22, 22)
+    } else {
+        (LOGO_32, 32)
+    };
+    let muted = matches!(
+        state,
+        ConnectionState::DaemonOffline | ConnectionState::Disconnected
+    );
+    let badge = match state {
+        ConnectionState::Usb => CYAN,
+        ConnectionState::Wifi => BLUE,
+        ConnectionState::Disconnected => AMBER,
+        ConnectionState::DaemonOffline => GREY,
+    };
+    let centre = size as f32 * 0.81;
+    let radius = size as f32 * 0.13;
     let mut out = Vec::with_capacity((size * size * 4) as usize);
     for y in 0..size {
         for x in 0..size {
-            let dx = x as f32 + 0.5 - centre;
-            let dy = y as f32 + 0.5 - centre;
-            let d = (dx * dx + dy * dy).sqrt();
-            let edge = coverage(d, outer);
-
-            let (alpha, rgb) = match state {
-                ConnectionState::DaemonOffline => {
-                    // Ring: outer disk minus the inner hole.
-                    let alpha = edge * (1.0 - coverage(d, hole));
-                    (alpha, disk)
-                }
-                _ => {
-                    let w = coverage(d, dot);
-                    let rgb = [
-                        mix(disk[0], WHITE[0], w),
-                        mix(disk[1], WHITE[1], w),
-                        mix(disk[2], WHITE[2], w),
-                    ];
-                    (edge, rgb)
-                }
-            };
-
-            out.extend_from_slice(&[to_byte(alpha), rgb[0], rgb[1], rgb[2]]);
+            let source_index =
+                ((y * source_size / size) * source_size + x * source_size / size) as usize * 4;
+            let rgba = &source[source_index..source_index + 4];
+            let mut pixel = [rgba[3], rgba[0], rgba[1], rgba[2]];
+            // Remove nearly transparent resampling specks outside the silhouette.
+            if pixel[0] < 8 {
+                pixel.fill(0);
+            }
+            if muted {
+                let grey =
+                    (u32::from(rgba[0]) * 54 + u32::from(rgba[1]) * 183 + u32::from(rgba[2]) * 19)
+                        / 256;
+                pixel[1..].fill(grey as u8);
+            }
+            let distance =
+                ((x as f32 + 0.5 - centre).powi(2) + (y as f32 + 0.5 - centre).powi(2)).sqrt();
+            over(&mut pixel, WHITE, coverage(distance, radius + 1.0));
+            over(&mut pixel, badge, coverage(distance, radius));
+            if state == ConnectionState::DaemonOffline {
+                over(&mut pixel, NAVY, coverage(distance, radius * 0.5));
+            }
+            out.extend_from_slice(&pixel);
         }
     }
     out
-}
-
-fn mix(a: u8, b: u8, t: f32) -> u8 {
-    (a as f32 + (b as f32 - a as f32) * t).round() as u8
-}
-
-fn to_byte(v: f32) -> u8 {
-    (v * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Returns (A, R, G, B) for pixel (x, y).
-    fn px(buf: &[u8], size: u32, x: u32, y: u32) -> (u8, u8, u8, u8) {
-        let i = ((y * size + x) * 4) as usize;
-        (buf[i], buf[i + 1], buf[i + 2], buf[i + 3])
-    }
+    const STATES: [ConnectionState; 4] = [
+        ConnectionState::DaemonOffline,
+        ConnectionState::Disconnected,
+        ConnectionState::Usb,
+        ConnectionState::Wifi,
+    ];
 
     #[test]
-    fn buffer_length_matches_size() {
+    fn pixmaps_have_sni_lengths_and_transparent_corners() {
         for size in ICON_SIZES {
-            let buf = render_argb(ConnectionState::Usb, size);
-            assert_eq!(buf.len(), (size * size * 4) as usize);
+            for state in STATES {
+                let pixels = render_argb(state, size);
+                assert_eq!(pixels.len(), (size * size * 4) as usize);
+                assert_eq!(pixels[0], 0);
+                assert_eq!(pixels[pixels.len() - 4], 0);
+            }
+        }
+        assert!(render_argb(ConnectionState::Wifi, 0).is_empty());
+    }
+
+    #[test]
+    fn logo_channels_are_converted_from_rgba_to_sni_argb() {
+        for size in ICON_SIZES {
+            let source: &[u8] = if size == 22 { LOGO_22 } else { LOGO_32 };
+            let offset = ((size / 2 * size + size / 2) * 4) as usize;
+            let rgba = &source[offset..offset + 4];
+            let pixels = render_argb(ConnectionState::Wifi, size);
+            assert_eq!(
+                pixels[offset..offset + 4],
+                [rgba[3], rgba[0], rgba[1], rgba[2]]
+            );
+            assert!(rgba[2] > rgba[0], "the blue visor must survive conversion");
         }
     }
 
     #[test]
-    fn corners_are_transparent_for_every_state() {
-        let size = 22;
-        for state in [
-            ConnectionState::DaemonOffline,
-            ConnectionState::Disconnected,
-            ConnectionState::Usb,
-            ConnectionState::Wifi,
-        ] {
-            let buf = render_argb(state, size);
-            assert_eq!(px(&buf, size, 0, 0).0, 0);
-            assert_eq!(px(&buf, size, size - 1, size - 1).0, 0);
+    fn transport_badges_match_the_palette_and_offline_is_a_ring() {
+        for size in ICON_SIZES {
+            let centre = (size as f32 * 0.81) as u32;
+            let offset = ((centre * size + centre) * 4) as usize;
+            for (state, colour) in [
+                (ConnectionState::Usb, CYAN),
+                (ConnectionState::Wifi, BLUE),
+                (ConnectionState::Disconnected, AMBER),
+                (ConnectionState::DaemonOffline, NAVY),
+            ] {
+                let pixels = render_argb(state, size);
+                assert_eq!(
+                    pixels[offset..offset + 4],
+                    [255, colour[0], colour[1], colour[2]]
+                );
+            }
         }
     }
 
     #[test]
-    fn connected_badges_have_white_centre_and_coloured_ring() {
-        let size = 22;
-        let c = size / 2;
-        // Ring sample: 80% of the way out, clear of the centre dot.
-        let ring_x = c + 8;
-        let usb = render_argb(ConnectionState::Usb, size);
-        assert_eq!(px(&usb, size, c, c), (255, 255, 255, 255));
-        let (a, r, g, b) = px(&usb, size, ring_x, c);
-        assert_eq!(a, 255);
-        assert!(g > r && g > b, "USB ring should be green, got {r},{g},{b}");
-
-        let wifi = render_argb(ConnectionState::Wifi, size);
-        let (a, r, g, b) = px(&wifi, size, ring_x, c);
-        assert_eq!(a, 255);
-        assert!(b > r && b > g, "Wi-Fi ring should be blue, got {r},{g},{b}");
-    }
-
-    #[test]
-    fn offline_is_hollow_ring() {
-        let size = 22;
-        let c = size / 2;
-        let offline = render_argb(ConnectionState::DaemonOffline, size);
-        assert_eq!(px(&offline, size, c, c).0, 0, "centre should be a hole");
-        assert_eq!(px(&offline, size, c + 8, c).0, 255, "ring should be opaque");
-    }
-
-    #[test]
-    fn sizes_are_deterministic() {
-        let a = render_argb(ConnectionState::Wifi, 32);
-        let b = render_argb(ConnectionState::Wifi, 32);
-        assert_eq!(a, b);
+    fn every_connection_state_has_a_distinct_icon() {
+        for (index, first) in STATES.iter().enumerate() {
+            for second in &STATES[index + 1..] {
+                assert_ne!(render_argb(*first, 32), render_argb(*second, 32));
+            }
+        }
     }
 }
