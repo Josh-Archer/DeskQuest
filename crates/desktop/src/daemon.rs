@@ -12,7 +12,7 @@ use linux_quest_host::tui::model::DashboardSnapshot;
 use linux_quest_host::{
     send_daemon_request, DaemonRequest, DaemonResponse, DaemonStatus, HeadsetReport,
 };
-use linux_quest_protocol::{HeadsetSettings, ScreenPlacement};
+use linux_quest_protocol::{HeadsetSettingsPatch, ScreenPlacement};
 
 /// Longest an ordinary request may take.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -188,11 +188,13 @@ pub async fn set_layout(
     headset_answer(request(DaemonRequest::SetHeadsetLayout { screens }, REQUEST_TIMEOUT).await?)
 }
 
-/// Changes the headset's settings; answers with what it applied.
-pub async fn set_settings(settings: HeadsetSettings) -> Result<Option<HeadsetReport>, DaemonError> {
+/// Changes only the settings `patch` carries; answers with what the headset applied.
+pub async fn patch_settings(
+    patch: HeadsetSettingsPatch,
+) -> Result<Option<HeadsetReport>, DaemonError> {
     headset_answer(
         request(
-            DaemonRequest::SetHeadsetSettings { settings },
+            DaemonRequest::PatchHeadsetSettings { patch },
             REQUEST_TIMEOUT,
         )
         .await?,

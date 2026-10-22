@@ -19,6 +19,7 @@ pub mod receiver;
 pub mod runtime;
 pub mod settings;
 pub mod spatial;
+pub mod storage;
 pub mod streams;
 
 #[cfg(target_os = "android")]
