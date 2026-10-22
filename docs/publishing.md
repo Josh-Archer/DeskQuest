@@ -12,7 +12,7 @@ would require a separate supported client and Apple build/signing pipeline.
   are test builds, not public store releases.
 - [Home's Linux Quest packages (UECB)](https://github.com/Josh-Archer/home/actions/workflows/linux-quest-packages.yml):
   manually builds an immutable Linux Quest mainline commit on a Docker-capable
-  UECB VM, inside Ubuntu 24.04. It exports desktop/daemon `.deb` packages, a daemon
+  UECB worker, inside Ubuntu 24.04. It exports desktop/daemon `.deb` packages, a daemon
   `.rpm`, `SOURCE_COMMIT` and `SHA256SUMS`. Home verifies mainline ancestry before
   allocation and finalizes the allocation after the job.
 - `Stage draft release`: manually takes a successful mainline Packaging run ID
