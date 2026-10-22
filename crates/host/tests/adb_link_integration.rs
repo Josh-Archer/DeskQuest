@@ -83,7 +83,16 @@ async fn loopback_control_connection_is_usb_only_while_tunnel_is_up() {
         link.lock().status(std::time::Instant::now()).transport,
         Some(LinkTransport::UsbAdb)
     );
-    assert_eq!(runner.get_rules("QUEST3_ABC").len(), 1);
+    let ports: Vec<u16> = runner
+        .get_rules("QUEST3_ABC")
+        .iter()
+        .map(|r| r.remote_port)
+        .collect();
+    assert!(ports.contains(&48444), "{ports:?}");
+    assert!(
+        ports.contains(&linux_quest_transport::SETTINGS_TUNNEL_PORT),
+        "the settings channel's own tunnel: {ports:?}"
+    );
 
     // Cable pulled: tunnel down, connection no longer reported.
     runner.remove_device("QUEST3_ABC");

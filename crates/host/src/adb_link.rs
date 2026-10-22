@@ -34,6 +34,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::link_status::SharedLinkTracker;
+use linux_quest_transport::SETTINGS_TUNNEL_PORT;
 
 /// Upper bound for removing the reverse mapping during shutdown.
 pub const REMOVE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -270,7 +271,17 @@ impl<R: AdbCommandRunner + Clone> Supervisor<R> {
         }
 
         match self.bridge.poll_step().await {
-            Ok(Some(evt)) => self.handle_event(evt),
+            Ok(Some(evt)) => {
+                let up = match &evt {
+                    AdbBridgeEvent::ReversePortEstablished { serial, .. }
+                    | AdbBridgeEvent::ReconnectionSuccessful { serial } => Some(serial.clone()),
+                    _ => None,
+                };
+                self.handle_event(evt);
+                if let Some(serial) = up {
+                    self.add_settings_tunnel(&serial).await;
+                }
+            }
             Ok(None) => {}
             Err(e) => {
                 self.report(Problem::from_error(&e));
@@ -310,6 +321,27 @@ impl<R: AdbCommandRunner + Clone> Supervisor<R> {
         }
     }
 
+    /// Adds the settings channel's own tunnel (device `SETTINGS_TUNNEL_PORT` to the host
+    /// control port) next to the main one. Best effort: without it the headset's settings
+    /// channel needs the LAN.
+    async fn add_settings_tunnel(&mut self, serial: &str) {
+        let control = self.config.bridge.local_port;
+        match self
+            .runner
+            .reverse(Some(serial), SETTINGS_TUNNEL_PORT, control)
+            .await
+        {
+            Ok(()) => info!(
+                "ADB reverse for the settings channel up for {serial}: device \
+                 tcp:{SETTINGS_TUNNEL_PORT} -> host tcp:{control}"
+            ),
+            Err(e) => warn!(
+                "`adb reverse tcp:{SETTINGS_TUNNEL_PORT} tcp:{control}` failed for {serial}: {e}. \
+                 The headset's settings channel then needs the LAN"
+            ),
+        }
+    }
+
     /// Best-effort removal of the reverse mapping, then marks the tunnel down.
     async fn shutdown(&mut self) {
         let serial = match self.bridge.state() {
@@ -318,16 +350,19 @@ impl<R: AdbCommandRunner + Clone> Supervisor<R> {
             AdbBridgeState::Idle => None,
         };
         if let Some(serial) = serial {
-            let port = self.port();
-            match tokio::time::timeout(
-                REMOVE_TIMEOUT,
-                self.runner.reverse_remove(Some(&serial), port),
-            )
-            .await
-            {
-                Ok(Ok(())) => info!("Removed ADB reverse tcp:{port} for {serial}"),
-                Ok(Err(e)) => warn!("Could not remove ADB reverse tcp:{port} for {serial}: {e}"),
-                Err(_) => warn!("Timed out removing ADB reverse tcp:{port} for {serial}"),
+            for port in [self.port(), SETTINGS_TUNNEL_PORT] {
+                match tokio::time::timeout(
+                    REMOVE_TIMEOUT,
+                    self.runner.reverse_remove(Some(&serial), port),
+                )
+                .await
+                {
+                    Ok(Ok(())) => info!("Removed ADB reverse tcp:{port} for {serial}"),
+                    Ok(Err(e)) => {
+                        warn!("Could not remove ADB reverse tcp:{port} for {serial}: {e}")
+                    }
+                    Err(_) => warn!("Timed out removing ADB reverse tcp:{port} for {serial}"),
+                }
             }
             self.link
                 .lock()
@@ -437,6 +472,15 @@ mod tests {
         task: JoinHandle<()>,
     }
 
+    /// Reverse rules for the control port itself (the settings tunnel is counted apart).
+    fn control_rules(runner: &MockAdbRunner, serial: &str) -> usize {
+        runner
+            .get_rules(serial)
+            .iter()
+            .filter(|r| r.remote_port == 48444)
+            .count()
+    }
+
     fn start() -> Harness {
         let runner = MockAdbRunner::new();
         let link = new_shared_link_tracker(Duration::from_secs(5));
@@ -465,8 +509,17 @@ mod tests {
 
         h.runner.add_device(quest("Q1"));
         settle().await;
-        assert_eq!(h.runner.get_rules("Q1").len(), 1);
-        assert_eq!(h.runner.get_rules("Q1")[0].remote_port, 48444);
+        let rules = h.runner.get_rules("Q1");
+        let mut ports: Vec<(u16, u16)> = rules
+            .iter()
+            .map(|r| (r.remote_port, r.local_port))
+            .collect();
+        ports.sort_unstable();
+        assert_eq!(
+            ports,
+            vec![(48444, 48444), (SETTINGS_TUNNEL_PORT, 48444)],
+            "the control port, and the settings channel's own tunnel to it"
+        );
         assert!(usb_up(&h.link));
 
         h.runner.remove_device("Q1");
@@ -491,7 +544,14 @@ mod tests {
         h.runner.add_device(quest("Q1"));
         settle().await;
         assert!(usb_up(&h.link));
-        assert_eq!(h.runner.get_rules("Q1").len(), 1);
+        assert_eq!(control_rules(&h.runner, "Q1"), 1);
+        assert!(
+            h.runner
+                .get_rules("Q1")
+                .iter()
+                .any(|r| r.remote_port == SETTINGS_TUNNEL_PORT && r.local_port == 48444),
+            "the settings tunnel comes back with the control tunnel"
+        );
 
         let _ = h.tx.send(());
         h.task.await.unwrap();
@@ -508,7 +568,7 @@ mod tests {
         assert!(!usb_up(&h.link));
         h.runner.add_device(quest("Q2"));
         settle().await;
-        assert_eq!(h.runner.get_rules("Q2").len(), 1);
+        assert_eq!(control_rules(&h.runner, "Q2"), 1);
         assert!(usb_up(&h.link));
 
         let _ = h.tx.send(());
@@ -564,7 +624,7 @@ mod tests {
         h.runner
             .set_hardware_serial("2G0YC1ZF9H039X", "2G0YC1ZF9H039X");
         settle().await;
-        assert_eq!(h.runner.get_rules("2G0YC1ZF9H039X").len(), 1);
+        assert_eq!(control_rules(&h.runner, "2G0YC1ZF9H039X"), 1);
         assert!(h.runner.get_rules("192.168.1.50:5555").is_empty());
         assert!(usb_up(&h.link));
 
@@ -580,12 +640,12 @@ mod tests {
         h.runner.set_hardware_serial("192.168.1.50:5555", "HW1");
         h.runner.set_hardware_serial("USB1", "HW1");
         settle().await;
-        assert_eq!(h.runner.get_rules("USB1").len(), 1);
+        assert_eq!(control_rules(&h.runner, "USB1"), 1);
 
         h.runner.remove_device("USB1");
         tokio::time::sleep(Duration::from_secs(30)).await;
         settle().await;
-        assert_eq!(h.runner.get_rules("192.168.1.50:5555").len(), 1);
+        assert_eq!(control_rules(&h.runner, "192.168.1.50:5555"), 1);
 
         let _ = h.tx.send(());
         h.task.await.unwrap();
@@ -651,7 +711,7 @@ mod tests {
         let task = spawn_adb_supervisor(Arc::new(runner.clone()), cfg, link.clone(), rx);
         settle().await;
         assert!(runner.get_rules("Q1").is_empty());
-        assert_eq!(runner.get_rules("Q2").len(), 1);
+        assert_eq!(control_rules(&runner, "Q2"), 1);
         let _ = tx.send(());
         task.await.unwrap();
     }
@@ -675,7 +735,7 @@ mod tests {
         let h = start();
         h.runner.add_device(quest("Q1"));
         settle().await;
-        assert_eq!(h.runner.get_rules("Q1").len(), 1);
+        assert_eq!(control_rules(&h.runner, "Q1"), 1);
         assert!(usb_up(&h.link));
 
         let _ = h.tx.send(());

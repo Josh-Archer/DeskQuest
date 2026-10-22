@@ -265,6 +265,16 @@ impl SettingsPanel {
         actions
     }
 
+    /// Replaces the settings, for example with ones the host sent. They are sanitized, and
+    /// marked for saving when they differ.
+    pub fn replace_settings(&mut self, settings: ClientSettings) {
+        let settings = settings.sanitized();
+        if settings != self.settings {
+            self.settings = settings;
+            self.dirty = true;
+        }
+    }
+
     /// Reflects a HUD toggle made by the controller shortcut so the panel stays in sync.
     pub fn sync_hud(&mut self, enabled: bool) {
         if self.settings.hud_enabled != enabled {

@@ -1,19 +1,28 @@
 //! Wayland clipboard backend shelling out to `wl-copy` and `wl-paste`.
 
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use crate::clipboard::backend::ClipboardBackend;
 use crate::clipboard::cmd::{ClipboardCommandRunner, SystemCommandRunner};
 use crate::error::InputError;
 
+/// After `wl-paste` times out, the clipboard is not read again for this long. On GNOME it
+/// waits for keyboard focus it never gets, so every poll would otherwise cost the timeout.
+pub const UNRESPONSIVE_BACKOFF: Duration = Duration::from_secs(60);
+
 /// Wayland clipboard backend using `wl-clipboard` utilities.
 pub struct WaylandClipboardBackend<R: ClipboardCommandRunner = SystemCommandRunner> {
     runner: R,
+    /// `wl-paste` timed out; reads fail fast until then.
+    unresponsive_until: Mutex<Option<Instant>>,
+    /// The timeout was logged (once per process run).
+    warned: std::sync::atomic::AtomicBool,
 }
 
 impl WaylandClipboardBackend<SystemCommandRunner> {
     pub fn new() -> Self {
-        Self {
-            runner: SystemCommandRunner::new(),
-        }
+        Self::with_runner(SystemCommandRunner::new())
     }
 }
 
@@ -25,16 +34,48 @@ impl Default for WaylandClipboardBackend<SystemCommandRunner> {
 
 impl<R: ClipboardCommandRunner> WaylandClipboardBackend<R> {
     pub fn with_runner(runner: R) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            unresponsive_until: Mutex::new(None),
+            warned: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 }
 
 impl<R: ClipboardCommandRunner> ClipboardBackend for WaylandClipboardBackend<R> {
     fn get_text(&self) -> Result<String, InputError> {
-        let output = self
-            .runner
-            .run_command("wl-paste", &["--no-newline"], None)
-            .map_err(|e| InputError::ClipboardError(format!("Failed to execute wl-paste: {e}")))?;
+        let resting = self
+            .unresponsive_until
+            .lock()
+            .ok()
+            .and_then(|until| *until)
+            .is_some_and(|until| Instant::now() < until);
+        if resting {
+            return Err(InputError::ClipboardError(
+                "wl-paste did not answer recently; not reading the clipboard for now".into(),
+            ));
+        }
+        let output = match self.runner.run_command("wl-paste", &["--no-newline"], None) {
+            Ok(output) => output,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                if let Ok(mut until) = self.unresponsive_until.lock() {
+                    *until = Some(Instant::now() + UNRESPONSIVE_BACKOFF);
+                }
+                if !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        "wl-paste does not answer (the compositor gives it no clipboard access \
+                         without focus, as GNOME does); reading the clipboard is retried once a \
+                         minute"
+                    );
+                }
+                return Err(InputError::ClipboardError(format!("wl-paste: {e}")));
+            }
+            Err(e) => {
+                return Err(InputError::ClipboardError(format!(
+                    "Failed to execute wl-paste: {e}"
+                )))
+            }
+        };
 
         if output.status_code != 0 {
             let stderr_str = String::from_utf8_lossy(&output.stderr);
@@ -119,6 +160,37 @@ mod tests {
         let backend = WaylandClipboardBackend::with_runner(runner);
         let text = backend.get_text().unwrap();
         assert_eq!(text, "");
+    }
+
+    /// Times out every call, counting them.
+    struct HangingRunner(std::sync::atomic::AtomicU32);
+
+    impl ClipboardCommandRunner for HangingRunner {
+        fn run_command(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _input: Option<&[u8]>,
+        ) -> Result<CommandOutput, std::io::Error> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "hung"))
+        }
+        fn is_program_available(&self, _program: &str) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_hanging_wl_paste_is_not_run_again_until_the_backoff_ends() {
+        let backend = WaylandClipboardBackend::with_runner(HangingRunner(Default::default()));
+        assert!(backend.get_text().is_err());
+        assert!(backend.get_text().is_err());
+        assert!(backend.get_text().is_err());
+        assert_eq!(
+            backend.runner.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "later reads fail fast without running it"
+        );
     }
 
     #[test]

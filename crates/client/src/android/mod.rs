@@ -681,6 +681,20 @@ pub fn android_main(app: AndroidApp) {
         config = autodiscover_config(config);
     }
 
+    // Settings channel to the host: it can read and change the layout and settings. Kept
+    // across OpenXR session restarts.
+    let host_link = match crate::host_control::HostLink::spawn(
+        crate::host_control::LinkConfig::new(crate::host_control::control_candidates(&config)),
+    ) {
+        Ok(link) => Some(link),
+        Err(e) => {
+            tracing::warn!(error = ?e, "could not start the host settings channel");
+            None
+        }
+    };
+    let device_name = system_property("ro.product.model").unwrap_or_else(|| "Meta Quest".into());
+    let mut next_host_status = std::time::Instant::now();
+
     // Background transport packet receiver (bounded channel: 512 packets, drops on overflow)
     let (packet_tx, packet_rx) =
         std::sync::mpsc::sync_channel::<linux_quest_protocol::packet::Packet>(PACKET_CHANNEL_DEPTH);
@@ -1029,6 +1043,18 @@ pub fn android_main(app: AndroidApp) {
             }
         }
 
+        // Layout and settings from the host, and the status it is told in return.
+        if let (Some(link), Some(rt)) = (&host_link, runtime.as_mut()) {
+            while let Some(command) = link.try_command() {
+                rt.apply_host_command(command);
+            }
+            let now = std::time::Instant::now();
+            if link.is_connected() && (rt.take_host_status_dirty() || now >= next_host_status) {
+                link.publish(rt.headset_status());
+                next_host_status = now + crate::host_control::STATUS_INTERVAL;
+            }
+        }
+
         match lifecycle.decide_next_action() {
             NextAction::Wait => {}
             NextAction::CreateSession => {
@@ -1036,6 +1062,7 @@ pub fn android_main(app: AndroidApp) {
                     tracing::info!("{LOG_TAG}: window ready and resumed, creating OpenXR session");
                     match QuestClientRuntime::new(config.clone()) {
                         Ok(mut rt) => {
+                            rt.set_device_name(device_name.clone());
                             if let Some(request) = keyframe_requester() {
                                 rt.set_keyframe_requester(request);
                             }
@@ -1126,6 +1153,9 @@ pub fn android_main(app: AndroidApp) {
 
     running_flag.store(false, std::sync::atomic::Ordering::Relaxed);
     let _ = receiver_handle.join();
+    if let Some(link) = host_link {
+        link.stop();
+    }
     if let Some(sender) = input_sender {
         sender.stop();
     }

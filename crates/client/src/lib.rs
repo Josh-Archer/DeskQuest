@@ -10,6 +10,7 @@ pub mod decoder;
 pub mod discovery;
 pub mod error;
 pub mod graphics;
+pub mod host_control;
 pub mod hud;
 pub mod input;
 pub mod input_sender;

@@ -136,7 +136,8 @@ impl LinkTracker {
     /// Derives the link status at `now`.
     ///
     /// The peer is the newest open control connection. If there is none, the input peer is
-    /// used while its packets are within the liveness timeout. A peer only counts as connected
+    /// used while its packets are within the liveness timeout. A control connection through
+    /// the USB tunnel gives way to live input from the network. A peer only counts as connected
     /// when it can be classified: loopback needs an established ADB reverse tunnel (USB), and
     /// any other address is Wi-Fi.
     pub fn status(&self, now: Instant) -> LinkStatus {
@@ -144,10 +145,20 @@ impl LinkTracker {
             .input_last_seen
             .is_some_and(|seen| now.saturating_duration_since(seen) < self.liveness);
 
+        let live_input = self.input_peer.filter(|_| input_alive);
         let peer = match self.control_peers.last() {
+            // The headset streams over the network (live UDP input from a LAN address) and only
+            // its control connection comes through the USB tunnel, for example because a
+            // firewall blocks TCP on the LAN. Video goes where the input comes from, so the
+            // network peer is the link.
+            Some(control)
+                if is_loopback(control.ip())
+                    && live_input.is_some_and(|input| !is_loopback(input.ip())) =>
+            {
+                live_input
+            }
             Some(peer) => Some(*peer),
-            None if input_alive => self.input_peer,
-            None => None,
+            None => live_input,
         };
 
         let transport = peer.and_then(|p| classify(p, self.adb_reverse_established));
@@ -423,6 +434,30 @@ mod tests {
         let later = now + Duration::from_secs(6);
         t.input_packet(addr("192.168.1.31:40000"), later);
         assert_eq!(t.video_peer(later), Some("192.168.1.31".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_control_connection_over_the_tunnel_does_not_take_video_off_the_network() {
+        // UDP mode with the control channel over `adb reverse` (TCP blocked on the LAN).
+        let now = Instant::now();
+        let mut t = usb_tracker(now);
+        t.input_packet(addr("192.168.1.20:48442"), now);
+        let status = t.status(now);
+        assert_eq!(status.transport, Some(LinkTransport::Wifi));
+        assert_eq!(status.peer, Some(addr("192.168.1.20:48442")));
+        assert_eq!(t.video_peer(now), Some("192.168.1.20".parse().unwrap()));
+
+        // Once the input goes quiet only the cable is left: USB, and the stale link sends no
+        // video either way.
+        let later = now + LIVENESS;
+        assert_eq!(t.status(later).transport, Some(LinkTransport::UsbAdb));
+        assert_eq!(t.video_peer(later), None);
+
+        // A LAN control connection is still the link, as before.
+        let mut lan = LinkTracker::new(LIVENESS);
+        lan.control_accepted(addr("192.168.1.21:50000"), now);
+        lan.input_packet(addr("192.168.1.20:48442"), now);
+        assert_eq!(lan.status(now).peer, Some(addr("192.168.1.21:50000")));
     }
 
     #[test]

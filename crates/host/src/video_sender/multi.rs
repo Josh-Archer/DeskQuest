@@ -10,7 +10,7 @@
 //! * the destination, the headset's UDP port (48440 by default). Streams are told apart by
 //!   `PacketHeader::stream_id`, which equals the display id; stream 0 is the primary capture.
 //!
-//! Stream 0 is started by the unchanged single-stream path ([`start_daemon_video_sender`]).
+//! Stream 0 is started by the unchanged single-stream path ([`start_daemon_video_sender`](super::daemon::start_daemon_video_sender)).
 //! Streams 1.. are synthetic test patterns for now, one tint per display, until virtual
 //! monitors provide real captures for them.
 
@@ -21,8 +21,9 @@ use std::sync::Arc;
 use linux_quest_capture::SyntheticCapture;
 use tracing::{info, warn};
 
+use super::control::{PausablePeers, VideoControl};
 use super::daemon::{
-    open_planned_encoder, start_daemon_video_sender, CaptureFrameSource, DaemonVideoOptions,
+    open_planned_encoder, start_daemon_video_sender_with, CaptureFrameSource, DaemonVideoOptions,
 };
 use super::{
     spawn_video_sender, Dscp, HybridSink, KeyframeRequests, VideoSenderConfig, VideoSenderHandle,
@@ -180,7 +181,7 @@ impl MultiVideoSenderHandle {
 }
 
 /// Starts the daemon's video streams: stream 0 exactly as a single-stream daemon does
-/// ([`start_daemon_video_sender`]), then `options.streams - 1` synthetic test-pattern streams.
+/// ([`start_daemon_video_sender`](super::daemon::start_daemon_video_sender)), then `options.streams - 1` synthetic test-pattern streams.
 ///
 /// Returns `Err(reason)` only when stream 0 cannot start, as the single-stream path does. An
 /// extra stream that cannot start (for example the GPU is out of encoder sessions) is logged and
@@ -192,18 +193,40 @@ pub async fn start_daemon_video_senders(
     rate: Option<Arc<RateCoordinator>>,
     tunnel_video: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
 ) -> Result<MultiVideoSenderHandle, String> {
+    start_daemon_video_senders_with(
+        link,
+        options,
+        keyframe_requests,
+        rate,
+        tunnel_video,
+        VideoControl::new(),
+    )
+    .await
+}
+
+/// [`start_daemon_video_senders`] with a [`VideoControl`] that pauses and resumes every stream
+/// and lets the user pick what stream 0 shows.
+pub async fn start_daemon_video_senders_with(
+    link: SharedLinkTracker,
+    options: MultiStreamOptions,
+    keyframe_requests: Arc<KeyframeRequests>,
+    rate: Option<Arc<RateCoordinator>>,
+    tunnel_video: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
+    control: Arc<VideoControl>,
+) -> Result<MultiVideoSenderHandle, String> {
     if !(1..=MAX_VIDEO_STREAMS).contains(&options.streams) {
         return Err(format!(
             "{} video streams requested; the daemon sends 1 to {MAX_VIDEO_STREAMS}",
             options.streams
         ));
     }
-    let primary = start_daemon_video_sender(
+    let primary = start_daemon_video_sender_with(
         link.clone(),
         options.video,
         keyframe_requests.clone(),
         rate.clone(),
         tunnel_video.clone(),
+        control.clone(),
     )
     .await?;
     let mut streams = vec![(0, primary)];
@@ -217,6 +240,7 @@ pub async fn start_daemon_video_senders(
             keyframe_requests.clone(),
             rate.as_ref().map(|r| r.register_stream(stream_id)),
             tunnel_video.clone(),
+            control.clone(),
         )
         .await
         {
@@ -226,6 +250,7 @@ pub async fn start_daemon_video_senders(
             ),
         }
     }
+    control.set_running(streams.len() as u16, control.capture_kind());
     if options.streams > 1 {
         info!(
             requested = options.streams,
@@ -239,6 +264,7 @@ pub async fn start_daemon_video_senders(
 
 /// One extra stream: a synthetic test pattern tinted for display `stream_id`, its own encoder
 /// session and its own socket.
+#[allow(clippy::too_many_arguments)] // the stream's capture, encoder, link, rate, tunnel and control
 async fn start_synthetic_stream(
     link: SharedLinkTracker,
     options: &DaemonVideoOptions,
@@ -247,6 +273,7 @@ async fn start_synthetic_stream(
     keyframe_requests: Arc<KeyframeRequests>,
     rate: Option<Arc<StreamRate>>,
     tunnel_video: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
+    control: Arc<VideoControl>,
 ) -> Result<VideoSenderHandle, String> {
     let capture = SyntheticCapture::new(stream_id, size.width, size.height, size.fps);
     let source = CaptureFrameSource::open(capture, true)
@@ -256,7 +283,7 @@ async fn start_synthetic_stream(
         || options.bitrate_mbps.saturating_mul(1000),
         |r| r.target_kbps(),
     );
-    let (encoder, plan) = open_planned_encoder(
+    let (encoder, plan, _) = open_planned_encoder(
         options.encoder,
         bitrate_kbps,
         (size.width, size.height, size.fps),
@@ -282,7 +309,11 @@ async fn start_synthetic_stream(
         rate,
         ..VideoSenderConfig::default()
     };
-    Ok(spawn_video_sender(source, encoder, sink, link, config))
+    let peers = PausablePeers {
+        peers: link,
+        control,
+    };
+    Ok(spawn_video_sender(source, encoder, sink, peers, config))
 }
 
 #[cfg(test)]

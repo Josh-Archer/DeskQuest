@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use super::commands::ProcessRunner;
-use super::controller::{Flow, TrayConfig, TrayController, TrayHost};
+use super::controller::{Flow, IpcDaemonControl, TrayConfig, TrayController, TrayHost};
 use super::icon::{render_argb, ICON_SIZES};
 use super::model::{menu_entries, MenuEntry, TrayAction, TrayView, TRAY_TITLE};
 use crate::tui::TelemetrySource;
@@ -31,7 +31,8 @@ where
         actions: actions_tx,
         handle: None,
     };
-    let mut controller = TrayController::new(source, host, ProcessRunner, TrayConfig::from_env());
+    let mut controller = TrayController::new(source, host, ProcessRunner, TrayConfig::from_env())
+        .with_daemon_control(std::sync::Arc::new(IpcDaemonControl));
 
     let mut term = signal(SignalKind::terminate())?;
     let mut ticker = tokio::time::interval(interval);
@@ -106,9 +107,9 @@ impl ksni::Tray for QuestTray {
         }
     }
 
-    // Left click opens the dashboard, the same as the first menu action.
+    // Left click opens the desktop app.
     fn activate(&mut self, _x: i32, _y: i32) {
-        self.request(TrayAction::OpenDashboard);
+        self.request(TrayAction::OpenApp);
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
@@ -122,8 +123,13 @@ impl ksni::Tray for QuestTray {
                 }
                 .into(),
                 MenuEntry::Separator => MenuItem::Separator,
-                MenuEntry::Action { label, action } => StandardItem {
+                MenuEntry::Action {
+                    label,
+                    action,
+                    enabled,
+                } => StandardItem {
                     label: label.to_string(),
+                    enabled,
                     activate: Box::new(move |tray: &mut Self| tray.request(action)),
                     ..Default::default()
                 }

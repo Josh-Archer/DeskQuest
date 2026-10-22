@@ -5,23 +5,19 @@
 //!
 //! Layout:
 //! - [`model`], [`commands`], [`icon`] and [`controller`] are pure or have no D-Bus
-//!   dependency. They compile and are tested in every build.
-//! - `backend` (behind the `tray` cargo feature) is the StatusNotifierItem adapter
-//!   built on `ksni`.
+//!   dependency, and are tested with mocks.
+//! - [`backend`] is the StatusNotifierItem adapter built on `ksni` (pure Rust D-Bus, so it
+//!   is part of every build).
 
+pub mod backend;
 pub mod commands;
 pub mod controller;
 pub mod icon;
 pub mod model;
 
-#[cfg(feature = "tray")]
-pub mod backend;
-
-pub use commands::{
-    dashboard_command, restart_command, CommandRunner, LaunchCommand, ProcessRunner,
-};
-pub use controller::{Flow, TrayConfig, TrayController, TrayHost};
-pub use model::{menu_entries, ConnectionState, MenuEntry, TrayAction, TrayView};
-
-#[cfg(feature = "tray")]
 pub use backend::run_tray;
+pub use commands::{
+    app_command, dashboard_command, restart_command, CommandRunner, LaunchCommand, ProcessRunner,
+};
+pub use controller::{DaemonControl, Flow, IpcDaemonControl, TrayConfig, TrayController, TrayHost};
+pub use model::{menu_entries, ConnectionState, MenuEntry, TrayAction, TrayView};

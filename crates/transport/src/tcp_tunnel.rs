@@ -19,7 +19,7 @@ pub const MAX_TUNNEL_FRAME_SIZE: usize = 16 * 1024 * 1024;
 /// A peer must complete the protocol greeting promptly after connecting.
 pub const TUNNEL_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(2);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TunnelFrame {
     /// Exact protocol packet bytes, including the validated 32-byte packet header.
     Packet(Vec<u8>),

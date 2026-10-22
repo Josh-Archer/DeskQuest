@@ -23,7 +23,10 @@ pub use adb::{
     AdbBridgeHandle, AdbBridgeState, AdbCommandRunner, AdbDevice, AdbDeviceState, AdbError,
     AdbReverseRule, MockAdbRunner, SystemAdbRunner,
 };
-pub use control::{ControlChannel, ControlError, ControlMessage, DEFAULT_CONTROL_PORT};
+pub use control::{
+    encode_control_frame, ControlChannel, ControlError, ControlFrameReader, ControlMessage,
+    DEFAULT_CONTROL_PORT, SETTINGS_TUNNEL_PORT,
+};
 #[cfg(feature = "mdns")]
 pub use discovery::MdnsDiscoveryBackend;
 pub use discovery::{

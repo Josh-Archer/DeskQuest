@@ -320,8 +320,8 @@ struct CoordinatorState {
 /// (targets out) and the dashboard.
 pub struct RateCoordinator {
     state: Mutex<CoordinatorState>,
-    max_kbps: u32,
-    adaptive: bool,
+    max_kbps: AtomicU32,
+    adaptive: std::sync::atomic::AtomicBool,
     link: Option<SharedLinkTracker>,
 }
 
@@ -339,8 +339,8 @@ impl RateCoordinator {
                 streams: Vec::new(),
                 focused: None,
             }),
-            max_kbps,
-            adaptive,
+            max_kbps: AtomicU32::new(max_kbps),
+            adaptive: std::sync::atomic::AtomicBool::new(adaptive),
             link: None,
         }
     }
@@ -352,7 +352,26 @@ impl RateCoordinator {
     }
 
     pub fn max_kbps(&self) -> u32 {
-        self.max_kbps
+        self.max_kbps.load(Ordering::Relaxed)
+    }
+
+    /// Whether the rate follows client feedback (false with `--fixed-bitrate`).
+    pub fn is_adaptive(&self) -> bool {
+        self.adaptive.load(Ordering::Relaxed)
+    }
+
+    /// Changes the ceiling, and whether the rate adapts below it, while streaming. The target
+    /// starts again at the new ceiling.
+    pub fn set_limit(&self, max_kbps: u32, adaptive: bool) {
+        let max_kbps = max_kbps.max(1);
+        let mut st = self.state.lock();
+        self.max_kbps.store(max_kbps, Ordering::Relaxed);
+        self.adaptive.store(adaptive, Ordering::Relaxed);
+        st.controller =
+            CongestionController::new(CongestionConfig::for_policy(st.policy, max_kbps));
+        let decision = st.controller.decision();
+        Self::publish(&st, decision);
+        tracing::info!(max_kbps, adaptive, "video bitrate limit changed");
     }
 
     /// Adds a stream and re-splits the current rate over all streams.
@@ -383,7 +402,7 @@ impl RateCoordinator {
         if policy != st.policy {
             st.policy = policy;
             st.controller
-                .set_config(CongestionConfig::for_policy(policy, self.max_kbps));
+                .set_config(CongestionConfig::for_policy(policy, self.max_kbps()));
         }
     }
 
@@ -392,7 +411,7 @@ impl RateCoordinator {
         let mut st = self.state.lock();
         st.focused = (feedback.focused_stream != linux_quest_protocol::NO_FOCUSED_STREAM)
             .then_some(feedback.focused_stream);
-        if !self.adaptive {
+        if !self.is_adaptive() {
             Self::publish(&st, st.controller.decision());
             return;
         }
@@ -403,7 +422,7 @@ impl RateCoordinator {
 
     /// Periodic stall check; call a few times a second.
     pub fn tick(&self, now: Instant) {
-        if !self.adaptive {
+        if !self.is_adaptive() {
             return;
         }
         let mut st = self.state.lock();
@@ -733,5 +752,27 @@ mod tests {
             LinkPolicy::Usb
         );
         assert_eq!(LinkPolicy::from_transport(None), LinkPolicy::Wifi);
+    }
+
+    #[test]
+    fn the_limit_can_change_while_streaming() {
+        let rc = RateCoordinator::new(30_000, true);
+        let a = rc.register_stream(0);
+        let b = rc.register_stream(1);
+        assert_eq!(a.target_kbps() + b.target_kbps(), 30_000);
+
+        rc.set_limit(60_000, false);
+        assert_eq!(rc.max_kbps(), 60_000);
+        assert!(!rc.is_adaptive());
+        assert_eq!(a.target_kbps() + b.target_kbps(), 60_000);
+        // Fixed now: bad feedback does not lower it.
+        rc.on_feedback(&fb(300, 50_000, 0, 1_000), Instant::now());
+        assert_eq!(a.target_kbps() + b.target_kbps(), 60_000);
+
+        rc.set_limit(20_000, true);
+        assert!(rc.is_adaptive());
+        assert_eq!(a.target_kbps() + b.target_kbps(), 20_000);
+        rc.on_feedback(&fb(300, 50_000, 0, 1_000), Instant::now());
+        assert!(a.target_kbps() + b.target_kbps() < 20_000, "adapts again");
     }
 }

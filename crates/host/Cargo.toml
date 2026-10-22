@@ -29,15 +29,15 @@ crossterm.workspace = true
 parking_lot.workspace = true
 # Already in the lockfile via tokio; used for TCP keepalive options tokio does not expose.
 socket2 = { version = "0.6", features = ["all"] }
-# StatusNotifierItem tray icon (`linux-quest-host tray`). Off by default so headless
-# and CI builds do not pull in D-Bus crates.
-ksni = { version = "0.3.6", optional = true }
+# StatusNotifierItem tray icon (`linux-quest-host tray`); pure Rust D-Bus (zbus).
+ksni = "0.3.6"
 # Splits `$TERMINAL` into program and arguments without a shell (already in Cargo.lock).
 shlex = "2.0.1"
 
 [features]
 default = []
-tray = ["dep:ksni"]
+# The tray is now part of every build; kept so `--features tray` still works.
+tray = []
 vaapi = ["linux-quest-encoder/vaapi"]
 # Real mDNS advertisement of the daemon. Off by default; passes through to linux-quest-transport.
 mdns = ["linux-quest-transport/mdns"]
@@ -76,6 +76,7 @@ assets = [
     ["../../packaging/udev/99-uinput.rules", "usr/lib/udev/rules.d/99-uinput.rules", "644"],
     ["../../packaging/modules-load/linux-quest.conf", "usr/lib/modules-load.d/linux-quest.conf", "644"],
     ["../../packaging/systemd/linux-quest-host.service", "usr/lib/systemd/user/linux-quest-host.service", "644"],
+    ["../../packaging/systemd/linux-quest-tray.service", "usr/lib/systemd/user/linux-quest-tray.service", "644"],
     ["../../LICENSE-MIT", "usr/share/doc/linux-quest-host/LICENSE-MIT", "644"],
     ["../../LICENSE-APACHE", "usr/share/doc/linux-quest-host/LICENSE-APACHE", "644"],
 ]
@@ -90,6 +91,7 @@ assets = [
     { source = "packaging/udev/99-uinput.rules", dest = "/usr/lib/udev/rules.d/99-uinput.rules", mode = "644" },
     { source = "packaging/modules-load/linux-quest.conf", dest = "/usr/lib/modules-load.d/linux-quest.conf", mode = "644" },
     { source = "packaging/systemd/linux-quest-host.service", dest = "/usr/lib/systemd/user/linux-quest-host.service", mode = "644" },
+    { source = "packaging/systemd/linux-quest-tray.service", dest = "/usr/lib/systemd/user/linux-quest-tray.service", mode = "644" },
     { source = "LICENSE-MIT", dest = "/usr/share/licenses/linux-quest-host/LICENSE-MIT", mode = "644" },
     { source = "LICENSE-APACHE", dest = "/usr/share/licenses/linux-quest-host/LICENSE-APACHE", mode = "644" },
 ]

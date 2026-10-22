@@ -105,9 +105,43 @@ Hotkeys:
 
 ---
 
+## 🪟 Desktop App
+
+`linux-quest` is a GTK 4 / libadwaita app for GNOME. It talks only to the running daemon, over its IPC socket:
+
+- **Status**: whether the headset is connected (USB or Wi-Fi), the frame rate, latency, bitrate and packet loss, and a switch to pause the video.
+- **Screens**: the headset's screens seen from above, arranged around you. Drag a screen to move it around you, drag an end to resize it, scroll to scale it, or set its direction, distance, height, tilt, width and curve exactly. The headset applies each change as you drag. The host's virtual monitors can be added, removed, or given another resolution and refresh rate here too.
+- **Quest Settings**: bitrate (adaptive or fixed), preferred codec, refresh rate, curved or flat screens, the performance overlay and passthrough.
+- **Choose Screen…** shows GNOME's screen-sharing dialog so you can pick which screen or window the headset's main screen shows.
+
+Layout and settings need the headset app running and connected to the host's control port: TCP 48444 over the LAN, or over USB through `adb reverse tcp:48445 tcp:48444`, which the daemon sets up when it manages the tunnel (with `--no-adb`, run that `adb reverse` yourself). They also need a daemon and headset app from this version; an older daemon is never contacted over USB.
+
+```bash
+sudo apt install libgtk-4-dev libadwaita-1-dev     # build dependencies (Fedora: gtk4-devel libadwaita-devel)
+cargo install --path crates/desktop --root ~/.local
+install -Dm644 packaging/desktop/org.linuxquest.Desktop.desktop ~/.local/share/applications/org.linuxquest.Desktop.desktop
+linux-quest
+```
+
+To try it without a headset, run the demo daemon (the real IPC server with mock hardware and a simulated headset; it binds no fixed port and never opens the screen-sharing dialog):
+
+```bash
+export LINUX_QUEST_RUNTIME_DIR=$(mktemp -d)
+cargo run -p linux-quest-desktop --example demo_daemon &
+cargo run -p linux-quest-desktop
+```
+
+---
+
 ## 🔁 Headless Background Service (systemd)
 
-To run the daemon at login without a terminal, install the systemd user unit in [`packaging/systemd/linux-quest-host.service`](packaging/systemd/linux-quest-host.service):
+To run the daemon at login without a terminal, and have it restarted if it crashes, install it as a systemd user service. `service install` writes the unit for the binary you run it from, with the daemon options after `--`:
+
+```bash
+linux-quest-host service install --enable --start -- --streams 3
+```
+
+Or install the unit in [`packaging/systemd/linux-quest-host.service`](packaging/systemd/linux-quest-host.service) by hand:
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -130,16 +164,16 @@ Install a locally built Flatpak bundle with `flatpak install --user ./linux-ques
 The APK is debug-signed for sideloading; connect a Quest with Developer Mode enabled
 and run `scripts/install-quest.sh <path-to-apk>`.
 
-### Optional tray icon
+### Tray icon
 
-`linux-quest-host tray` shows connection state in the system tray, with Open dashboard, Restart service and Quit. It is a separate process, and it is off by default, so build it with the `tray` feature:
+`linux-quest-host tray` shows the headset's status in the system tray: how it is connected and what is streaming, with Pause/Resume Streaming, Choose Screen…, Open Linux Quest (the desktop app; also a left click), Open Dashboard, Restart Service and Quit. It is part of every build and runs as its own process:
 
 ```bash
-cargo install --path crates/host --bin linux-quest-host --features tray --root ~/.local
 linux-quest-host tray
+linux-quest-host service install --tray --enable --start   # or start it with every login
 ```
 
-It needs a StatusNotifierItem host (KDE Plasma, GNOME with the AppIndicator extension, or a bar with a tray module). It can start before or after the daemon, and the systemd unit above does not change. The ordering, a sample user unit and known limitations are in [`packaging/README.md`](packaging/README.md#optional-tray-icon).
+It needs a StatusNotifierItem host: KDE Plasma, a bar with a tray module, or on GNOME the AppIndicator extension (`gnome-extensions enable ubuntu-appindicators@ubuntu.com` on Ubuntu). It can start before or after the daemon. Details are in [`packaging/README.md`](packaging/README.md#tray-icon).
 
 ---
 

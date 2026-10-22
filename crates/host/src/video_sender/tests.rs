@@ -1946,3 +1946,103 @@ async fn the_sender_publishes_its_achieved_video_rate() {
     let kbps = rate.actual_kbps();
     assert!((4_000..=16_000).contains(&kbps), "measured {kbps} kbit/s");
 }
+
+/// Records every `init` an encoder gets.
+struct InitProbe<E: VideoEncoder> {
+    inner: E,
+    inits: Arc<Mutex<Vec<(u32, u32, u32)>>>,
+    keyframes: Arc<AtomicU64>,
+}
+
+#[async_trait]
+impl<E: VideoEncoder> VideoEncoder for InitProbe<E> {
+    async fn init(&mut self, config: EncoderConfig) -> Result<(), EncoderError> {
+        self.inits
+            .lock()
+            .push((config.width, config.height, config.bitrate_kbps));
+        self.inner.init(config).await
+    }
+    async fn encode(&mut self, frame: &RawFrame) -> Result<EncodedFrame, EncoderError> {
+        self.inner.encode(frame).await
+    }
+    fn request_keyframe(&mut self) {
+        self.keyframes.fetch_add(1, Ordering::Relaxed);
+        self.inner.request_keyframe();
+    }
+    fn invalidate_reference_picture(&mut self, pts_us: u64) {
+        self.inner.invalidate_reference_picture(pts_us);
+    }
+    fn set_bitrate(&mut self, kbps: u32) -> bool {
+        self.inner.set_bitrate(kbps)
+    }
+}
+
+#[tokio::test]
+async fn a_new_capture_size_recreates_the_encoder_at_that_size() {
+    let inits = Arc::new(Mutex::new(Vec::new()));
+    let keyframes = Arc::new(AtomicU64::new(0));
+    let base = EncoderConfig {
+        width: 3840,
+        height: 2160,
+        bitrate_kbps: 30_000,
+        ..EncoderConfig::default()
+    };
+    let mut pipeline = FramePipeline::new(
+        InitProbe {
+            inner: ScriptedEncoder::new(vec![1200; 8], 60),
+            inits: inits.clone(),
+            keyframes: keyframes.clone(),
+        },
+        RecordingSink::default(),
+        VideoSenderConfig {
+            pacing_fraction: 0.0,
+            encoder_config: Some(base),
+            ..VideoSenderConfig::default()
+        },
+        Arc::new(VideoSenderStats::default()),
+    );
+    let dest = peer("192.0.2.1:48440");
+
+    // The size it was set up for: nothing to do.
+    let same = raw_frame(3840, 2160, Bytes::new(), 0);
+    pipeline.send_frame(&same, dest, &|| false).await.unwrap();
+    assert!(inits.lock().is_empty());
+
+    // The user picked a 1080p monitor (an odd size is rounded down to even).
+    let smaller = raw_frame(1921, 1080, Bytes::new(), 16_666);
+    pipeline
+        .send_frame(&smaller, dest, &|| false)
+        .await
+        .unwrap();
+    pipeline
+        .send_frame(&smaller, dest, &|| false)
+        .await
+        .unwrap();
+    assert_eq!(
+        *inits.lock(),
+        vec![(1920, 1080, 30_000)],
+        "once, at the new size"
+    );
+    assert_eq!(
+        keyframes.load(Ordering::Relaxed),
+        1,
+        "the new encoder starts with an IDR"
+    );
+
+    // Without a known encoder setup, frames go through untouched.
+    let mut plain = FramePipeline::new(
+        InitProbe {
+            inner: ScriptedEncoder::new(vec![1200; 2], 60),
+            inits: inits.clone(),
+            keyframes,
+        },
+        RecordingSink::default(),
+        VideoSenderConfig {
+            pacing_fraction: 0.0,
+            ..VideoSenderConfig::default()
+        },
+        Arc::new(VideoSenderStats::default()),
+    );
+    plain.send_frame(&smaller, dest, &|| false).await.unwrap();
+    assert_eq!(inits.lock().len(), 1);
+}

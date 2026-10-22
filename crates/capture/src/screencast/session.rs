@@ -8,7 +8,8 @@ use tokio::task::JoinHandle;
 use super::error::ScreenCastError;
 use super::hub::CaptureHub;
 use super::portal::{
-    negotiate_source, ScreenCastPortal, SessionHandle, SOURCE_MONITOR, SOURCE_WINDOW,
+    negotiate_source, negotiate_source_fresh, ScreenCastPortal, SessionHandle, SOURCE_MONITOR,
+    SOURCE_WINDOW,
 };
 use super::stream::{self, StreamHandle, StreamParams};
 use super::ScreenCastConfig;
@@ -38,7 +39,27 @@ impl ScreenCastSession {
     where
         P: ScreenCastPortal + 'static,
     {
-        Self::start_source(portal, cfg, hub, display_id, SOURCE_MONITOR).await
+        Self::start_source(portal, cfg, hub, display_id, SOURCE_MONITOR, false).await
+    }
+
+    /// Like [`start`](Self::start), but the portal always shows its picker: the stored
+    /// restore token is not offered. A grant replaces the stored token.
+    pub async fn start_fresh<P>(
+        portal: P,
+        cfg: &ScreenCastConfig,
+        hub: Arc<CaptureHub>,
+        display_id: u16,
+        window: bool,
+    ) -> Result<Self, ScreenCastError>
+    where
+        P: ScreenCastPortal + 'static,
+    {
+        let source = if window {
+            SOURCE_WINDOW
+        } else {
+            SOURCE_MONITOR
+        };
+        Self::start_source(portal, cfg, hub, display_id, source, true).await
     }
 
     /// Starts a session that asks the portal to select one application window.
@@ -51,7 +72,7 @@ impl ScreenCastSession {
     where
         P: ScreenCastPortal + 'static,
     {
-        Self::start_source(portal, cfg, hub, display_id, SOURCE_WINDOW).await
+        Self::start_source(portal, cfg, hub, display_id, SOURCE_WINDOW, false).await
     }
 
     async fn start_source<P>(
@@ -60,18 +81,21 @@ impl ScreenCastSession {
         hub: Arc<CaptureHub>,
         display_id: u16,
         source_types: u32,
+        fresh: bool,
     ) -> Result<Self, ScreenCastError>
     where
         P: ScreenCastPortal + 'static,
     {
         hub.reset();
         let store = cfg.resolve_token_store();
-        let grant = match tokio::time::timeout(
-            cfg.portal_timeout,
-            negotiate_source(&mut portal, store.as_ref(), source_types),
-        )
-        .await
-        {
+        let negotiation = async {
+            if fresh {
+                negotiate_source_fresh(&mut portal, store.as_ref(), source_types).await
+            } else {
+                negotiate_source(&mut portal, store.as_ref(), source_types).await
+            }
+        };
+        let grant = match tokio::time::timeout(cfg.portal_timeout, negotiation).await {
             Ok(r) => r?,
             Err(_) => return Err(ScreenCastError::NegotiationTimeout(cfg.portal_timeout)),
         };
