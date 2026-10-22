@@ -76,6 +76,40 @@ impl SystemCommandRunner {
     }
 }
 
+/// Puts the tool in a process group of its own, so a timeout can kill everything it started,
+/// and asks the kernel to kill it if the daemon dies first (even by SIGKILL), so a hung
+/// `wl-paste` can never outlive the daemon as an orphan.
+fn configure_child(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0);
+    let parent = std::process::id() as libc::pid_t;
+    // SAFETY: only async-signal-safe libc calls between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // The parent may already have died before prctl took effect.
+            if libc::getppid() != parent {
+                libc::_exit(1);
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Kills the child's whole process group (the tool and anything it forked), then reaps the
+/// child so no zombie is left.
+fn kill_tree(child: &mut std::process::Child) {
+    let pgid = child.id() as libc::pid_t;
+    // SAFETY: kill(2) on the process group we created for this child.
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Reads `pipe` to the end on a thread and sends what it read.
 fn drain<P: Read + Send + 'static>(pipe: Option<P>) -> mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = mpsc::channel();
@@ -109,6 +143,8 @@ impl ClipboardCommandRunner for SystemCommandRunner {
             cmd.stdin(Stdio::null());
         }
 
+        configure_child(&mut cmd);
+
         let mut child = cmd.spawn()?;
         let deadline = Instant::now() + self.timeout;
 
@@ -128,8 +164,7 @@ impl ClipboardCommandRunner for SystemCommandRunner {
                 break status;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_tree(&mut child);
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("{program} did not finish within {:?}", self.timeout),
@@ -267,5 +302,62 @@ mod system_runner_tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    /// Pids of live (non-zombie) processes whose command line contains `marker`.
+    fn live_with_marker(marker: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+            let pid = entry.file_name().to_string_lossy().to_string();
+            if !pid.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+                continue;
+            };
+            let stat = std::fs::read_to_string(entry.path().join("stat")).unwrap_or_default();
+            let zombie = stat
+                .rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'));
+            if !zombie && String::from_utf8_lossy(&cmdline).contains(marker) {
+                found.push(pid);
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn a_hung_stub_wl_paste_and_its_children_are_killed_and_reaped() {
+        let dir = std::env::temp_dir().join(format!("lq-stub-wlpaste-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A sleep length no other process uses, so it identifies the stub's processes.
+        let marker = format!("{}", 7_000_000 + std::process::id());
+        let stub = dir.join("wl-paste");
+        // Forks a grandchild that sleeps forever, like a tool stuck waiting for focus.
+        std::fs::write(
+            &stub,
+            format!("#!/bin/sh\nsleep {marker} &\nsleep {marker}\n"),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = Instant::now();
+        let err = SystemCommandRunner::with_timeout(Duration::from_millis(300))
+            .run_command(stub.to_str().unwrap(), &["--no-newline", &marker], None)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !live_with_marker(&marker).is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            live_with_marker(&marker).is_empty(),
+            "stub wl-paste processes survived the timeout: {:?}",
+            live_with_marker(&marker)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
