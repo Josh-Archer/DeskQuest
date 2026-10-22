@@ -136,6 +136,8 @@ struct OverlaySwapchains {
     ray: OverlayTexture,
     cursor: OverlayTexture,
     mask: OverlayTexture,
+    /// Soft outline around a window being moved or resized.
+    frame: OverlayTexture,
     bar: [OverlayTexture; 2],
     edge: [OverlayTexture; 2],
     corner: [OverlayTexture; 2],
@@ -844,6 +846,7 @@ impl OpenXrContext {
                 ray: tex(RAY_TEXTURE, ray_rgba())?,
                 cursor: tex(CURSOR_TEXTURE, cursor_rgba())?,
                 mask: tex(MASK_TEXTURE, mask_rgba())?,
+                frame: tex(frame_texture_size(16.0 / 9.0), frame_rgba(16.0 / 9.0))?,
                 bar: [
                     tex(BAR_TEXTURE, bar_rgba(0.55))?,
                     tex(BAR_TEXTURE, bar_rgba(0.95))?,
@@ -1447,7 +1450,8 @@ impl OpenXrContext {
                 (overlay.chrome.edge, EDGE_TEXTURE),
                 (overlay.chrome.corner, CORNER_TEXTURE),
             ];
-            let (mut rays_ok, mut cursor_ok, mut mask_ok) = (false, false, false);
+            let (mut rays_ok, mut cursor_ok, mut mask_ok, mut frame_ok) =
+                (false, false, false, false);
             let mut chrome_ok = [false; 3];
             if let Some(o) = &mut self.overlay_swapchains {
                 if !overlay.pointers.is_empty() {
@@ -1458,6 +1462,9 @@ impl OpenXrContext {
                 }
                 if self.supports_alpha_blend {
                     mask_ok = o.mask.ensure(vulkan_context);
+                }
+                if overlay.chrome.frame.is_some() {
+                    frame_ok = o.frame.ensure(vulkan_context);
                 }
                 let looks = [&mut o.bar, &mut o.edge, &mut o.corner];
                 for ((ok, (handle, _)), look) in chrome_ok.iter_mut().zip(&chrome).zip(looks) {
@@ -1549,6 +1556,19 @@ impl OpenXrContext {
                     Some((sc, screen.size, screen.transform.to_desktop_layer_config()))
                 }));
             let mut desktop_layers = Vec::new();
+            // The soft frame of a window being moved or resized goes under the screens: its
+            // texture is clear over the window, so only the glow around it shows.
+            if let (true, Some(o), Some(frame)) = (frame_ok, ov, &overlay.chrome.frame) {
+                desktop_layers.push(DesktopLayer::build(
+                    space,
+                    o.frame.swapchain(),
+                    crate::openxr::overlay::frame_texture_size(16.0 / 9.0),
+                    &frame.window.to_desktop_layer_config(),
+                    self.supports_cylinder,
+                    std::ptr::null(),
+                    source_alpha,
+                ));
+            }
             for (sc, size, cfg) in screens {
                 match ov.filter(|_| rounded) {
                     Some(o) => {
