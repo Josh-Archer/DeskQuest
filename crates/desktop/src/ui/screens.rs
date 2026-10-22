@@ -58,6 +58,13 @@ struct State {
     backend: String,
 }
 
+#[derive(PartialEq)]
+struct MonitorList {
+    monitors: Vec<VirtualMonitor>,
+    backend: String,
+    daemon_running: bool,
+}
+
 struct Rows {
     group: adw::PreferencesGroup,
     angle: adw::SpinRow,
@@ -71,12 +78,16 @@ struct Rows {
 }
 
 pub struct ScreensPage {
-    root: gtk::Box,
+    root: adw::BreakpointBin,
+    selector: gtk::DropDown,
+    screen_names: gtk::StringList,
+    screen_ids: RefCell<Vec<u32>>,
     stack: gtk::Stack,
     area: gtk::DrawingArea,
     rows: Rows,
     monitors_group: adw::PreferencesGroup,
     monitor_rows: RefCell<Vec<adw::ActionRow>>,
+    shown_monitors: RefCell<Option<MonitorList>>,
     resolution: adw::ComboRow,
     monitor_rate: adw::ComboRow,
     add_monitor: gtk::Button,
@@ -237,20 +248,109 @@ impl ScreensPage {
         sidebar_page.set_vexpand(true);
         sidebar.append(&buttons);
         buttons.set_margin_bottom(18);
-        sidebar.set_size_request(380, -1);
+        sidebar.add_css_class("layout-sidebar");
 
-        let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        root.append(&stack);
-        root.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-        root.append(&sidebar);
+        let screen_names = gtk::StringList::new(&[]);
+        let selector = gtk::DropDown::builder()
+            .model(&screen_names)
+            .tooltip_text("Select the screen to arrange")
+            .build();
+        selector.set_sensitive(false);
+        let heading = gtk::Label::builder()
+            .label("Headset Layout")
+            .halign(gtk::Align::Start)
+            .hexpand(true)
+            .build();
+        heading.add_css_class("heading");
+        let controls = gtk::ToggleButton::builder()
+            .label("Controls")
+            .tooltip_text("Show screen settings and virtual monitors")
+            .active(true)
+            .visible(false)
+            .build();
+        let tools = gtk::Box::builder()
+            .spacing(12)
+            .margin_top(16)
+            .margin_bottom(12)
+            .margin_start(20)
+            .margin_end(20)
+            .build();
+        tools.append(&heading);
+        tools.append(&selector);
+        tools.append(&controls);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        content.append(&tools);
+        content.append(&stack);
+        stack.set_vexpand(true);
+
+        let close = gtk::Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Hide layout controls")
+            .visible(false)
+            .build();
+        close.add_css_class("flat");
+        let sidebar_title = gtk::Label::builder()
+            .label("Layout Controls")
+            .halign(gtk::Align::Start)
+            .hexpand(true)
+            .build();
+        sidebar_title.add_css_class("heading");
+        let sidebar_header = gtk::Box::builder()
+            .spacing(12)
+            .margin_top(12)
+            .margin_bottom(6)
+            .margin_start(24)
+            .margin_end(12)
+            .build();
+        sidebar_header.append(&sidebar_title);
+        sidebar_header.append(&close);
+        sidebar.prepend(&sidebar_header);
+        let split = adw::OverlaySplitView::builder()
+            .content(&content)
+            .sidebar(&sidebar)
+            .sidebar_position(gtk::PackType::End)
+            .min_sidebar_width(360.0)
+            .max_sidebar_width(400.0)
+            .sidebar_width_fraction(0.36)
+            .pin_sidebar(true)
+            .show_sidebar(true)
+            .build();
+        controls
+            .bind_property("active", &split, "show-sidebar")
+            .bidirectional()
+            .sync_create()
+            .build();
+        let weak_split = split.downgrade();
+        close.connect_clicked(move |_| {
+            if let Some(split) = weak_split.upgrade() {
+                split.set_show_sidebar(false);
+            }
+        });
+        let compact = adw::Breakpoint::new(
+            adw::BreakpointCondition::parse("max-width: 920px").expect("layout breakpoint"),
+        );
+        compact.add_setter(&split, "collapsed", Some(&true.to_value()));
+        compact.add_setter(&split, "show-sidebar", Some(&false.to_value()));
+        compact.add_setter(&controls, "visible", Some(&true.to_value()));
+        compact.add_setter(&close, "visible", Some(&true.to_value()));
+        let root = adw::BreakpointBin::builder()
+            .child(&split)
+            .width_request(360)
+            .height_request(300)
+            .build();
+        root.add_breakpoint(compact);
 
         let this = Rc::new(Self {
             root,
+            selector,
+            screen_names,
+            screen_ids: RefCell::new(Vec::new()),
             stack,
             area,
             rows,
             monitors_group,
             monitor_rows: RefCell::new(Vec::new()),
+            shown_monitors: RefCell::new(None),
             resolution,
             monitor_rate,
             add_monitor,
@@ -260,6 +360,21 @@ impl ScreensPage {
             shown: Cell::new(None),
             shell,
         });
+        let weak = Rc::downgrade(&this);
+        this.selector.connect_selected_notify(move |selector| {
+            if let Some(this) = weak.upgrade() {
+                let id = this
+                    .screen_ids
+                    .borrow()
+                    .get(selector.selected() as usize)
+                    .copied();
+                if let Some(id) = id {
+                    this.state.borrow_mut().selected = Some(id);
+                    this.show_selected();
+                    this.area.queue_draw();
+                }
+            }
+        });
         this.connect_canvas();
         this.connect_rows();
         this.connect_monitor_buttons();
@@ -267,7 +382,7 @@ impl ScreensPage {
         this
     }
 
-    pub fn widget(&self) -> &gtk::Box {
+    pub fn widget(&self) -> &adw::BreakpointBin {
         &self.root
     }
 
@@ -650,6 +765,33 @@ impl ScreensPage {
     // ---- sidebar -------------------------------------------------------------------------
 
     fn show_selected(&self) {
+        let (ids, selected_id) = {
+            let st = self.state.borrow();
+            (
+                st.screens
+                    .iter()
+                    .map(|screen| screen.display_id)
+                    .collect::<Vec<_>>(),
+                st.selected,
+            )
+        };
+        if *self.screen_ids.borrow() != ids {
+            let labels: Vec<_> = ids.iter().map(|&id| topdown::display_name(id)).collect();
+            let labels: Vec<_> = labels.iter().map(String::as_str).collect();
+            // Drop the borrow before the model emits selection notifications.
+            *self.screen_ids.borrow_mut() = ids.clone();
+            self.screen_names
+                .splice(0, self.screen_names.n_items(), &labels);
+        }
+        self.selector.set_sensitive(!ids.is_empty());
+        self.selector.set_visible(!ids.is_empty());
+        let index = ids
+            .iter()
+            .position(|&id| Some(id) == selected_id)
+            .map_or(gtk::INVALID_LIST_POSITION, |index| index as u32);
+        if self.selector.selected() != index {
+            self.selector.set_selected(index);
+        }
         let selected = self.selected_placement();
         let showing = {
             let st = self.state.borrow();
@@ -766,6 +908,17 @@ impl ScreensPage {
             let st = self.state.borrow();
             (st.monitors.clone(), st.backend.clone())
         };
+        let shown = MonitorList {
+            monitors: monitors.clone(),
+            backend: backend.clone(),
+            daemon_running,
+        };
+        if self.shown_monitors.borrow().as_ref() == Some(&shown) {
+            return;
+        }
+        *self.shown_monitors.borrow_mut() = Some(shown);
+        // Retain unchanged row widgets so a telemetry tick cannot take keyboard focus
+        // away from a monitor's remove button.
         let mutter = backend.to_lowercase().contains("mutter");
         self.monitors_group
             .set_description(Some(&if !daemon_running {

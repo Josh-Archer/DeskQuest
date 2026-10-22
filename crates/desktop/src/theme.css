@@ -16,3 +16,7 @@
 .linux-quest-window .suggested-action:hover {
   background-image: linear-gradient(110deg, #0056d0, #006aaf);
 }
+
+.linux-quest-window .layout-sidebar {
+  background-color: @view_bg_color;
+}
