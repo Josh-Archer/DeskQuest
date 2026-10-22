@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Linux Quest Tray
+Comment=Show Linux Quest connection status in the top bar
+Exec=linux-quest-host tray
+Icon=org.linuxquest.Desktop
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

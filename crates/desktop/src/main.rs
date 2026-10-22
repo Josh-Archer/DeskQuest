@@ -35,6 +35,23 @@ fn main() -> gtk::glib::ExitCode {
         if let Some(display) = gtk::gdk::Display::default() {
             gtk::IconTheme::for_display(&display)
                 .add_resource_path("/org/linuxquest/Desktop/icons");
+            let css = gtk::CssProvider::new();
+            css.load_from_resource("/org/linuxquest/Desktop/theme.css");
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &css,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+            // Newer Adwaita uses CSS variables; Ubuntu 24.04's GTK uses named colours.
+            if gtk::minor_version() >= 16 {
+                let css = gtk::CssProvider::new();
+                css.load_from_resource("/org/linuxquest/Desktop/theme-modern.css");
+                gtk::style_context_add_provider_for_display(
+                    &display,
+                    &css,
+                    gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+                );
+            }
         }
     });
     app.connect_activate(ui::activate);

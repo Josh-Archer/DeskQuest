@@ -3,4 +3,8 @@
   <gresource prefix="/org/linuxquest/Desktop/icons">
     <file alias="512x512/apps/org.linuxquest.Desktop.png">hicolor/512x512/apps/org.linuxquest.Desktop.png</file>
   </gresource>
+  <gresource prefix="/org/linuxquest/Desktop">
+    <file alias="theme.css">src/theme.css</file>
+    <file alias="theme-modern.css">src/theme-modern.css</file>
+  </gresource>
 </gresources>
