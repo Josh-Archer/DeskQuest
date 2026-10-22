@@ -251,7 +251,9 @@ impl Window {
                 self.take_screenshot_if_asked();
             }
             Err(e) => {
-                tracing::warn!(error = %e, "no answer from the daemon");
+                if !self.banner.is_revealed() {
+                    tracing::warn!(error = %e, "no answer from the daemon");
+                }
                 let installed = service_installed();
                 self.banner.set_title(&if installed {
                     format!("{e}. Start it as a service?")
