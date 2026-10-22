@@ -5,7 +5,7 @@ use tracing::info;
 use super::{VirtualDisplayBackend, VirtualMonitor};
 use crate::config::VirtualMonitorConfig;
 use crate::error::DisplayError;
-use crate::layout::DisplayLayout;
+use crate::layout::{DisplayLayout, DisplayLayoutMode};
 
 /// GNOME Mutter virtual monitor backend via D-Bus (`org.gnome.Mutter.ScreenCast` & `org.gnome.Mutter.DisplayConfig`).
 pub struct MutterDisplayBackend {
@@ -114,6 +114,80 @@ type MutterLogicalMonitorApply = (
         HashMap<String, zbus::zvariant::Value<'static>>,
     )>,
 );
+
+/// A logical monitor's rectangle in Mutter's layout coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LogicalRect {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+/// Room a monitor takes in the layout. In Mutter's logical layout mode (its default) that is
+/// the mode size divided by the scale, so a 3840x2160 monitor at 125% is 3072x1728; in
+/// physical mode it is the mode size. Turned 90 or 270 degrees, width and height swap.
+fn logical_size(mode: (i32, i32), scale: f64, transform: u32, logical_mode: bool) -> (i32, i32) {
+    let scale = if logical_mode && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let (w, h) = (
+        (f64::from(mode.0) / scale).round() as i32,
+        (f64::from(mode.1) / scale).round() as i32,
+    );
+    // Transforms 1 and 3 (and their flipped 5 and 7) turn the monitor sideways.
+    if transform % 2 == 1 {
+        (h, w)
+    } else {
+        (w, h)
+    }
+}
+
+/// Positions for monitors of `sizes`, edge to edge after `existing`: a row to the right of
+/// everything, top-aligned with the topmost monitor, or for a vertical layout a column below
+/// everything, left-aligned. Mutter rejects a layout whose logical monitors do not touch
+/// ("Logical monitors not adjacent") or overlap.
+fn adjacent_positions(
+    existing: &[LogicalRect],
+    sizes: &[(i32, i32)],
+    vertical: bool,
+) -> Vec<(i32, i32)> {
+    let left = existing.iter().map(|r| r.x).min().unwrap_or(0);
+    let top = existing.iter().map(|r| r.y).min().unwrap_or(0);
+    let right = existing.iter().map(|r| r.x + r.width).max().unwrap_or(0);
+    let bottom = existing.iter().map(|r| r.y + r.height).max().unwrap_or(0);
+    let mut cursor = if vertical { bottom } else { right };
+    sizes
+        .iter()
+        .map(|&(w, h)| {
+            let at = if vertical {
+                (left, cursor)
+            } else {
+                (cursor, top)
+            };
+            cursor += if vertical { h } else { w };
+            at
+        })
+        .collect()
+}
+
+/// The current mode of `connector` in Mutter's state: its id and size.
+fn current_mode(monitors: &[MutterMonitor], connector: &str) -> Option<(String, i32, i32)> {
+    let (_, modes, _) = monitors.iter().find(|(spec, _, _)| spec.0 == connector)?;
+    let flag = |props: &HashMap<String, zbus::zvariant::OwnedValue>, key: &str| {
+        props
+            .get(key)
+            .is_some_and(|v| matches!(&**v, zbus::zvariant::Value::Bool(true)))
+    };
+    modes
+        .iter()
+        .find(|m| flag(&m.6, "is-current"))
+        .or_else(|| modes.iter().find(|m| flag(&m.6, "is-preferred")))
+        .or_else(|| modes.first())
+        .map(|m| (m.0.clone(), m.1, m.2))
+}
 
 #[async_trait]
 impl VirtualDisplayBackend for MutterDisplayBackend {
@@ -398,74 +472,52 @@ impl VirtualDisplayBackend for MutterDisplayBackend {
 
             let mut logical_monitors: Vec<MutterLogicalMonitorApply> = Vec::new();
             let mut physical_has_primary = false;
+            // Where the kept monitors are, so the virtual ones can go edge to edge with them.
+            let mut kept_rects: Vec<LogicalRect> = Vec::new();
+            let logical_mode = state
+                .3
+                .get("layout-mode")
+                .and_then(|v| u32::try_from(&**v).ok())
+                .is_none_or(|mode| mode != 2);
 
             // Preserve existing physical displays so laptop / external screens are not disabled
             for (lm_x, lm_y, lm_scale, lm_transform, lm_primary, lm_monitors, _) in
                 current_logical_monitors
             {
-                let physical_monitors: Vec<(String, String, String, String)> = lm_monitors
+                let mut converted_monitors = Vec::new();
+                let mut size = None;
+                for (conn_name, _, _, _) in lm_monitors
                     .into_iter()
                     .filter(|(conn_name, _, _, _)| !virtual_connectors.contains(conn_name))
-                    .collect();
-
-                if !physical_monitors.is_empty() {
-                    let mut converted_monitors = Vec::new();
-                    for (conn_name, _, _, _) in physical_monitors {
-                        let mut chosen_mode = String::new();
-                        if let Some((_, modes, _)) = mutter_monitors
-                            .iter()
-                            .find(|(spec, _, _)| spec.0 == conn_name)
-                        {
-                            // 1. Look for mode with "is-current" == true
-                            for (mode_id, _, _, _, _, _, props) in modes {
-                                if let Some(val) = props.get("is-current") {
-                                    if let zbus::zvariant::Value::Bool(true) = &**val {
-                                        chosen_mode = mode_id.clone();
-                                        break;
-                                    }
-                                }
-                            }
-                            // 2. Look for mode with "is-preferred" == true
-                            if chosen_mode.is_empty() {
-                                for (mode_id, _, _, _, _, _, props) in modes {
-                                    if let Some(val) = props.get("is-preferred") {
-                                        if let zbus::zvariant::Value::Bool(true) = &**val {
-                                            chosen_mode = mode_id.clone();
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            // 3. Fallback to first available mode
-                            if chosen_mode.is_empty() {
-                                if let Some(first) = modes.first() {
-                                    chosen_mode = first.0.clone();
-                                }
-                            }
-                        }
-
-                        if !chosen_mode.is_empty() {
-                            converted_monitors.push((
-                                conn_name,
-                                chosen_mode,
-                                HashMap::<String, zbus::zvariant::Value>::new(),
-                            ));
-                        }
-                    }
-
-                    if !converted_monitors.is_empty() {
-                        if lm_primary {
-                            physical_has_primary = true;
-                        }
-                        logical_monitors.push((
-                            lm_x,
-                            lm_y,
-                            lm_scale,
-                            lm_transform,
-                            lm_primary,
-                            converted_monitors,
+                {
+                    if let Some((mode_id, w, h)) = current_mode(&mutter_monitors, &conn_name) {
+                        size.get_or_insert((w, h));
+                        converted_monitors.push((
+                            conn_name,
+                            mode_id,
+                            HashMap::<String, zbus::zvariant::Value>::new(),
                         ));
                     }
+                }
+                if let Some(size) = size {
+                    if lm_primary {
+                        physical_has_primary = true;
+                    }
+                    let (width, height) = logical_size(size, lm_scale, lm_transform, logical_mode);
+                    kept_rects.push(LogicalRect {
+                        x: lm_x,
+                        y: lm_y,
+                        width,
+                        height,
+                    });
+                    logical_monitors.push((
+                        lm_x,
+                        lm_y,
+                        lm_scale,
+                        lm_transform,
+                        lm_primary,
+                        converted_monitors,
+                    ));
                 }
             }
 
@@ -475,42 +527,92 @@ impl VirtualDisplayBackend for MutterDisplayBackend {
             // Ensure at least one monitor is marked primary
             let primary_id = placements.iter().map(|p| p.id).min().unwrap_or(1);
 
-            for p in &placements {
-                if let Some(m) = self.monitors.get(&p.id) {
-                    let mut chosen_mode_id = format!("{}x{}@{}", p.width, p.height, p.refresh_rate);
-                    let mut chosen_conn = m.connector.clone();
-
-                    for (spec, modes, _) in &mutter_monitors {
-                        let (conn_name, _, _, _) = spec;
-                        if conn_name == &m.connector || conn_name.contains("Virtual") {
-                            chosen_conn = conn_name.clone();
-                            // Match by width, height, and refresh rate
-                            if let Some(matched_mode) = modes.iter().find(|mode| {
-                                mode.1 == p.width as i32
-                                    && mode.2 == p.height as i32
-                                    && (mode.3 - p.refresh_rate as f64).abs() < 1.0
-                            }) {
-                                chosen_mode_id = matched_mode.0.clone();
-                                break;
-                            } else if let Some(matched_mode) = modes
-                                .iter()
-                                .find(|mode| mode.1 == p.width as i32 && mode.2 == p.height as i32)
-                            {
-                                chosen_mode_id = matched_mode.0.clone();
-                                break;
-                            } else if let Some(first_mode) = modes.first() {
-                                chosen_mode_id = first_mode.0.clone();
-                                break;
-                            }
-                        }
+            // Our virtual monitors, in the layout's order, each on its own connector: the one
+            // recorded at creation, else an unclaimed Mutter virtual monitor ("MetaVendor").
+            let mut ordered: Vec<_> = placements.iter().collect();
+            ordered.sort_by_key(|p| (p.x, p.y, p.id));
+            let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut virtuals = Vec::new();
+            for p in ordered {
+                let Some(m) = self.monitors.get(&p.id) else {
+                    continue;
+                };
+                let connector = mutter_monitors
+                    .iter()
+                    .map(|(spec, _, _)| spec)
+                    .find(|spec| spec.0 == m.connector && !claimed.contains(&spec.0))
+                    .or_else(|| {
+                        mutter_monitors
+                            .iter()
+                            .map(|(spec, _, _)| spec)
+                            .find(|spec| {
+                                spec.1 == "MetaVendor"
+                                    && !claimed.contains(&spec.0)
+                                    && !logical_monitors
+                                        .iter()
+                                        .any(|lm| lm.5.iter().any(|(c, _, _)| *c == spec.0))
+                            })
+                    })
+                    .map(|spec| spec.0.clone())
+                    .unwrap_or_else(|| m.connector.clone());
+                claimed.insert(connector.clone());
+                let modes = mutter_monitors
+                    .iter()
+                    .find(|(spec, _, _)| spec.0 == connector)
+                    .map(|(_, modes, _)| modes.as_slice())
+                    .unwrap_or(&[]);
+                let mode = modes
+                    .iter()
+                    .find(|mode| {
+                        mode.1 == p.width as i32
+                            && mode.2 == p.height as i32
+                            && (mode.3 - p.refresh_rate as f64).abs() < 1.0
+                    })
+                    .or_else(|| {
+                        modes
+                            .iter()
+                            .find(|mode| mode.1 == p.width as i32 && mode.2 == p.height as i32)
+                    })
+                    .or_else(|| modes.first());
+                let (mode_id, size) = match mode {
+                    Some(mode) => (mode.0.clone(), (mode.1, mode.2)),
+                    None => (
+                        format!("{}x{}@{}", p.width, p.height, p.refresh_rate),
+                        (p.width as i32, p.height as i32),
+                    ),
+                };
+                // HiDPI monitors at 200%, if their mode offers it; otherwise 100%.
+                let scale = match mode {
+                    Some(mode) if p.dpi > 144 && mode.5.iter().any(|s| (s - 2.0).abs() < 1e-6) => {
+                        2.0
                     }
+                    _ => 1.0,
+                };
+                virtuals.push((
+                    p.id,
+                    connector,
+                    mode_id,
+                    scale,
+                    logical_size(size, scale, 0, logical_mode),
+                ));
+            }
 
-                    let mon_props: HashMap<String, zbus::zvariant::Value> = HashMap::new();
-                    let monitor_spec = vec![(chosen_conn, chosen_mode_id, mon_props)];
-                    let scale = if p.dpi > 144 { 2.0f64 } else { 1.0f64 };
-                    let is_primary = !physical_has_primary && (p.id == primary_id);
-                    logical_monitors.push((p.x, p.y, scale, 0u32, is_primary, monitor_spec));
+            let sizes: Vec<(i32, i32)> = virtuals.iter().map(|v| v.4).collect();
+            let positions = adjacent_positions(
+                &kept_rects,
+                &sizes,
+                layout.mode == DisplayLayoutMode::Vertical,
+            );
+            for ((id, connector, mode_id, scale, _), (x, y)) in virtuals.into_iter().zip(positions)
+            {
+                if let Some(m) = self.monitors.get_mut(&id) {
+                    m.x = x;
+                    m.y = y;
                 }
+                let mon_props: HashMap<String, zbus::zvariant::Value> = HashMap::new();
+                let monitor_spec = vec![(connector, mode_id, mon_props)];
+                let is_primary = !physical_has_primary && (id == primary_id);
+                logical_monitors.push((x, y, scale, 0u32, is_primary, monitor_spec));
             }
 
             // If neither physical nor virtual was marked primary, ensure at least first monitor is primary
@@ -535,5 +637,69 @@ impl VirtualDisplayBackend for MutterDisplayBackend {
         let mut list: Vec<_> = self.monitors.values().cloned().collect();
         list.sort_by_key(|m| m.id);
         list
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    fn rect(x: i32, y: i32, width: i32, height: i32) -> LogicalRect {
+        LogicalRect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn a_scaled_monitor_takes_its_mode_size_over_its_scale() {
+        // The Samsung Odyssey G80SD on the test machine: 4K at 125%.
+        assert_eq!(logical_size((3840, 2160), 1.25, 0, true), (3072, 1728));
+        assert_eq!(logical_size((3840, 2160), 1.25, 0, false), (3840, 2160));
+        assert_eq!(logical_size((2560, 1440), 1.0, 0, true), (2560, 1440));
+        assert_eq!(logical_size((1920, 1080), 1.0, 1, true), (1080, 1920));
+        assert_eq!(logical_size((3840, 2160), 2.0, 3, true), (1080, 1920));
+    }
+
+    #[test]
+    fn virtual_monitors_go_edge_to_edge_after_the_real_ones() {
+        // The layout GNOME reported when adding a 2560x1440 monitor: "not adjacent" before,
+        // because the virtual monitor was placed at (0, 0) on top of the real one.
+        let real = [rect(0, 0, 3072, 1728)];
+        assert_eq!(
+            adjacent_positions(&real, &[(2560, 1440)], false),
+            vec![(3072, 0)]
+        );
+        assert_eq!(
+            adjacent_positions(&real, &[(2560, 1440), (1920, 1080)], false),
+            vec![(3072, 0), (5632, 0)]
+        );
+        assert_eq!(
+            adjacent_positions(&real, &[(2560, 1440), (1920, 1080)], true),
+            vec![(0, 1728), (0, 3168)]
+        );
+    }
+
+    #[test]
+    fn several_real_monitors_are_kept_and_the_row_starts_past_them_all() {
+        let real = [rect(-1920, 120, 1920, 1080), rect(0, 0, 3072, 1728)];
+        assert_eq!(
+            adjacent_positions(&real, &[(2560, 1440)], false),
+            vec![(3072, 0)]
+        );
+        assert_eq!(
+            adjacent_positions(&real, &[(2560, 1440)], true),
+            vec![(-1920, 1728)]
+        );
+    }
+
+    #[test]
+    fn with_no_real_monitor_the_row_starts_at_the_origin() {
+        assert_eq!(
+            adjacent_positions(&[], &[(1920, 1080), (1920, 1080)], false),
+            vec![(0, 0), (1920, 0)]
+        );
     }
 }
