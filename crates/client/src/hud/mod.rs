@@ -57,7 +57,9 @@ pub struct HudSnapshot {
     pub fps: f32,
     /// Target display refresh rate in Hz.
     pub target_fps: f32,
-    /// Motion-to-photon latency in milliseconds.
+    /// Software estimate in milliseconds: frame-pacing budget + decoder time + capped
+    /// wait_frame time. Omits host capture, encode, transport and panel scanout, so it is
+    /// not glass-to-glass latency (only an optical measurement is; see docs/latency-measurement.md).
     pub motion_to_photon_ms: f32,
     /// Decoder latency in milliseconds.
     pub decode_latency_ms: f32,
@@ -204,21 +206,29 @@ impl DebugHud {
             ));
         }
         if let Some(b) = &self.breakdown {
-            let ms = |us: u32| us as f32 / 1000.0;
+            // A zero stage was not reported; show "--" rather than a measured 0.0.
+            let ms = |us: u32| {
+                if us == 0 {
+                    "--".to_string()
+                } else {
+                    format!("{:.1}", us as f32 / 1000.0)
+                }
+            };
             text.push_str(&format!(
-                "\nCap {:.1} Enc {:.1} Q {:.1} Net {:.1}\nDec {:.1} Rnd {:.1} = {:.1}ms",
+                "\nCap {} Enc {} Q {} Net {}\nDec {} Rnd {} | stage sum {:.1}ms",
                 ms(b.capture_duration_us),
                 ms(b.encode_duration_us),
                 ms(b.host_queue_duration_us),
                 ms(b.transport_duration_us),
                 ms(b.client_decode_duration_us),
                 ms(b.client_render_duration_us),
-                ms(b.capture_duration_us
+                (b.capture_duration_us
                     + b.encode_duration_us
                     + b.host_queue_duration_us
                     + b.transport_duration_us
                     + b.client_decode_duration_us
-                    + b.client_render_duration_us),
+                    + b.client_render_duration_us) as f32
+                    / 1000.0,
             ));
         }
         text
@@ -226,7 +236,7 @@ impl DebugHud {
 
     fn base_text(&self) -> String {
         format!(
-            "FPS: {:.1} / {:.0}Hz\nM2P: {:.1}ms | Dec: {:.1}ms\nInput: {:.2}ms\nCodec: {}\nPackets: {} | FEC: {} | Loss: {}\nRx: {:.1} Mbps",
+            "FPS: {:.1} / {:.0}Hz\nEst (SW, not g2g): {:.1}ms | Dec: {:.1}ms\nInput: {:.2}ms\nCodec: {}\nPackets: {} | FEC: {} | Loss: {}\nRx: {:.1} Mbps",
             self.last_snapshot.fps,
             self.last_snapshot.target_fps,
             self.last_snapshot.motion_to_photon_ms,
@@ -328,7 +338,7 @@ mod tests {
 
         let text = hud.formatted_text();
         assert!(text.contains("Rx: 28.4 Mbps"));
-        assert!(text.contains("M2P: 12.1ms"));
+        assert!(text.contains("Est (SW, not g2g): 12.1ms"));
         assert!(text.contains("Dec: 2.4ms"));
         assert!(text.contains("Input: 1.25ms"));
         assert!(text.contains("c2.qti.av1"));
@@ -358,7 +368,7 @@ mod tests {
         let text = hud.formatted_text();
         assert!(text.contains("Bitrate: 64.0 Mbps | Loss: 1.50% | FEC rec: 7"));
         assert!(text.contains("Cap 1.0 Enc 2.0 Q 0.5 Net 3.0"));
-        assert!(text.contains("Dec 2.5 Rnd 1.0 = 10.0ms"));
+        assert!(text.contains("Dec 2.5 Rnd 1.0 | stage sum 10.0ms"));
     }
 
     #[test]
