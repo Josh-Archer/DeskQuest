@@ -11,9 +11,28 @@ use crate::error::InputError;
 /// waits for keyboard focus it never gets, so every poll would otherwise cost the timeout.
 pub const UNRESPONSIVE_BACKOFF: Duration = Duration::from_secs(60);
 
+/// Set to `1` to read the clipboard with `wl-paste` on GNOME anyway (see
+/// [`reads_take_focus`]).
+pub const READS_ON_GNOME_ENV: &str = "LINUX_QUEST_WAYLAND_CLIPBOARD_READS";
+
+/// Whether reading the clipboard takes keyboard focus in this session. GNOME's compositor has
+/// no data-control protocol, so `wl-paste` gets the clipboard by popping up a tiny surface to
+/// take keyboard focus. Polled every 200 ms, that swallows keys the user is typing. `env`
+/// reads an environment variable.
+pub fn reads_take_focus(env: impl Fn(&str) -> Option<String>) -> bool {
+    let gnome = ["XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP"]
+        .iter()
+        .filter_map(|key| env(key))
+        .any(|value| value.to_ascii_lowercase().contains("gnome"));
+    gnome && env(READS_ON_GNOME_ENV).as_deref() != Some("1")
+}
+
 /// Wayland clipboard backend using `wl-clipboard` utilities.
 pub struct WaylandClipboardBackend<R: ClipboardCommandRunner = SystemCommandRunner> {
     runner: R,
+    /// Whether `get_text` may run `wl-paste`. Off where that takes keyboard focus, so the
+    /// host's clipboard poll does not eat the user's typing; writes still work.
+    reads: bool,
     /// `wl-paste` timed out; reads fail fast until then.
     unresponsive_until: Mutex<Option<Instant>>,
     /// The timeout was logged (once per process run).
@@ -21,8 +40,18 @@ pub struct WaylandClipboardBackend<R: ClipboardCommandRunner = SystemCommandRunn
 }
 
 impl WaylandClipboardBackend<SystemCommandRunner> {
+    /// Reads the clipboard only where that leaves keyboard focus alone (not on GNOME, unless
+    /// [`READS_ON_GNOME_ENV`] is `1`).
     pub fn new() -> Self {
-        Self::with_runner(SystemCommandRunner::new())
+        let reads = !reads_take_focus(|key| std::env::var(key).ok());
+        if !reads {
+            tracing::info!(
+                "GNOME gives wl-paste the clipboard only with keyboard focus, which would steal \
+                 keystrokes every poll: not reading the desktop clipboard (headset-to-desktop \
+                 copies still work; set {READS_ON_GNOME_ENV}=1 to read it anyway)"
+            );
+        }
+        Self::with_runner(SystemCommandRunner::new()).with_reads(reads)
     }
 }
 
@@ -36,14 +65,26 @@ impl<R: ClipboardCommandRunner> WaylandClipboardBackend<R> {
     pub fn with_runner(runner: R) -> Self {
         Self {
             runner,
+            reads: true,
             unresponsive_until: Mutex::new(None),
             warned: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Whether `get_text` may run `wl-paste` at all.
+    pub fn with_reads(mut self, reads: bool) -> Self {
+        self.reads = reads;
+        self
     }
 }
 
 impl<R: ClipboardCommandRunner> ClipboardBackend for WaylandClipboardBackend<R> {
     fn get_text(&self) -> Result<String, InputError> {
+        if !self.reads {
+            return Err(InputError::ClipboardError(
+                "reading the clipboard would take keyboard focus here; reads are off".into(),
+            ));
+        }
         let resting = self
             .unresponsive_until
             .lock()
@@ -133,6 +174,44 @@ impl<R: ClipboardCommandRunner> ClipboardBackend for WaylandClipboardBackend<R> 
 mod tests {
     use super::*;
     use crate::clipboard::cmd::{CommandOutput, MockCommandRunner};
+
+    fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| {
+            vars.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn reads_take_focus_on_gnome_only() {
+        assert!(reads_take_focus(env(&[(
+            "XDG_CURRENT_DESKTOP",
+            "ubuntu:GNOME"
+        )])));
+        assert!(reads_take_focus(env(&[("XDG_SESSION_DESKTOP", "gnome")])));
+        assert!(!reads_take_focus(env(&[("XDG_CURRENT_DESKTOP", "KDE")])));
+        assert!(!reads_take_focus(env(&[("XDG_CURRENT_DESKTOP", "sway")])));
+        assert!(!reads_take_focus(env(&[])));
+        assert!(!reads_take_focus(env(&[
+            ("XDG_CURRENT_DESKTOP", "GNOME"),
+            (READS_ON_GNOME_ENV, "1"),
+        ])));
+    }
+
+    #[test]
+    fn with_reads_off_wl_paste_never_runs_but_writes_still_do() {
+        let runner = MockCommandRunner::new();
+        runner.set_response(
+            "wl-paste",
+            &["--no-newline"],
+            CommandOutput::success(b"would steal focus"),
+        );
+        runner.set_response("wl-copy", &[], CommandOutput::success(b""));
+        let mut backend = WaylandClipboardBackend::with_runner(runner).with_reads(false);
+        assert!(backend.get_text().is_err());
+        assert!(backend.set_text("from the headset").is_ok());
+    }
 
     #[test]
     fn test_wayland_clipboard_get_text_success() {
