@@ -5,7 +5,7 @@ use crate::spatial::interaction::{InteractionInput, InteractionSource};
 use crate::spatial::limits::{
     clamp_curve_angle, clamp_distance, clamp_tilt, MIN_TWO_HAND_SEPARATION_M,
 };
-use crate::spatial::pose::{ScreenPose, Vec3};
+use crate::spatial::pose::{Quat, ScreenPose, Vec3};
 use crate::spatial::ray::{Ray, RayHit};
 use crate::spatial::transform::ScreenTransform;
 
@@ -89,6 +89,35 @@ pub struct GrabSession {
 
     /// Two-handed scale state, present while a second hand or controller also grabs the screen.
     pub two_hand: Option<Box<TwoHandScale>>,
+
+    /// How a move follows the pointing ray, when the grab started with one.
+    pub ray_drag: Option<Box<RayDrag>>,
+}
+
+/// A move that follows the pointing ray, as Horizon OS windows do: the grabbed point stays on
+/// the ray, the window stays upright and turned towards the viewer, and moving the hand along
+/// the pointing direction pushes or pulls it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RayDrag {
+    /// Distance along the ray from its origin to the grabbed point.
+    pub distance: f32,
+    /// Screen centre relative to the grabbed point, in the upright frame facing the viewer.
+    pub local_offset: Vec3,
+    /// Hand position and pointing direction when the grab started.
+    pub hand_start: Vec3,
+    pub direction_start: Vec3,
+}
+
+/// How much further the window goes than the hand when pushed or pulled.
+pub const PUSH_PULL_GAIN: f32 = 3.0;
+/// Closest a dragged window comes to the pointer, in meters.
+pub const MIN_DRAG_DISTANCE_M: f32 = 0.3;
+
+/// Upright orientation (no pitch, no roll) whose front (+Z) faces `viewer` from `at`.
+pub fn upright_facing(at: Vec3, viewer: Vec3) -> Option<Quat> {
+    let d = viewer - at;
+    (d.x.abs() + d.z.abs() > 1e-4)
+        .then(|| Quat::from_axis_angle(Vec3::new(0.0, 1.0, 0.0), d.x.atan2(d.z)))
 }
 
 /// State captured when a second hand or controller joins an active grab to scale the screen.
@@ -175,6 +204,8 @@ pub struct GrabStateMachine {
     push_pull_speed: f32,
     tilt_speed: f32,
     curve_speed: f32,
+    /// Where the user's head is, which a moved window turns to face.
+    viewer: Option<Vec3>,
 }
 
 impl Default for GrabStateMachine {
@@ -184,6 +215,7 @@ impl Default for GrabStateMachine {
             push_pull_speed: 1.2, // 1.2 meters per second at full deflection
             tilt_speed: 1.0,      // ~57 degrees per second
             curve_speed: 0.8,     // central angle radians per second
+            viewer: None,
         }
     }
 }
@@ -192,6 +224,12 @@ impl GrabStateMachine {
     /// Creates a new grab state machine in the Idle state.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Where the user's head is: a window being moved turns to face it. Without it, windows
+    /// face the pointer's origin.
+    pub fn set_viewer(&mut self, viewer: Vec3) {
+        self.viewer = Some(viewer);
     }
 
     /// Current lifecycle state of the interaction state machine.
@@ -346,6 +384,22 @@ impl GrabStateMachine {
                         },
                         None => GrabMode::Move,
                     };
+                    let ray_drag = match (&mode, input.aim_ray.as_ref()) {
+                        (GrabMode::Move, Some(ray)) => {
+                            let viewer = self.viewer.unwrap_or(ray.origin);
+                            let upright = upright_facing(grab_hit.point, viewer)
+                                .unwrap_or(target_screen.orientation);
+                            Some(Box::new(RayDrag {
+                                distance: grab_hit.distance,
+                                local_offset: upright
+                                    .conjugate()
+                                    .rotate_vec(target_screen.position - grab_hit.point),
+                                hand_start: ctrl_pose.position,
+                                direction_start: ray.direction.normalize(),
+                            }))
+                        }
+                        _ => None,
+                    };
 
                     let session = GrabSession {
                         display_id: current_display_id,
@@ -356,6 +410,7 @@ impl GrabStateMachine {
                         initial_screen_transform: target_screen.clone(),
                         current_screen_transform: target_screen,
                         two_hand: None,
+                        ray_drag,
                     };
 
                     self.state = InteractionState::Grabbing(session);
@@ -552,30 +607,37 @@ impl GrabStateMachine {
                     });
                 }
 
-                // One-hand drag: calculate 6DoF rigid-body transform following controller pose
-                let current_ctrl_pose = primary_pose;
-                let initial_ctrl = session.initial_controller_pose;
-                let initial_screen = session.initial_screen_pose;
-
-                // 1. Controller rotation delta: dQ = Q_c * (Q_c0)^-1
-                let dq = (current_ctrl_pose.orientation * initial_ctrl.orientation.conjugate())
-                    .normalize();
-
-                // 2. Initial relative offset from controller to screen: V0 = P_s0 - P_c0
-                let v0 = initial_screen.position - initial_ctrl.position;
-
-                // 3. Rotated offset: V = dQ * V0
-                let v_rotated = dq.rotate_vec(v0);
-
-                // 4. New screen position: P_s = P_c + V
-                let new_screen_pos = current_ctrl_pose.position + v_rotated;
-
-                // 5. New screen orientation: Q_s = dQ * Q_s0
-                let new_screen_orient = (dq * initial_screen.orientation).normalize();
-
                 let mut transform = session.current_screen_transform.clone();
-                transform.position = new_screen_pos;
-                transform.orientation = new_screen_orient;
+                let mut thumbstick = input.thumbstick;
+                if let (Some(drag), Some(ray)) = (&mut session.ray_drag, input.aim_ray.as_ref()) {
+                    // Follow the ray: the grabbed point stays on it, the hand's motion along the
+                    // pointing direction (and the thumbstick) pushes or pulls, and the window
+                    // stays upright facing the viewer however the wrist turns.
+                    if thumbstick.1.abs() > 0.05 {
+                        drag.distance += thumbstick.1 * self.push_pull_speed * dt_seconds;
+                    }
+                    thumbstick.1 = 0.0;
+                    let reach = (primary_pose.position - drag.hand_start).dot(drag.direction_start);
+                    let distance =
+                        (drag.distance + PUSH_PULL_GAIN * reach).max(MIN_DRAG_DISTANCE_M);
+                    let point = ray.origin + ray.direction.normalize() * distance;
+                    let viewer = self.viewer.unwrap_or(ray.origin);
+                    let orientation =
+                        upright_facing(point, viewer).unwrap_or(transform.orientation);
+                    transform.position = point + orientation.rotate_vec(drag.local_offset);
+                    transform.orientation = orientation;
+                } else {
+                    // No ray (a hand grabbing by its pose): follow the hand's position, and keep
+                    // the window upright facing the viewer rather than copying the wrist's turn.
+                    let initial_ctrl = session.initial_controller_pose;
+                    let initial_screen = session.initial_screen_pose;
+                    let new_screen_pos =
+                        initial_screen.position + (primary_pose.position - initial_ctrl.position);
+                    let viewer = self.viewer.unwrap_or(primary_pose.position);
+                    transform.position = new_screen_pos;
+                    transform.orientation = upright_facing(new_screen_pos, viewer)
+                        .unwrap_or(initial_screen.orientation);
+                }
 
                 // Synchronize spherical distance, yaw, tilt from new 6DoF pose
                 let horiz_dist = (transform.position.x * transform.position.x
@@ -588,10 +650,10 @@ impl GrabStateMachine {
                 transform.yaw = yaw;
                 transform.roll = roll;
 
-                // 6. and 7. Thumbstick push/pull, tilt and curve adjustments
+                // Thumbstick tilt and curve adjustments (push/pull is in the drag above)
                 apply_thumbstick(
                     &mut transform,
-                    input.thumbstick,
+                    thumbstick,
                     dt_seconds,
                     (self.push_pull_speed, self.tilt_speed, self.curve_speed),
                 );
@@ -794,9 +856,13 @@ mod tests {
         ));
         assert!(sm.is_grabbing());
 
-        // 3. Drag controller (translate right +0.3m, up +0.1m)
+        // 3. Drag controller (translate right +0.3m, up +0.1m): its ray moves with it
         let mut input_drag = input_grab;
         input_drag.grab_pose = Some(ScreenPose::new(Vec3::new(0.5, 1.3, -0.4), Quat::IDENTITY));
+        input_drag.aim_ray = Some(crate::spatial::ray::Ray::new(
+            Vec3::new(0.3, 1.5, 0.0),
+            Vec3::new(0.0, 0.0, -1.0),
+        ));
 
         let ev3 = sm
             .update(&input_drag, screens.clone(), 0.016)
@@ -863,23 +929,31 @@ mod tests {
         sm.update(&input_start, screens.clone(), 0.016);
         assert!(sm.is_grabbing());
 
-        // Rotate controller 90 degrees CCW (around Y):
-        // Relative offset (0, 0, -1) rotates into (+1, 0, 0)!
+        // Turn the controller 90 degrees CCW (around Y): its ray now points to the side.
         let rotated_pose = ScreenPose::new(
             Vec3::new(0.0, 1.4, 0.0),
             Quat::from_euler(0.0, FRAC_PI_2, 0.0),
         );
         let mut input_rotated = input_start;
         input_rotated.grab_pose = Some(rotated_pose);
+        input_rotated.aim_ray = Some(crate::spatial::ray::Ray::new(
+            rotated_pose.position,
+            rotated_pose
+                .orientation
+                .rotate_vec(Vec3::new(0.0, 0.0, -1.0)),
+        ));
 
         let ev = sm
             .update(&input_rotated, screens.clone(), 0.016)
             .expect("GrabUpdated");
         if let InteractionEvent::GrabUpdated { transform, .. } = ev {
-            // Rotated offset from (0, 0, -1) rotated by 90 deg around Y:
-            // Since OpenXR rotation maps -Z to -X or +X depending on yaw direction
+            // The screen swings round along the ray, the same distance away...
             assert!(transform.position.x.abs() > 0.9);
             assert!((transform.position.z).abs() < 0.1);
+            // ...and turns to face the pointer's origin.
+            let front = transform.orientation.rotate_vec(Vec3::new(0.0, 0.0, 1.0));
+            let back = (Vec3::new(0.0, 1.4, 0.0) - transform.position).normalize();
+            assert!(front.dot(back) > 0.99, "{front:?} {back:?}");
         } else {
             panic!("Expected GrabUpdated");
         }
@@ -1669,5 +1743,124 @@ mod tests {
         sm.update(&release, vec![(0, &screen)], 0.016);
         assert_eq!(sm.resizing(), None);
         assert_eq!(sm.hovered_corner(), Some(Corner::TopLeft));
+    }
+
+    /// Hovers then grabs the default flat screen with a ray from `origin` along -Z.
+    fn grab_flat_screen(sm: &mut GrabStateMachine, screen: &ScreenTransform, origin: Vec3) {
+        let input = InteractionInput {
+            source: InteractionSource::Controller(Handedness::Right),
+            aim_ray: Some(crate::spatial::ray::Ray::new(
+                origin,
+                Vec3::new(0.0, 0.0, -1.0),
+            )),
+            grab_pose: Some(ScreenPose::new(origin, Quat::IDENTITY)),
+            is_grabbing: false,
+            is_selecting: false,
+            thumbstick: (0.0, 0.0),
+        };
+        sm.update(&input, vec![(0, screen)], 0.016);
+        let grab = InteractionInput {
+            is_grabbing: true,
+            ..input
+        };
+        sm.update(&grab, vec![(0, screen)], 0.016);
+        assert!(sm.is_grabbing());
+    }
+
+    #[test]
+    fn turning_the_wrist_while_moving_keeps_the_screen_upright() {
+        let mut sm = GrabStateMachine::new();
+        sm.set_viewer(Vec3::new(0.0, 1.6, 0.3));
+        let mut screen = ScreenTransform::for_display(0);
+        screen.display_mode = DisplayMode::FlatQuad;
+        screen.set_distance(1.5);
+        let origin = Vec3::new(0.0, screen.position.y, 0.0);
+        grab_flat_screen(&mut sm, &screen, origin);
+
+        // Roll and pitch the hand; the ray still points at the screen.
+        let twisted = Quat::from_euler(0.4, 0.0, 0.7);
+        let input = InteractionInput {
+            source: InteractionSource::Controller(Handedness::Right),
+            aim_ray: Some(crate::spatial::ray::Ray::new(
+                origin,
+                Vec3::new(0.0, 0.0, -1.0),
+            )),
+            grab_pose: Some(ScreenPose::new(origin, twisted)),
+            is_grabbing: true,
+            is_selecting: false,
+            thumbstick: (0.0, 0.0),
+        };
+        let Some(InteractionEvent::GrabUpdated { transform, .. }) =
+            sm.update(&input, vec![(0, &screen)], 0.016)
+        else {
+            panic!("expected GrabUpdated");
+        };
+        let up = transform.orientation.rotate_vec(Vec3::new(0.0, 1.0, 0.0));
+        assert!(up.y > 0.9999, "the screen stays upright: {up:?}");
+        assert!((transform.position - screen.position).length() < 1e-3);
+    }
+
+    #[test]
+    fn grabbing_a_tilted_screen_straightens_it() {
+        let mut sm = GrabStateMachine::new();
+        let mut screen = ScreenTransform::for_display(0);
+        screen.display_mode = DisplayMode::FlatQuad;
+        screen.set_distance(1.5);
+        screen.orientation = Quat::from_euler(0.15, 0.0, 0.2);
+        let origin = Vec3::new(0.0, screen.position.y, 0.0);
+        grab_flat_screen(&mut sm, &screen, origin);
+        let input = InteractionInput {
+            source: InteractionSource::Controller(Handedness::Right),
+            aim_ray: Some(crate::spatial::ray::Ray::new(
+                origin,
+                Vec3::new(0.0, 0.0, -1.0),
+            )),
+            grab_pose: Some(ScreenPose::new(origin, Quat::IDENTITY)),
+            is_grabbing: true,
+            is_selecting: false,
+            thumbstick: (0.0, 0.0),
+        };
+        let Some(InteractionEvent::GrabUpdated { transform, .. }) =
+            sm.update(&input, vec![(0, &screen)], 0.016)
+        else {
+            panic!("expected GrabUpdated");
+        };
+        let up = transform.orientation.rotate_vec(Vec3::new(0.0, 1.0, 0.0));
+        let front = transform.orientation.rotate_vec(Vec3::new(0.0, 0.0, 1.0));
+        assert!(up.y > 0.9999 && front.z > 0.9999, "{up:?} {front:?}");
+    }
+
+    #[test]
+    fn pushing_the_hand_forward_sends_the_screen_further_away() {
+        let mut sm = GrabStateMachine::new();
+        let mut screen = ScreenTransform::for_display(0);
+        screen.display_mode = DisplayMode::FlatQuad;
+        screen.set_distance(1.5);
+        let origin = Vec3::new(0.0, screen.position.y, 0.0);
+        grab_flat_screen(&mut sm, &screen, origin);
+        let forward = origin + Vec3::new(0.0, 0.0, -0.1);
+        let input = InteractionInput {
+            source: InteractionSource::Controller(Handedness::Right),
+            aim_ray: Some(crate::spatial::ray::Ray::new(
+                forward,
+                Vec3::new(0.0, 0.0, -1.0),
+            )),
+            grab_pose: Some(ScreenPose::new(forward, Quat::IDENTITY)),
+            is_grabbing: true,
+            is_selecting: false,
+            thumbstick: (0.0, 0.0),
+        };
+        let Some(InteractionEvent::GrabUpdated { transform, .. }) =
+            sm.update(&input, vec![(0, &screen)], 0.016)
+        else {
+            panic!("expected GrabUpdated");
+        };
+        // 10 cm of hand travel moves the screen 0.1 + 3 x 0.1 = 40 cm further.
+        let expected = screen.position.z - 0.1 - PUSH_PULL_GAIN * 0.1;
+        assert!(
+            (transform.position.z - expected).abs() < 1e-3,
+            "{:?}",
+            transform.position
+        );
     }
 }

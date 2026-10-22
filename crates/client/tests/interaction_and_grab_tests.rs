@@ -242,19 +242,19 @@ fn test_grab_state_machine_rigid_drag_preserves_offset() {
         InteractionEvent::GrabStarted { display_id: 0, .. }
     ));
 
-    // Drag: Controller moves by (+0.4m X, -0.2m Y, +0.3m Z)
+    // Drag: the controller, and its ray, move by (+0.4m X, -0.2m Y)
     let mut drag_input = grab_input;
-    drag_input.grab_pose = Some(ScreenPose::new(Vec3::new(0.6, 1.0, -0.2), Quat::IDENTITY));
+    drag_input.grab_pose = Some(ScreenPose::new(Vec3::new(0.6, 1.0, -0.5), Quat::IDENTITY));
+    drag_input.aim_ray = Some(Ray::new(Vec3::new(0.4, 1.2, 0.0), -Vec3::UNIT_Z));
     let ev_drag = sm
         .update(&drag_input, screens.clone(), 0.016)
         .expect("GrabUpdate");
     if let InteractionEvent::GrabUpdated { transform, .. } = ev_drag {
-        // Original screen position: (0.0, 1.4, -1.5)
-        // Controller delta: (0.4, -0.2, 0.3)
-        // Expected screen position: (0.4, 1.2, -1.2)
+        // Original screen position: (0.0, 1.4, -1.5); the grabbed point stays on the ray,
+        // so the screen moves with it to (0.4, 1.2, -1.5).
         assert!((transform.position.x - 0.4).abs() < 1e-4);
         assert!((transform.position.y - 1.2).abs() < 1e-4);
-        assert!((transform.position.z - (-1.2)).abs() < 1e-4);
+        assert!((transform.position.z - (-1.5)).abs() < 1e-4);
     } else {
         panic!("Expected GrabUpdated");
     }
@@ -532,6 +532,7 @@ fn test_layout_persistence_on_manipulation_end() {
     // Drag screen to new position (+0.5m X, +0.2m Y)
     let mut drag_input = grab_input;
     drag_input.grab_pose = Some(ScreenPose::new(Vec3::new(0.5, 1.6, 0.0), Quat::IDENTITY));
+    drag_input.aim_ray = Some(Ray::new(Vec3::new(0.5, 1.6, 0.0), -Vec3::UNIT_Z));
     runtime.step_interaction(&drag_input, 0.016);
     assert!((runtime.screen_transform().position.x - 0.5).abs() < 1e-4);
 
