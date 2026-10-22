@@ -59,7 +59,7 @@ pub use packetizer::{
     Datagram, FecConfig, FramePlan, Packetizer, VideoSendError, DEFAULT_MAX_PAYLOAD,
     DEFAULT_VIDEO_PORT, MAX_DATAGRAM_SIZE,
 };
-pub use sink::{DatagramSink, Dscp, UdpSink, DEFAULT_SEND_BUFFER_BYTES};
+pub use sink::{DatagramSink, Dscp, HybridSink, UdpSink, DEFAULT_SEND_BUFFER_BYTES};
 
 /// Shortest pacing wait worth sleeping for. Timers wake up to about 1 ms late, so gaps below
 /// this are sent as a micro-burst and the schedule catches up on the next real wait.

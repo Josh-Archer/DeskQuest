@@ -15,6 +15,7 @@ pub mod pacing;
 #[cfg(feature = "quic")]
 pub mod quic;
 pub mod tcp;
+pub mod tcp_tunnel;
 pub mod udp;
 
 pub use adb::{
@@ -46,6 +47,10 @@ pub use quic::{
     QuicControl, QuicControlServer, QuicControlSession, QuicError,
 };
 pub use tcp::TcpEndpoint;
+pub use tcp_tunnel::{
+    negotiate_client, negotiate_server, recv_frame, send_frame, TunnelError, TunnelFrame,
+    USB_TUNNEL_ACCEPT, USB_TUNNEL_HELLO,
+};
 pub use udp::{PacedUdpEndpoint, DEFAULT_UDP_MTU};
 
 #[derive(Error, Debug)]

@@ -23,7 +23,7 @@ use linux_quest_transport::MdnsDiscoveryBackend;
 /// Ports the daemon is listening on, as bound. These are the values advertised.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListeningPorts {
-    /// TCP control channel (clipboard sync and handshake).
+    /// TCP tunnel and control channel (USB video, input, and clipboard sync).
     pub control: u16,
     /// UDP input channel from the Quest client.
     pub input: u16,

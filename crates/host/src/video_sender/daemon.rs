@@ -14,8 +14,8 @@ use linux_quest_encoder::{
 
 use super::control::{CaptureKind, PausablePeers, ReselectRequest, VideoControl};
 use super::{
-    spawn_video_sender, FrameSource, KeyframeRequests, UdpSink, VideoSenderConfig,
-    VideoSenderHandle, DEFAULT_SEND_BUFFER_BYTES,
+    spawn_video_sender, FrameSource, KeyframeRequests, VideoSenderConfig, VideoSenderHandle,
+    DEFAULT_SEND_BUFFER_BYTES,
 };
 use crate::codec_select::{plan_stream, StreamPlan, CLIENT_DECODE_CODECS, CODEC_PREFERENCE};
 use crate::congestion::{RateCoordinator, StreamRate};
@@ -259,7 +259,7 @@ pub(super) async fn open_planned_encoder(
     Ok((BoxedEncoder(encoder), plan, config))
 }
 
-/// Starts the UDP video sender for the headless daemon.
+/// Starts the daemon video sender for the active UDP or negotiated USB tunnel transport.
 ///
 /// Returns `Err(reason)` as one human-readable line when it cannot run, so the caller logs a
 /// single message and keeps the daemon up. Today that is the normal outcome on most machines:
@@ -269,9 +269,17 @@ pub async fn start_daemon_video_sender(
     options: DaemonVideoOptions,
     keyframe_requests: Arc<KeyframeRequests>,
     rate: Option<Arc<RateCoordinator>>,
+    tunnel_video: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
 ) -> Result<VideoSenderHandle, String> {
-    start_daemon_video_sender_with(link, options, keyframe_requests, rate, VideoControl::new())
-        .await
+    start_daemon_video_sender_with(
+        link,
+        options,
+        keyframe_requests,
+        rate,
+        tunnel_video,
+        VideoControl::new(),
+    )
+    .await
 }
 
 /// [`start_daemon_video_sender`] whose video `control` pauses, resumes and lets the user pick
@@ -281,6 +289,7 @@ pub async fn start_daemon_video_sender_with(
     options: DaemonVideoOptions,
     keyframe_requests: Arc<KeyframeRequests>,
     rate: Option<Arc<RateCoordinator>>,
+    tunnel_video: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
     control: Arc<VideoControl>,
 ) -> Result<VideoSenderHandle, String> {
     let stream_rate = rate.as_ref().map(|r| r.register_stream(0));
@@ -292,6 +301,7 @@ pub async fn start_daemon_video_sender_with(
         options.bitrate_mbps.saturating_mul(1000),
         keyframe_requests,
         stream_rate,
+        tunnel_video,
         control,
     )
     .await
@@ -309,6 +319,7 @@ pub async fn start_daemon_video_senders(
     monitors: &[linux_quest_protocol::DisplayInfo],
     keyframe_requests: Arc<KeyframeRequests>,
     rate: Option<Arc<RateCoordinator>>,
+    tunnel_video: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
 ) -> Result<Vec<VideoSenderHandle>, String> {
     if monitors.is_empty() {
         return Err("no active monitors to stream".into());
@@ -336,6 +347,7 @@ pub async fn start_daemon_video_senders(
                 bitrate.saturating_mul(1000),
                 keyframe_requests.clone(),
                 stream_rate,
+                tunnel_video.clone(),
                 VideoControl::new(),
             )
             .await?,
@@ -361,7 +373,7 @@ fn bitrate_shares(total_mbps: u32, streams: usize) -> Result<Vec<u32>, String> {
         .collect())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // one pipeline gets link, capture, rate, keyframe, tunnel and control
 async fn start_daemon_video_stream(
     link: SharedLinkTracker,
     options: DaemonVideoOptions,
@@ -370,6 +382,7 @@ async fn start_daemon_video_stream(
     initial_bitrate_kbps: u32,
     keyframe_requests: Arc<KeyframeRequests>,
     rate: Option<Arc<StreamRate>>,
+    tunnel_video: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
     control: Arc<VideoControl>,
 ) -> Result<VideoSenderHandle, String> {
     let defaults = EncoderConfig::default();
@@ -406,7 +419,7 @@ async fn start_daemon_video_stream(
         fps = geometry.2,
         "UDP video sender encoder chosen"
     );
-    let sink = UdpSink::new(DEFAULT_SEND_BUFFER_BYTES, super::Dscp::Af41)
+    let sink = super::HybridSink::new(tunnel_video, DEFAULT_SEND_BUFFER_BYTES, super::Dscp::Af41)
         .map_err(|e| format!("UDP socket: {e}"))?;
     let config = VideoSenderConfig {
         video_port: options.video_port,
@@ -465,6 +478,7 @@ mod tests {
                 bitrate_mbps: 30,
             },
             KeyframeRequests::new(),
+            None,
             None,
         )
         .await;

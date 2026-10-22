@@ -83,8 +83,8 @@ pub struct ClientConfig {
     #[serde(default)]
     pub extra_host_ips: Vec<IpAddr>,
 
-    /// Host UDP port for the low-latency input and keepalive datagrams (`Udp` mode only;
-    /// `adb reverse` cannot carry UDP, so `AdbReverseTcp` sends no input). Default `48442`.
+    /// Host UDP port for the low-latency input and keepalive datagrams (`Udp` mode only).
+    /// USB mode carries these events as packet frames over TCP. Default `48442`.
     #[serde(default = "default_input_port")]
     pub input_port: u16,
 

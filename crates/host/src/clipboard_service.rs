@@ -9,15 +9,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+use tokio::io::BufReader;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use linux_quest_input::{
     AutoClipboardBackend, ClipboardBackend, ClipboardWatcher, ClipboardWatcherConfig,
     DEFAULT_CLIPBOARD_DEBOUNCE_DURATION, DEFAULT_CLIPBOARD_POLL_INTERVAL,
 };
+use linux_quest_protocol::Packet;
 use linux_quest_protocol::{ClipboardMessage, ClipboardSyncEngine, SyncAction};
-use linux_quest_transport::{ControlChannel, ControlMessage, TransportError};
+use linux_quest_transport::{
+    negotiate_server, recv_frame, send_frame, ControlMessage, TransportError, TunnelFrame,
+};
 
 use crate::headset::HeadsetHub;
 use crate::link_status::SharedLinkTracker;
@@ -61,6 +65,9 @@ pub struct HostClipboardService<B: ClipboardBackend + 'static = AutoClipboardBac
     listener: Option<TcpListener>,
     peer_writers: Arc<Mutex<Vec<mpsc::UnboundedSender<ControlMessage>>>>,
     link: Option<SharedLinkTracker>,
+    tunnel_packet_handler: Option<Arc<dyn Fn(Packet) + Send + Sync>>,
+    tunnel_video: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
+    tunnel_keyframe_request: Option<Arc<dyn Fn() + Send + Sync>>,
     headset: Option<Arc<HeadsetHub>>,
 }
 
@@ -90,6 +97,9 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
             listener: None,
             peer_writers: Arc::new(Mutex::new(Vec::new())),
             link: None,
+            tunnel_packet_handler: None,
+            tunnel_video: None,
+            tunnel_keyframe_request: None,
             headset: None,
         }
     }
@@ -100,7 +110,27 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
         self
     }
 
-    /// Greets every control connection with a headset status request and records the
+    /// Routes packet frames from negotiated USB tunnel peers to the host's packet handler.
+    pub fn with_tunnel_packet_handler(
+        mut self,
+        handler: Arc<dyn Fn(Packet) + Send + Sync>,
+    ) -> Self {
+        self.tunnel_packet_handler = Some(handler);
+        self
+    }
+
+    /// Adds the outbound packet stream used by negotiated USB tunnel peers.
+    pub fn with_tunnel_video(mut self, video: tokio::sync::broadcast::Sender<Vec<u8>>) -> Self {
+        self.tunnel_video = Some(video);
+        self
+    }
+
+    pub fn with_tunnel_keyframe_request(mut self, request: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.tunnel_keyframe_request = Some(request);
+        self
+    }
+
+    /// Greets every plain control connection with a headset status request and records the
     /// answers in `hub`, so the daemon can read and change the headset's layout and settings.
     pub fn with_headset_hub(mut self, hub: Arc<HeadsetHub>) -> Self {
         self.headset = Some(hub);
@@ -224,6 +254,9 @@ impl<B: ClipboardBackend + 'static> HostClipboardService<B> {
             peer_writers: self.peer_writers.clone(),
             link: self.link.clone(),
             headset: self.headset.clone(),
+            tunnel_packet_handler: self.tunnel_packet_handler.clone(),
+            tunnel_video: self.tunnel_video.clone(),
+            tunnel_keyframe_request: self.tunnel_keyframe_request.clone(),
         }
     }
 
@@ -256,6 +289,9 @@ struct PeerContext<B: ClipboardBackend + 'static> {
     peer_writers: Arc<Mutex<Vec<mpsc::UnboundedSender<ControlMessage>>>>,
     link: Option<SharedLinkTracker>,
     headset: Option<Arc<HeadsetHub>>,
+    tunnel_packet_handler: Option<Arc<dyn Fn(Packet) + Send + Sync>>,
+    tunnel_video: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
+    tunnel_keyframe_request: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl<B: ClipboardBackend + 'static> PeerContext<B> {
@@ -286,80 +322,246 @@ impl<B: ClipboardBackend + 'static> PeerContext<B> {
     }
 
     fn spawn_peer_handler(&self, stream: TcpStream, peer_addr: SocketAddr) {
-        let (reader, writer) = stream.into_split();
-        let mut ctrl_reader = ControlChannel::new(reader, tokio::io::sink());
-        let mut ctrl_writer = ControlChannel::new(tokio::io::empty(), writer);
-
-        let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<ControlMessage>();
-        self.peer_writers.lock().push(peer_tx.clone());
-        let headset = self.headset.clone();
-        let headset_id = headset.as_ref().map(|hub| {
-            // A headset that understands the settings channel answers with its status; an
-            // older one ignores the message (it skips what it cannot decode).
-            let _ = peer_tx.send(HeadsetHub::greeting());
-            hub.next_peer_id()
-        });
-
+        let running = self.running.clone();
+        let link = self.link.clone();
         let sync_engine = self.sync_engine.clone();
         let backend = self.backend.clone();
-        let running = self.running.clone();
-
-        // Task sending outgoing messages to peer
-        let running_writer = running.clone();
+        let packet_handler = self.tunnel_packet_handler.clone();
+        let keyframe_request = self.tunnel_keyframe_request.clone();
+        let mut video_rx = self.tunnel_video.as_ref().map(|tx| tx.subscribe());
+        let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<ControlMessage>();
+        self.peer_writers.lock().push(peer_tx.clone());
+        let headset = self.headset.clone().map(|hub| {
+            let id = hub.next_peer_id();
+            LegacyHeadset {
+                hub,
+                id,
+                tx: peer_tx,
+            }
+        });
         tokio::spawn(async move {
-            while running_writer.load(Ordering::Relaxed) {
-                match peer_rx.recv().await {
-                    Some(msg) => {
-                        if ctrl_writer.send_message(&msg).await.is_err() {
+            let mut probe = [0u8; linux_quest_transport::USB_TUNNEL_HELLO.len()];
+            let probe_result = tokio::time::timeout(
+                linux_quest_transport::tcp_tunnel::TUNNEL_NEGOTIATION_TIMEOUT,
+                async {
+                    loop {
+                        match stream.peek(&mut probe).await {
+                            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof),
+                            Ok(n) if n == probe.len() => return Ok(()),
+                            Ok(_) => tokio::task::yield_now().await,
+                            Err(error) => return Err(error.kind()),
+                        }
+                    }
+                },
+            )
+            .await;
+            if !matches!(probe_result, Ok(Ok(()))) {
+                if let Some(link) = link {
+                    link.lock().control_closed(peer_addr);
+                }
+                return;
+            }
+            let is_tunnel = probe == *linux_quest_transport::USB_TUNNEL_HELLO;
+            let (reader, writer) = stream.into_split();
+            let mut writer = writer;
+            if is_tunnel {
+                let mut reader = reader;
+                let negotiated = tokio::time::timeout(
+                    linux_quest_transport::tcp_tunnel::TUNNEL_NEGOTIATION_TIMEOUT,
+                    negotiate_server(&mut reader, &mut writer),
+                )
+                .await;
+                if !matches!(negotiated, Ok(Ok(()))) {
+                    if let Some(link) = link {
+                        link.lock().control_closed(peer_addr);
+                    }
+                    return;
+                }
+                let (incoming_tx, mut incoming_rx) = mpsc::channel(32);
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(reader);
+                    loop {
+                        let result = recv_frame(&mut reader).await;
+                        let failed = result.is_err();
+                        if incoming_tx.send(result).await.is_err() || failed {
                             break;
                         }
                     }
-                    None => break,
-                }
-            }
-        });
-
-        // Task receiving incoming messages from peer; reports the close when it ends
-        let link = self.link.clone();
-        tokio::spawn(async move {
-            while running.load(Ordering::Relaxed) {
-                let received = ctrl_reader.recv_message().await;
-                if let (Ok(_), Some(link)) = (&received, &link) {
-                    link.lock().control_activity(Instant::now());
-                }
-                match received {
-                    Ok(ControlMessage::Clipboard(clip_msg)) => {
-                        let action = {
-                            let mut engine = sync_engine.lock();
-                            engine.process_incoming_message(clip_msg)
-                        };
-
-                        if let Ok(SyncAction::ApplyToLocal(text)) = action {
-                            let mut b = backend.lock();
-                            let _ = b.set_text(&text);
+                });
+                while running.load(Ordering::Relaxed) {
+                    let received = tokio::select! {
+                        outgoing = peer_rx.recv() => match outgoing {
+                            Some(message) => {
+                                if send_frame(&mut writer, &TunnelFrame::Control(message)).await.is_err() { break; }
+                                continue;
+                            }
+                            None => break,
+                        },
+                        video = async {
+                            match video_rx.as_mut() {
+                                Some(rx) => Some(rx.recv().await),
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            match video {
+                                Some(result) => {
+                                    let (packet, closed) = handle_video_result(result, keyframe_request.as_ref());
+                                    if closed { break; }
+                                    if let Some(bytes) = packet {
+                                        if send_frame(&mut writer, &TunnelFrame::Packet(bytes)).await.is_err() { break; }
+                                    }
+                                }
+                                None => break,
+                            }
+                            continue;
+                        },
+                        incoming = incoming_rx.recv() => incoming,
+                    };
+                    let Some(received) = received else { break };
+                    if let (Ok(_), Some(link)) = (&received, &link) {
+                        link.lock().control_activity(Instant::now());
+                    }
+                    match received {
+                        Ok(TunnelFrame::Control(ControlMessage::Clipboard(clip_msg))) => {
+                            apply_clipboard_message(&sync_engine, &backend, clip_msg);
                         }
-                    }
-                    Ok(ControlMessage::HeadsetStatus(status)) => {
-                        if let (Some(hub), Some(id)) = (&headset, headset_id) {
-                            hub.status_received(id, peer_addr, &peer_tx, *status);
+                        Ok(TunnelFrame::Control(ControlMessage::Disconnect { .. })) => break,
+                        Ok(TunnelFrame::Packet(bytes)) => {
+                            if let (Some(handler), Ok(packet)) =
+                                (&packet_handler, Packet::from_bytes(&bytes))
+                            {
+                                handler(packet);
+                            }
                         }
+                        Ok(TunnelFrame::Control(_)) => {}
+                        Err(_) => break,
                     }
-                    Ok(ControlMessage::Disconnect { .. }) => break,
-                    Ok(_) => {}
-                    Err(e) if e.is_recoverable() => {
-                        tracing::debug!(peer = %peer_addr, error = %e, "skipping control message");
-                    }
-                    Err(_) => break,
                 }
-            }
-            if let (Some(hub), Some(id)) = (&headset, headset_id) {
-                hub.peer_closed(id);
-            }
-            if let Some(link) = link {
-                link.lock().control_closed(peer_addr);
+                if let Some(link) = link {
+                    link.lock().control_closed(peer_addr);
+                }
+            } else {
+                run_legacy_control_peer(
+                    reader,
+                    writer,
+                    peer_rx,
+                    sync_engine,
+                    backend,
+                    link,
+                    peer_addr,
+                    running,
+                    headset,
+                )
+                .await;
             }
         });
     }
+}
+
+fn handle_video_result(
+    result: Result<Vec<u8>, broadcast::error::RecvError>,
+    keyframe_request: Option<&Arc<dyn Fn() + Send + Sync>>,
+) -> (Option<Vec<u8>>, bool) {
+    match result {
+        Ok(bytes) => (Some(bytes), false),
+        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+            tracing::warn!(skipped, "USB video tunnel lagged; requesting keyframe");
+            if let Some(request) = keyframe_request {
+                request();
+            }
+            (None, false)
+        }
+        Err(broadcast::error::RecvError::Closed) => (None, true),
+    }
+}
+
+fn apply_clipboard_message<B: ClipboardBackend>(
+    sync_engine: &Arc<Mutex<ClipboardSyncEngine>>,
+    backend: &Arc<Mutex<B>>,
+    message: ClipboardMessage,
+) {
+    let action = sync_engine.lock().process_incoming_message(message);
+    if let Ok(SyncAction::ApplyToLocal(text)) = action {
+        let _ = backend.lock().set_text(&text);
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Legacy and tunnel peers share the same service state.
+async fn run_legacy_control_peer<B: ClipboardBackend + 'static>(
+    reader: tokio::net::tcp::OwnedReadHalf,
+    writer: tokio::net::tcp::OwnedWriteHalf,
+    mut outgoing: mpsc::UnboundedReceiver<ControlMessage>,
+    sync_engine: Arc<Mutex<ClipboardSyncEngine>>,
+    backend: Arc<Mutex<B>>,
+    link: Option<SharedLinkTracker>,
+    peer_addr: SocketAddr,
+    running: Arc<AtomicBool>,
+    headset: Option<LegacyHeadset>,
+) {
+    let (incoming_tx, mut incoming_rx) = mpsc::channel(16);
+    tokio::spawn(async move {
+        let mut channel = linux_quest_transport::ControlChannel::new(reader, tokio::io::sink());
+        loop {
+            let message = channel.recv_message().await;
+            if let Err(e) = &message {
+                // A message from a newer peer: skip it, the stream is still in step.
+                if e.is_recoverable() {
+                    tracing::debug!(peer = %peer_addr, error = %e, "skipping control message");
+                    continue;
+                }
+            }
+            let failed = message.is_err();
+            if incoming_tx.send(message).await.is_err() || failed {
+                break;
+            }
+        }
+    });
+    let mut channel = linux_quest_transport::ControlChannel::new(tokio::io::empty(), writer);
+    // A headset that understands the settings channel answers with its status; an older one
+    // skips the message.
+    if headset.is_some() && channel.send_message(&HeadsetHub::greeting()).await.is_err() {
+        if let Some(link) = link {
+            link.lock().control_closed(peer_addr);
+        }
+        return;
+    }
+    while running.load(Ordering::Relaxed) {
+        tokio::select! {
+            message = outgoing.recv() => match message {
+                Some(message) => if channel.send_message(&message).await.is_err() { break; },
+                None => break,
+            },
+            message = incoming_rx.recv() => match message {
+                Some(Ok(message)) => {
+                    if let Some(link) = &link { link.lock().control_activity(Instant::now()); }
+                    match message {
+                        ControlMessage::Clipboard(clip) => apply_clipboard_message(&sync_engine, &backend, clip),
+                        ControlMessage::HeadsetStatus(status) => {
+                            if let Some(h) = &headset {
+                                h.hub.status_received(h.id, peer_addr, &h.tx, *status);
+                            }
+                        }
+                        ControlMessage::Disconnect { .. } => break,
+                        _ => {},
+                    }
+                }
+                Some(Err(_)) | None => break,
+            }
+        }
+    }
+    if let Some(h) = &headset {
+        h.hub.peer_closed(h.id);
+    }
+    if let Some(link) = link {
+        link.lock().control_closed(peer_addr);
+    }
+}
+
+/// A plain control peer's place in the headset hub: its id and its writer.
+struct LegacyHeadset {
+    hub: Arc<HeadsetHub>,
+    id: u64,
+    tx: mpsc::UnboundedSender<ControlMessage>,
 }
 
 impl HostClipboardService<AutoClipboardBackend> {
@@ -401,7 +603,11 @@ impl HostClipboardService<AutoClipboardBackend> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use linux_quest_input::MockClipboardBackend;
+    use linux_quest_protocol::{PacketHeader, PacketType};
+    use linux_quest_transport::{negotiate_client, recv_frame, ControlMessage, TunnelFrame};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
     async fn test_control_keepalive_is_enabled_on_accepted_socket() {
@@ -440,6 +646,189 @@ mod tests {
         );
         enable_control_nodelay(&stream).unwrap();
         assert!(stream.nodelay().unwrap());
+    }
+
+    #[tokio::test]
+    async fn negotiated_usb_peer_routes_packets_and_video_frames() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let backend = Arc::new(Mutex::new(MockClipboardBackend::new()));
+        let sync = Arc::new(Mutex::new(ClipboardSyncEngine::new(7)));
+        let (outgoing, _outgoing_rx) = mpsc::unbounded_channel::<ControlMessage>();
+        let (_incoming_tx, incoming) = mpsc::unbounded_channel::<ClipboardMessage>();
+        let mut service = HostClipboardService::new(backend, sync, outgoing, incoming);
+        service.listener = Some(listener);
+        let packets = Arc::new(AtomicUsize::new(0));
+        let packet_count = packets.clone();
+        let (video_tx, _) = tokio::sync::broadcast::channel(8);
+        let link =
+            crate::link_status::new_shared_link_tracker(crate::link_status::DEFAULT_INPUT_LIVENESS);
+        let running = service.running_flag();
+        service = service
+            .with_link_tracker(link.clone())
+            .with_tunnel_packet_handler(Arc::new(move |_| {
+                packet_count.fetch_add(1, Ordering::Relaxed);
+            }))
+            .with_tunnel_video(video_tx.clone());
+        let task = tokio::spawn(async move { service.run().await.unwrap() });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+        negotiate_client(&mut reader, &mut writer).await.unwrap();
+        // Video is sent while an input frame is only partially available on the TCP stream.
+        // The independent tunnel reader must preserve the partial length prefix across this.
+        let video = linux_quest_protocol::Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 2, 11, b"video"),
+            Bytes::from_static(b"video"),
+        );
+        video_tx.send(video.to_bytes().to_vec()).unwrap();
+        let TunnelFrame::Packet(bytes) =
+            tokio::time::timeout(Duration::from_secs(1), recv_frame(&mut reader))
+                .await
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("expected video packet")
+        };
+        assert_eq!(
+            linux_quest_protocol::Packet::from_bytes(&bytes)
+                .unwrap()
+                .payload,
+            Bytes::from_static(b"video")
+        );
+
+        let packet = linux_quest_protocol::Packet::new(
+            PacketHeader::new(PacketType::InputEvent, 0, 1, 10, b"input"),
+            Bytes::from_static(b"input"),
+        );
+        let body = bincode::serialize(&TunnelFrame::Packet(packet.to_bytes().to_vec())).unwrap();
+        let prefix = (body.len() as u32).to_be_bytes();
+        tokio::io::AsyncWriteExt::write_all(&mut writer, &prefix[..2])
+            .await
+            .unwrap();
+        let video2 = linux_quest_protocol::Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 3, 12, b"video2"),
+            Bytes::from_static(b"video2"),
+        );
+        video_tx.send(video2.to_bytes().to_vec()).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(1), recv_frame(&mut reader))
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut writer, &prefix[2..])
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut writer, &body)
+            .await
+            .unwrap();
+        assert!(link
+            .lock()
+            .status(std::time::Instant::now())
+            .last_seen
+            .is_some());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while packets.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        running.store(false, Ordering::SeqCst);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn plain_control_client_still_works_without_tunnel_hello() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let backend = Arc::new(Mutex::new(MockClipboardBackend::new()));
+        let sync = Arc::new(Mutex::new(ClipboardSyncEngine::new(7)));
+        let (outgoing, _outgoing_rx) = mpsc::unbounded_channel::<ControlMessage>();
+        let (_incoming_tx, incoming) = mpsc::unbounded_channel::<ClipboardMessage>();
+        let link =
+            crate::link_status::new_shared_link_tracker(crate::link_status::DEFAULT_INPUT_LIVENESS);
+        let mut service = HostClipboardService::new(backend, sync, outgoing.clone(), incoming)
+            .with_link_tracker(link.clone());
+        service.listener = Some(listener);
+        let running = service.running_flag();
+        let task = tokio::spawn(async move { service.run().await.unwrap() });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (reader, writer) = stream.into_split();
+        let mut legacy = linux_quest_transport::ControlChannel::new(reader, writer);
+        let outbound = ControlMessage::Heartbeat {
+            sequence: 8,
+            timestamp_us: 19,
+        };
+        legacy.send_message(&outbound).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if link
+                    .lock()
+                    .status(Instant::now())
+                    .last_seen
+                    .is_some_and(|seen| seen.elapsed() < Duration::from_millis(100))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok(),);
+
+        running.store(false, Ordering::SeqCst);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn idle_control_connection_is_closed_after_negotiation_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let backend = Arc::new(Mutex::new(MockClipboardBackend::new()));
+        let sync = Arc::new(Mutex::new(ClipboardSyncEngine::new(7)));
+        let (outgoing, _outgoing_rx) = mpsc::unbounded_channel::<ControlMessage>();
+        let (_incoming_tx, incoming) = mpsc::unbounded_channel::<ClipboardMessage>();
+        let mut service = HostClipboardService::new(backend, sync, outgoing, incoming);
+        service.listener = Some(listener);
+        let running = service.running_flag();
+        let task = tokio::spawn(async move { service.run().await.unwrap() });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut one = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(
+                linux_quest_transport::tcp_tunnel::TUNNEL_NEGOTIATION_TIMEOUT
+                    + Duration::from_secs(1),
+                tokio::io::AsyncReadExt::read(&mut client, &mut one),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            0,
+        );
+        running.store(false, Ordering::SeqCst);
+        task.abort();
+    }
+
+    #[test]
+    fn lagged_video_requests_keyframe_and_closed_sender_stops_reader() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let callback: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+        });
+        let (packet, closed) =
+            handle_video_result(Err(broadcast::error::RecvError::Lagged(3)), Some(&callback));
+        assert!(packet.is_none());
+        assert!(!closed);
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+
+        let (packet, closed) =
+            handle_video_result(Err(broadcast::error::RecvError::Closed), Some(&callback));
+        assert!(packet.is_none());
+        assert!(closed);
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -554,8 +943,17 @@ mod tests {
         // Let a slow poll start, then connect: the greeting must not wait for it.
         tokio::time::sleep(Duration::from_millis(100)).await;
         let stream = TcpStream::connect(addr).await.unwrap();
-        let (reader, _writer) = stream.into_split();
-        let mut channel = ControlChannel::new(reader, tokio::io::sink());
+        let (reader, writer) = stream.into_split();
+        // A plain control client speaks first (the host tells USB tunnel clients apart by
+        // their first bytes).
+        let mut out = linux_quest_transport::ControlChannel::new(tokio::io::empty(), writer);
+        out.send_message(&ControlMessage::Heartbeat {
+            sequence: 0,
+            timestamp_us: 0,
+        })
+        .await
+        .unwrap();
+        let mut channel = linux_quest_transport::ControlChannel::new(reader, tokio::io::sink());
         let started = std::time::Instant::now();
         let greeting = tokio::time::timeout(Duration::from_secs(5), channel.recv_message())
             .await

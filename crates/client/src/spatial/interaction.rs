@@ -402,6 +402,28 @@ impl InteractionInput {
         }
     }
 
+    /// Input from a tracked hand. Horizon OS reports a tracked hand through the controller
+    /// actions too (the `khr/simple_controller` profile: its own pinch ray as the aim pose,
+    /// the pinch as select), so that state, when present, gives the system's steadier ray
+    /// and pinch; the joints give the rest.
+    pub fn from_tracked_hand(
+        hand: Handedness,
+        gesture: &HandGestureState,
+        system: Option<&ControllerInputState>,
+    ) -> Self {
+        let mut input = Self::from_hand(hand, gesture);
+        if let Some(system) = system {
+            if let Some(aim) = &system.aim_pose {
+                input.aim_ray = Some(Ray::from_aim_pose(aim));
+            }
+            if let Some(grip) = system.grip_pose {
+                input.grab_pose = Some(grip);
+            }
+            input.is_selecting |= system.is_selecting();
+        }
+        input
+    }
+
     /// Constructs unified interaction input from a recognized hand gesture state.
     pub fn from_hand(hand: Handedness, gesture: &HandGestureState) -> Self {
         let grab_pose = if gesture.is_pinching {

@@ -234,6 +234,17 @@ fn session(
     {
         return Ended::Closed;
     }
+    // Speak first: the host tells USB tunnel clients (which open with a hello) from plain
+    // control clients by their first bytes, and drops a connection that stays silent. A
+    // heartbeat is a message every host version accepts.
+    let hello = ControlMessage::Heartbeat {
+        sequence: 0,
+        timestamp_us: 0,
+    };
+    match encode_control_frame(&hello) {
+        Ok(frame) if stream.write_all(&frame).is_ok() => {}
+        _ => return Ended::Closed,
+    }
     let greeting_deadline = Instant::now() + config.greeting_timeout;
     let mut greeted = false;
     let mut reader = ControlFrameReader::new();
@@ -386,15 +397,19 @@ mod tests {
         link.publish(status.clone());
         let mut reader = ControlFrameReader::new();
         let mut buf = [0u8; 4096];
-        let got = wait_for(|| {
-            if let Some(m) = reader.next_message() {
-                return Some(m.unwrap());
-            }
-            let n = host.read(&mut buf).ok()?;
-            reader.push(&buf[..n]);
-            reader.next_message().map(Result::unwrap)
-        });
-        assert_eq!(got, ControlMessage::HeadsetStatus(Box::new(status)));
+        let mut next = || {
+            wait_for(|| {
+                if let Some(m) = reader.next_message() {
+                    return Some(m.unwrap());
+                }
+                let n = host.read(&mut buf).ok()?;
+                reader.push(&buf[..n]);
+                reader.next_message().map(Result::unwrap)
+            })
+        };
+        // The link spoke first, with a heartbeat.
+        assert!(matches!(next(), ControlMessage::Heartbeat { .. }));
+        assert_eq!(next(), ControlMessage::HeadsetStatus(Box::new(status)));
 
         drop(host);
         wait_for(|| (!link.is_connected()).then_some(()));
@@ -413,9 +428,16 @@ mod tests {
         first
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        // The link closes it after the greeting timeout: the read sees EOF.
-        let mut byte = [0u8; 1];
-        assert_eq!(first.read(&mut byte).unwrap(), 0);
+        // The link speaks first (a heartbeat), then closes it after the greeting timeout.
+        let mut sent = Vec::new();
+        first.read_to_end(&mut sent).unwrap();
+        let mut reader = ControlFrameReader::new();
+        reader.push(&sent);
+        assert!(matches!(
+            reader.next_message(),
+            Some(Ok(ControlMessage::Heartbeat { .. }))
+        ));
+        assert!(reader.next_message().is_none(), "nothing else");
         assert!(!link.is_connected());
 
         // A loopback address of an old host is never tried again.
