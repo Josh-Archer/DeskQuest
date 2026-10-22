@@ -1,0 +1,50 @@
+{
+  "cpu_one_core_percent": {
+    "n": 60,
+    "mean": 0.1640589888077147,
+    "min": 0.0,
+    "p95": 0.9829406077315247,
+    "max": 0.9995719803098145
+  },
+  "cpu_machine_percent": {
+    "n": 60,
+    "mean": 0.006835791200321445,
+    "min": 0.0,
+    "p95": 0.040955858655480196,
+    "max": 0.04164883251290894
+  },
+  "gpu_device_percent": {
+    "n": 60,
+    "mean": 7.45,
+    "min": 6.0,
+    "p95": 10.0,
+    "max": 11.0
+  },
+  "gpu_encoder_percent": {
+    "n": 60,
+    "mean": 0.0,
+    "min": 0.0,
+    "p95": 0.0,
+    "max": 0.0
+  },
+  "client_metric_samples": 0,
+  "vrapi_samples": 60,
+  "vrapi_fps": {
+    "n": 60,
+    "mean": 90.6,
+    "min": 90,
+    "p95": 91,
+    "max": 91
+  },
+  "vrapi_stale_sum": 0,
+  "optical_latency_ms": null,
+  "optical_latency_status": "NOT MEASURED: requires optical apparatus",
+  "stream": null,
+  "host_gpu": {
+    "sm_percent": null,
+    "memory_percent": null,
+    "encoder_percent": null,
+    "decoder_percent": null
+  },
+  "client_pid_stable": true
+}

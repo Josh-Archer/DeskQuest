@@ -19,6 +19,7 @@ local.properties
 *.swo
 *~
 .DS_Store
+__pycache__/
 
 # Logs & Dumps
 *.log

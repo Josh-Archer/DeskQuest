@@ -1007,6 +1007,32 @@ impl QuestClientRuntime {
         self.decoder.stats()
     }
 
+    /// Machine-readable primary-stream counters for hardware validation. Surface releases
+    /// are submission counts, not proof of photons or distinct compositor presentations.
+    pub fn validation_metrics(&self) -> serde_json::Value {
+        let d = self.decoder.stats();
+        let h = self.hud.snapshot();
+        let p = self.frame_loop.last_metrics();
+        serde_json::json!({
+            "loop_frames": self.frame_loop.frame_counter(),
+            "hud_fps": h.fps,
+            "target_hz": h.target_fps,
+            "hud_estimate_ms": h.motion_to_photon_ms,
+            "wait_us": p.wait_frame_duration_us,
+            "render_us": p.render_duration_us,
+            "queued": d.frames_queued,
+            "decoded": d.frames_decoded,
+            "surface_releases": d.frames_rendered,
+            "decoder_dropped": d.frames_dropped,
+            "decode_last_us": d.last_latency_us,
+            "decoder": d.decoder_name,
+            "packets": h.packets_received,
+            "packets_lost": h.packets_lost,
+            "fec_recovered": h.fec_recovered,
+            "simulated": self.openxr_context.is_simulated(),
+        })
+    }
+
     /// Whether the client runtime is actively running.
     pub fn is_running(&self) -> bool {
         self.is_running

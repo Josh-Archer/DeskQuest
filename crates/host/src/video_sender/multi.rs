@@ -25,7 +25,7 @@ use super::daemon::{
     open_planned_encoder, start_daemon_video_sender, CaptureFrameSource, DaemonVideoOptions,
 };
 use super::{
-    spawn_video_sender, Dscp, KeyframeRequests, UdpSink, VideoSenderConfig, VideoSenderHandle,
+    spawn_video_sender, Dscp, HybridSink, KeyframeRequests, VideoSenderConfig, VideoSenderHandle,
     VideoSenderStats, DEFAULT_SEND_BUFFER_BYTES,
 };
 use crate::congestion::{RateCoordinator, StreamRate};
@@ -190,6 +190,7 @@ pub async fn start_daemon_video_senders(
     options: MultiStreamOptions,
     keyframe_requests: Arc<KeyframeRequests>,
     rate: Option<Arc<RateCoordinator>>,
+    tunnel_video: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
 ) -> Result<MultiVideoSenderHandle, String> {
     if !(1..=MAX_VIDEO_STREAMS).contains(&options.streams) {
         return Err(format!(
@@ -202,6 +203,7 @@ pub async fn start_daemon_video_senders(
         options.video,
         keyframe_requests.clone(),
         rate.clone(),
+        tunnel_video.clone(),
     )
     .await?;
     let mut streams = vec![(0, primary)];
@@ -214,6 +216,7 @@ pub async fn start_daemon_video_senders(
             options.extra_stream,
             keyframe_requests.clone(),
             rate.as_ref().map(|r| r.register_stream(stream_id)),
+            tunnel_video.clone(),
         )
         .await
         {
@@ -243,6 +246,7 @@ async fn start_synthetic_stream(
     size: StreamSize,
     keyframe_requests: Arc<KeyframeRequests>,
     rate: Option<Arc<StreamRate>>,
+    tunnel_video: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
 ) -> Result<VideoSenderHandle, String> {
     let capture = SyntheticCapture::new(stream_id, size.width, size.height, size.fps);
     let source = CaptureFrameSource::open(capture, true)
@@ -269,7 +273,7 @@ async fn start_synthetic_stream(
         fps = size.fps,
         "UDP video sender encoder chosen for extra synthetic stream"
     );
-    let sink = UdpSink::new(DEFAULT_SEND_BUFFER_BYTES, Dscp::Af41)
+    let sink = HybridSink::new(tunnel_video, DEFAULT_SEND_BUFFER_BYTES, Dscp::Af41)
         .map_err(|e| format!("UDP socket: {e}"))?;
     let config = VideoSenderConfig {
         video_port: options.video_port,
@@ -366,7 +370,7 @@ mod tests {
                 fps: 30,
             },
         };
-        let handle = start_daemon_video_senders(link, options, KeyframeRequests::new(), None)
+        let handle = start_daemon_video_senders(link, options, KeyframeRequests::new(), None, None)
             .await
             .expect("mock encoder and synthetic capture need no hardware");
         assert_eq!(handle.stream_count(), 3);
@@ -405,7 +409,7 @@ mod tests {
             extra_stream: StreamSize::default(),
         };
         let handle =
-            start_daemon_video_senders(link.clone(), options, KeyframeRequests::new(), None)
+            start_daemon_video_senders(link.clone(), options, KeyframeRequests::new(), None, None)
                 .await
                 .unwrap();
         assert_eq!(handle.stream_ids(), vec![0]);
@@ -415,7 +419,7 @@ mod tests {
             streams: 4,
             ..options
         };
-        let err = start_daemon_video_senders(link, too_many, KeyframeRequests::new(), None)
+        let err = start_daemon_video_senders(link, too_many, KeyframeRequests::new(), None, None)
             .await
             .err()
             .expect("four streams are refused");

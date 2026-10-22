@@ -162,23 +162,28 @@ impl LinkTracker {
 }
 
 impl LinkTracker {
-    /// IP address UDP video should be sent to at `now`, or `None` when video must not flow.
+    /// Destination selected for video at `now`; unspecified selects the negotiated USB tunnel.
     ///
-    /// Video flows only to a peer that is reached over the network (not the loopback ADB
-    /// tunnel, which carries no UDP) and whose last activity, control or input keepalive, is
+    /// Video flows to a peer whose last activity, control or input keepalive, is
     /// within the liveness timeout. When the headset goes silent this returns `None` after
     /// [`DEFAULT_INPUT_LIVENESS`] (or whatever liveness the tracker was built with); a new input
     /// source address is picked up on the next call, so the sender follows a re-latch.
     pub fn video_peer(&self, now: Instant) -> Option<IpAddr> {
         let status = self.status(now);
-        if !status.connected || status.transport != Some(LinkTransport::Wifi) {
+        if !status.connected {
             return None;
         }
         let seen = status.last_seen?;
         if now.saturating_duration_since(seen) >= self.liveness {
             return None;
         }
-        status.peer.map(|peer| peer.ip().to_canonical())
+        match status.transport {
+            // Unspecified is an internal route marker consumed by HybridSink. Real destinations
+            // on 127.0.0.0/8 remain regular UDP destinations.
+            Some(LinkTransport::UsbAdb) => Some(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            Some(LinkTransport::Wifi) => status.peer.map(|peer| peer.ip().to_canonical()),
+            None => None,
+        }
     }
 }
 
@@ -421,12 +426,12 @@ mod tests {
     }
 
     #[test]
-    fn video_peer_ignores_the_usb_tunnel_and_folds_mapped_addresses() {
+    fn video_peer_selects_usb_tunnel_and_folds_mapped_addresses() {
         let now = Instant::now();
         assert_eq!(
             usb_tracker(now).video_peer(now),
-            None,
-            "the ADB reverse tunnel carries no UDP video"
+            Some(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            "the USB tunnel uses the explicit sink route marker"
         );
 
         let mut t = LinkTracker::new(LIVENESS);
