@@ -291,7 +291,7 @@ fn render_virtual_displays(frame: &mut Frame, area: Rect, model: &DashboardModel
 
 fn render_waterfall_section(frame: &mut Frame, area: Rect, model: &DashboardModel) {
     let block = Block::default()
-        .title(" Real-Time Latency Waterfall Breakdown ")
+        .title(" Latency Waterfall (stage sum, not optical) ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Green));
@@ -719,7 +719,7 @@ mod tests {
         assert!(rendered_text.contains("Quest-Virtual-1"));
         assert!(rendered_text.contains("2560x1440"));
         assert!(rendered_text.contains("AV1"));
-        assert!(rendered_text.contains("Real-Time Latency Waterfall Breakdown"));
+        assert!(rendered_text.contains("Latency Waterfall (stage sum, not optical)"));
         assert!(rendered_text.contains("Capture"));
         assert!(rendered_text.contains("Encode"));
         assert!(rendered_text.contains("Queue"));

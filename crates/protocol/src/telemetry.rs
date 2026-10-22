@@ -18,7 +18,9 @@ pub struct FrameLatencyBreakdown {
     pub client_decode_duration_us: u32,
     /// OpenXR composition layer blit duration
     pub client_render_duration_us: u32,
-    /// End-to-end glass-to-glass latency in microseconds
+    /// Software figure in microseconds: the sum of the stages above, or (in the daemon
+    /// dashboard) the headset's HUD estimate. A stage left at 0 was not measured. This is
+    /// NOT optical glass-to-glass latency; see docs/latency-measurement.md.
     pub total_motion_to_photon_us: u32,
 }
 

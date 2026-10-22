@@ -205,7 +205,7 @@ fn test_ratatui_render_all_dashboard_components() {
     assert!(rendered.contains("1920x1080"));
 
     // Verify Video Latency Waterfall
-    assert!(rendered.contains("Real-Time Latency Waterfall Breakdown"));
+    assert!(rendered.contains("Latency Waterfall (stage sum, not optical)"));
     assert!(rendered.contains("Capture"));
     assert!(rendered.contains("Encode"));
     assert!(rendered.contains("Queue"));
