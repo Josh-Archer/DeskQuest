@@ -1,6 +1,7 @@
 //! Debug HUD overlay rendering FPS, frame pacing, and latency metrics.
 
 pub mod font;
+pub mod latency;
 
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -8,7 +9,7 @@ use std::time::Instant;
 use crate::config::{ClientConfig, DisplayMode};
 use crate::decoder::DecoderStats;
 use crate::openxr::FramePacingMetrics;
-use linux_quest_protocol::{ClientTransportTelemetry, FrameLatencyBreakdown};
+use linux_quest_protocol::{ClientTransportTelemetry, FrameLatencyBreakdown, MeasuredFrameLatency};
 
 /// Result of a completed controller shortcut.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +88,7 @@ pub struct DebugHud {
     received_kbps: u32,
     breakdown: Option<FrameLatencyBreakdown>,
     transport: Option<ClientTransportTelemetry>,
+    measured: Option<MeasuredFrameLatency>,
 }
 
 impl Default for DebugHud {
@@ -118,7 +120,19 @@ impl DebugHud {
             received_kbps: 0,
             breakdown: None,
             transport: None,
+            measured: None,
         }
+    }
+
+    /// Records the newest measured (timestamped) frame latency, or `None` when no fresh
+    /// measurement exists, so the HUD falls back to the labeled estimate.
+    pub fn set_measured_latency(&mut self, measured: Option<MeasuredFrameLatency>) {
+        self.measured = measured;
+    }
+
+    /// The measured latency currently shown, if any.
+    pub fn measured_latency(&self) -> Option<&MeasuredFrameLatency> {
+        self.measured.as_ref()
     }
 
     /// Records the latest per-stage latency breakdown reported by telemetry.
@@ -234,13 +248,44 @@ impl DebugHud {
         text
     }
 
+    /// Latency lines: measured capture-to-present when the host clock is calibrated, else the
+    /// software estimate, labeled as such. Measured single-clock stages are shown either way.
+    fn latency_lines(&self) -> String {
+        let ms =
+            |v: Option<u64>| v.map_or("--".to_string(), |us| format!("{:.1}", us as f32 / 1000.0));
+        let est = format!(
+            "Est (SW, not g2g): {:.1}ms | Dec: {:.1}ms",
+            self.last_snapshot.motion_to_photon_ms, self.last_snapshot.decode_latency_ms
+        );
+        let Some(m) = &self.measured else {
+            return est;
+        };
+        let stages = format!(
+            "Enc {} Snd {} Net {} Buf {} Dec {} Pres {}",
+            ms(m.encode_us),
+            ms(m.send_us),
+            ms(m.network_us),
+            ms(m.jitter_us),
+            ms(m.decode_us),
+            ms(m.present_us)
+        );
+        match (m.capture_to_present_us, m.clock_rtt_us) {
+            (Some(total), Some(rtt)) => format!(
+                "Meas cap>submit: {:.1}ms +-{:.1} (no scanout)\n{}",
+                total as f32 / 1000.0,
+                rtt as f32 / 2000.0,
+                stages
+            ),
+            _ => format!("{est}\nMeas stages (no clock sync): {stages}"),
+        }
+    }
+
     fn base_text(&self) -> String {
         format!(
-            "FPS: {:.1} / {:.0}Hz\nEst (SW, not g2g): {:.1}ms | Dec: {:.1}ms\nInput: {:.2}ms\nCodec: {}\nPackets: {} | FEC: {} | Loss: {}\nRx: {:.1} Mbps",
+            "FPS: {:.1} / {:.0}Hz\n{}\nInput: {:.2}ms\nCodec: {}\nPackets: {} | FEC: {} | Loss: {}\nRx: {:.1} Mbps",
             self.last_snapshot.fps,
             self.last_snapshot.target_fps,
-            self.last_snapshot.motion_to_photon_ms,
-            self.last_snapshot.decode_latency_ms,
+            self.latency_lines(),
             self.input_latency_us as f32 / 1000.0,
             self.last_snapshot.decoder_name,
             self.last_snapshot.packets_received,
@@ -346,6 +391,45 @@ mod tests {
         let rgba = hud.render_to_rgba();
         assert_eq!(rgba.len(), 256 * 128 * 4);
         assert!(rgba.as_chunks::<4>().0.contains(&[255, 255, 255, 255]));
+    }
+
+    fn measured(calibrated: bool) -> MeasuredFrameLatency {
+        MeasuredFrameLatency {
+            frame_id: 3,
+            capture_to_encode_us: Some(500),
+            encode_us: Some(3_000),
+            send_us: Some(500),
+            network_us: calibrated.then_some(2_000),
+            jitter_us: Some(1_000),
+            decode_us: Some(2_500),
+            present_us: Some(5_500),
+            capture_to_present_us: calibrated.then_some(15_000),
+            clock_rtt_us: calibrated.then_some(1_000),
+        }
+    }
+
+    #[test]
+    fn hud_prefers_measured_latency_and_marks_estimates_otherwise() {
+        let mut hud = DebugHud::new(256, 128);
+        assert!(hud.formatted_text().contains("Est (SW, not g2g)"));
+        assert!(!hud.formatted_text().contains("Meas"));
+
+        hud.set_measured_latency(Some(measured(true)));
+        let text = hud.formatted_text();
+        assert!(
+            text.contains("Meas cap>submit: 15.0ms +-0.5 (no scanout)"),
+            "{text}"
+        );
+        assert!(text.contains("Enc 3.0 Snd 0.5 Net 2.0 Buf 1.0 Dec 2.5 Pres 5.5"));
+        assert!(!text.contains("Est (SW"));
+
+        hud.set_measured_latency(Some(measured(false)));
+        let text = hud.formatted_text();
+        assert!(text.contains("Est (SW, not g2g)"));
+        assert!(text.contains("Meas stages (no clock sync): Enc 3.0 Snd 0.5 Net -- "));
+
+        hud.set_measured_latency(None);
+        assert!(!hud.formatted_text().contains("Meas"));
     }
 
     #[test]

@@ -35,3 +35,24 @@ compositor FPS as a glass-to-glass result.
 Per-frame stage timestamps with host/headset clock calibration and stated uncertainty
 need a protocol change (frame-id-tagged stage durations plus an offset estimate) and are
 tracked under #102. Re-run #34 once the apparatus and the USB video path (#101) exist.
+
+## Measured per-frame stage timestamps (issue #102)
+
+The HUD can now show *measured* software latency instead of the estimate:
+
+- **Clock calibration.** The client sends a `Ping` whose payload is `LQCK` + version + `t1`.
+  A new host replies with a `Pong` that appends `t2` (receive) and `t3` (send). The client
+  stamps `t4` and computes NTP-style `offset = ((t2-t1)+(t3-t4))/2`, `rtt = (t4-t1)-(t3-t2)`,
+  keeping the lowest-RTT sample of the last 16. Cross-clock error is bounded by `rtt/2`.
+  An old host just echoes the ping; the client ignores it and keeps the estimate.
+- **Frame timing.** After a host has seen a clock-sync ping it sends, per frame, a
+  `TelemetryReport` with payload `LQFT` + version + `HostFrameTiming` (capture, encode start,
+  encode end, last chunk sent; host clock). Old clients never receive it.
+- The client records receive (last chunk), decode queued, decode dequeued and submit to the
+  compositor, and combines them (`MeasuredFrameLatency`).
+- HUD: `Meas cap>submit: X ms +-Y (no scanout)` plus per-stage `Enc/Snd/Net/Buf/Dec/Pres`
+  when calibrated; otherwise `Est (SW, not g2g)` stays, with any single-clock stages shown as
+  `Meas stages (no clock sync)`. Measured figures still stop at compositor submit: panel
+  scanout and pixel response are only covered by the optical procedure above.
+
+Wire format and math: `crates/protocol/src/timing.rs`.
