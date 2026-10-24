@@ -3,20 +3,20 @@
 @define-color accent_fg_color #ffffff;
 @define-color accent_color #009eea;
 
-.linux-quest-window headerbar {
+.deskquest-window headerbar {
   background-image: linear-gradient(110deg, alpha(@accent_bg_color, 0.18), alpha(@accent_color, 0.06));
   border-bottom: 1px solid alpha(@accent_color, 0.3);
 }
 
-.linux-quest-window .suggested-action {
+.deskquest-window .suggested-action {
   background-image: linear-gradient(110deg, #0064ed, #007bc6);
   color: #ffffff;
 }
 
-.linux-quest-window .suggested-action:hover {
+.deskquest-window .suggested-action:hover {
   background-image: linear-gradient(110deg, #0056d0, #006aaf);
 }
 
-.linux-quest-window .layout-sidebar {
+.deskquest-window .layout-sidebar {
   background-color: @view_bg_color;
 }

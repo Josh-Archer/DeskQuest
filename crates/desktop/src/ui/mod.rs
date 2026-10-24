@@ -110,7 +110,7 @@ pub fn activate(app: &adw::Application) {
     header.set_title_widget(Some(&switcher));
     let logo = gtk::Image::from_icon_name(crate::APP_ID);
     logo.set_pixel_size(32);
-    logo.set_tooltip_text(Some("Linux Quest"));
+    logo.set_tooltip_text(Some("DeskQuest"));
     header.pack_start(&logo);
     let choose = gtk::Button::builder()
         .label("Choose Screen…")
@@ -119,7 +119,7 @@ pub fn activate(app: &adw::Application) {
     choose.add_css_class("suggested-action");
     header.pack_start(&choose);
 
-    let banner = adw::Banner::new("The Linux Quest daemon is not running");
+    let banner = adw::Banner::new("The DeskQuest daemon is not running");
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.append(&banner);
     toasts.set_child(Some(&stack));
@@ -134,7 +134,7 @@ pub fn activate(app: &adw::Application) {
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("Linux Quest")
+        .title("DeskQuest")
         .default_width(1100)
         .default_height(760)
         .content(&toolbar)
@@ -150,7 +150,7 @@ pub fn activate(app: &adw::Application) {
     );
     compact.add_setter(&switcher_bar, "reveal", Some(&true.to_value()));
     window.add_breakpoint(compact);
-    window.add_css_class("linux-quest-window");
+    window.add_css_class("deskquest-window");
 
     if let Ok(page) = std::env::var("LINUX_QUEST_PAGE") {
         stack.set_visible_child_name(&page);

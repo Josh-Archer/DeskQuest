@@ -62,7 +62,7 @@ pub enum DaemonError {
 impl std::fmt::Display for DaemonError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotRunning => write!(f, "the Linux Quest daemon is not running"),
+            Self::NotRunning => write!(f, "the DeskQuest daemon is not running"),
             Self::TimedOut => write!(f, "the daemon did not answer in time"),
             Self::Refused(why) => write!(f, "{why}"),
             Self::Unexpected => write!(

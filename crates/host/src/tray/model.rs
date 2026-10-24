@@ -7,7 +7,7 @@ use linux_quest_protocol::ClientConnectionMode;
 use crate::tui::model::DashboardSnapshot;
 
 /// Title shown as the tray item's name and in the tooltip header.
-pub const TRAY_TITLE: &str = "Linux Quest host";
+pub const TRAY_TITLE: &str = "DeskQuest";
 
 /// What the tray reports about the host's connection to a Quest headset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,7 +122,7 @@ impl TrayView {
 /// Actions a menu item or click can request. The controller decides what they do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayAction {
-    /// Opens the desktop app (`linux-quest`).
+    /// Opens the desktop app (`deskquest`).
     OpenApp,
     /// Opens `linux-quest-host dashboard` in a terminal.
     OpenDashboard,
@@ -178,7 +178,7 @@ pub fn menu_entries(view: &TrayView) -> Vec<MenuEntry> {
         enabled: online && view.can_choose_screen && !view.choosing_screen,
     });
     entries.push(MenuEntry::Action {
-        label: "Open Linux Quest",
+        label: "Open DeskQuest",
         action: TrayAction::OpenApp,
         enabled: true,
     });
@@ -396,7 +396,7 @@ mod tests {
         );
         assert_eq!(
             action(&entries, TrayAction::OpenApp),
-            Some(("Open Linux Quest", true))
+            Some(("Open DeskQuest", true))
         );
     }
 }

@@ -54,9 +54,9 @@ pub fn dashboard_command(terminal_env: Option<&str>, host_exe: &str) -> LaunchCo
 }
 
 /// Name of the desktop app's binary.
-pub const APP_BINARY: &str = "linux-quest";
+pub const APP_BINARY: &str = "deskquest";
 
-/// Starts the desktop app: the `linux-quest` next to `host_exe` when there is one (a cargo
+/// Starts the desktop app: the `deskquest` next to `host_exe` when there is one (a cargo
 /// build or an install puts both in one directory), else the one on `$PATH`. `exists` is
 /// injected for testing.
 pub fn app_command(host_exe: &str, exists: impl Fn(&std::path::Path) -> bool) -> LaunchCommand {
@@ -202,17 +202,17 @@ mod tests {
     #[test]
     fn the_app_next_to_the_host_binary_wins_over_path() {
         let cmd = app_command("/home/u/.local/bin/linux-quest-host", |p| {
-            p == std::path::Path::new("/home/u/.local/bin/linux-quest")
+            p == std::path::Path::new("/home/u/.local/bin/deskquest")
         });
-        assert_eq!(cmd.program, "/home/u/.local/bin/linux-quest");
+        assert_eq!(cmd.program, "/home/u/.local/bin/deskquest");
         assert!(cmd.args.is_empty());
         assert_eq!(
             app_command("/usr/bin/linux-quest-host", |_| false).program,
-            "linux-quest"
+            "deskquest"
         );
         assert_eq!(
             app_command("linux-quest-host", |_| true).program,
-            "linux-quest"
+            "deskquest"
         );
     }
 

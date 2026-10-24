@@ -17,7 +17,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Josh Archer"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/Josh-Archer/linux-quest"
+repository = "https://github.com/Josh-Archer/DeskQuest"
 
 [workspace.dependencies]
 thiserror = "2.0"
