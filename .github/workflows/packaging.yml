@@ -48,6 +48,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: packaging-host
+          # Only main saves; PR copies are usable by that PR alone and evict main's (see ci.yml).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install package builders
         run: cargo install --locked cargo-deb cargo-generate-rpm
       - name: Build and verify desktop and host packages
@@ -152,6 +154,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: packaging-android
+          # Only main saves; PR copies are usable by that PR alone and evict main's (see ci.yml).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build APK
         run: |
           cargo install --locked cargo-ndk
