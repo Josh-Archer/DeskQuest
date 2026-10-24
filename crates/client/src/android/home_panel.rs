@@ -349,7 +349,7 @@ fn run(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_linux_quest_client_HomePanelActivity_nativeStart(
+pub extern "system" fn Java_com_linuxquest_client_HomePanelActivity_nativeStart(
     mut env: JNIEnv,
     _: JClass,
     activity: JObject,
@@ -433,7 +433,7 @@ pub extern "system" fn Java_com_linux_quest_client_HomePanelActivity_nativeStart
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_linux_quest_client_HomePanelActivity_nativeStop(
+pub extern "system" fn Java_com_linuxquest_client_HomePanelActivity_nativeStop(
     _: JNIEnv,
     _: JClass,
 ) {
@@ -441,7 +441,7 @@ pub extern "system" fn Java_com_linux_quest_client_HomePanelActivity_nativeStop(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_linux_quest_client_HomePanelActivity_nativeStatus(
+pub extern "system" fn Java_com_linuxquest_client_HomePanelActivity_nativeStatus(
     env: JNIEnv,
     _: JClass,
 ) -> jstring {
@@ -461,7 +461,7 @@ fn send(event: InputEvent) {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_linux_quest_client_HomePanelActivity_nativePointer(
+pub extern "system" fn Java_com_linuxquest_client_HomePanelActivity_nativePointer(
     _: JNIEnv,
     _: JClass,
     x: jfloat,
@@ -477,7 +477,7 @@ pub extern "system" fn Java_com_linux_quest_client_HomePanelActivity_nativePoint
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_linux_quest_client_HomePanelActivity_nativeButton(
+pub extern "system" fn Java_com_linuxquest_client_HomePanelActivity_nativeButton(
     _: JNIEnv,
     _: JClass,
     button: jint,
@@ -500,7 +500,7 @@ pub extern "system" fn Java_com_linux_quest_client_HomePanelActivity_nativeButto
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_linux_quest_client_HomePanelActivity_nativeScroll(
+pub extern "system" fn Java_com_linuxquest_client_HomePanelActivity_nativeScroll(
     _: JNIEnv,
     _: JClass,
     x: jfloat,
@@ -515,7 +515,7 @@ pub extern "system" fn Java_com_linux_quest_client_HomePanelActivity_nativeScrol
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_linux_quest_client_HomePanelActivity_nativeKey(
+pub extern "system" fn Java_com_linuxquest_client_HomePanelActivity_nativeKey(
     _: JNIEnv,
     _: JClass,
     key: jint,
@@ -541,7 +541,7 @@ pub extern "system" fn Java_com_linux_quest_client_HomePanelActivity_nativeKey(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_linux_quest_client_HomePanelActivity_nativeReleaseInput(
+pub extern "system" fn Java_com_linuxquest_client_HomePanelActivity_nativeReleaseInput(
     _: JNIEnv,
     _: JClass,
 ) {
@@ -551,7 +551,7 @@ pub extern "system" fn Java_com_linux_quest_client_HomePanelActivity_nativeRelea
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_linux_quest_client_HomePanelActivity_nativeText(
+pub extern "system" fn Java_com_linuxquest_client_HomePanelActivity_nativeText(
     mut env: JNIEnv,
     _: JClass,
     text: JString,
