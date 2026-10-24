@@ -96,6 +96,17 @@ where
     stream_id: u16,
     sequence: u32,
     running: Arc<AtomicBool>,
+    /// Set once the client sent a clock-sync ping, proving it understands frame-timing
+    /// reports (see `linux_quest_protocol::timing`). Older clients never get them.
+    timing_opt_in: bool,
+}
+
+/// Host wall clock in microseconds since the Unix epoch (the clock frame timings use).
+pub fn host_now_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64
 }
 
 impl<C, E, T, I> HostStreamSession<C, E, T, I>
@@ -116,7 +127,13 @@ where
             stream_id,
             sequence: 0,
             running: Arc::new(AtomicBool::new(false)),
+            timing_opt_in: false,
         }
+    }
+
+    /// Whether the client opted in to per-frame timing reports.
+    pub fn timing_opt_in(&self) -> bool {
+        self.timing_opt_in
     }
 
     pub fn with_display_host(mut self, host: Arc<MultiDisplayHost>) -> Self {
@@ -167,7 +184,10 @@ where
             return Err(HostError::NotRunning);
         }
         let raw_frame = self.capture.capture_frame().await?;
+        let capture_us = host_now_us();
+        let encode_start_us = host_now_us();
         let encoded = self.encoder.encode(&raw_frame).await?;
+        let encode_end_us = host_now_us();
 
         let total_chunks = encoded.chunks.len();
         for (idx, chunk) in encoded.chunks.into_iter().enumerate() {
@@ -198,6 +218,29 @@ where
             self.transport.send_packet(packet).await?;
         }
 
+        if self.timing_opt_in {
+            let timing = linux_quest_protocol::HostFrameTiming {
+                frame_id: encoded.frame_id,
+                stream_id: self.stream_id,
+                capture_us,
+                encode_start_us,
+                encode_end_us,
+                send_us: host_now_us(),
+            };
+            let payload = bytes::Bytes::from(timing.encode());
+            self.sequence += 1;
+            let header = PacketHeader::new(
+                PacketType::TelemetryReport,
+                self.stream_id,
+                self.sequence,
+                timing.send_us,
+                &payload,
+            );
+            self.transport
+                .send_packet(Packet::new(header, payload))
+                .await?;
+        }
+
         Ok(encoded.frame_id)
     }
 
@@ -205,15 +248,31 @@ where
     pub async fn handle_incoming_packet(&mut self, packet: Packet) -> Result<(), HostError> {
         match packet.header.packet_type {
             PacketType::Ping => {
+                let t2 = host_now_us();
+                let payload = match linux_quest_protocol::timing::decode_clock_sync_request(
+                    &packet.payload,
+                ) {
+                    Some(t1) => {
+                        self.timing_opt_in = true;
+                        bytes::Bytes::from(
+                            linux_quest_protocol::timing::encode_clock_sync_response(
+                                t1,
+                                t2,
+                                host_now_us(),
+                            ),
+                        )
+                    }
+                    None => packet.payload,
+                };
                 let pong_header = PacketHeader::new(
                     PacketType::Pong,
                     self.stream_id,
                     self.sequence + 1,
                     packet.header.timestamp_us,
-                    &packet.payload,
+                    &payload,
                 );
                 self.transport
-                    .send_packet(Packet::new(pong_header, packet.payload))
+                    .send_packet(Packet::new(pong_header, payload))
                     .await?;
             }
             PacketType::ReferencePictureInvalidation => {
@@ -470,6 +529,63 @@ mod tests {
 
         let packet = ep_client.recv_packet().await.expect("Recv failed");
         assert_eq!(packet.header.packet_type, PacketType::VideoFrameChunk);
+    }
+
+    #[tokio::test]
+    async fn clock_sync_ping_gets_host_timestamps_and_enables_frame_timing() {
+        use linux_quest_protocol::timing;
+        let capture = SyntheticCapture::new(0, 1280, 720, 60);
+        let encoder = MockVideoEncoder::new(EncoderConfig::default());
+        let (ep_host, mut ep_client) = LoopbackEndpoint::create_pair();
+        let mut session =
+            HostStreamSession::new(capture, encoder, ep_host, MockInputInjector::new(), 0);
+        session.init(EncoderConfig::default()).await.unwrap();
+
+        // Legacy client: no timing reports, plain pings echoed unchanged.
+        session.step_stream_frame().await.unwrap();
+        let mut kinds = Vec::new();
+        while let Ok(Ok(p)) = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            ep_client.recv_packet(),
+        )
+        .await
+        {
+            kinds.push(p.header.packet_type);
+        }
+        assert!(!kinds.contains(&PacketType::TelemetryReport));
+        assert!(!session.timing_opt_in());
+
+        let before = host_now_us();
+        let req = bytes::Bytes::from(timing::encode_clock_sync_request(77));
+        let hdr = PacketHeader::new(PacketType::Ping, 0, 1, 77, &req);
+        session
+            .handle_incoming_packet(Packet::new(hdr, req))
+            .await
+            .unwrap();
+        let pong = ep_client.recv_packet().await.unwrap();
+        assert_eq!(pong.header.packet_type, PacketType::Pong);
+        let (t1, t2, t3) = timing::decode_clock_sync_response(&pong.payload).unwrap();
+        assert_eq!(t1, 77);
+        assert!(t2 >= before && t3 >= t2);
+        assert!(session.timing_opt_in());
+
+        let frame_id = session.step_stream_frame().await.unwrap();
+        let mut timing_report = None;
+        while let Ok(Ok(p)) = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            ep_client.recv_packet(),
+        )
+        .await
+        {
+            if p.header.packet_type == PacketType::TelemetryReport {
+                timing_report = linux_quest_protocol::HostFrameTiming::decode(&p.payload);
+            }
+        }
+        let t = timing_report.expect("frame timing report");
+        assert_eq!(t.frame_id, frame_id);
+        assert!(t.capture_us <= t.encode_start_us);
+        assert!(t.encode_start_us <= t.encode_end_us);
+        assert!(t.encode_end_us <= t.send_us);
     }
 
     #[tokio::test]

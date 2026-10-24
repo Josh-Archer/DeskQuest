@@ -8,6 +8,7 @@ pub mod packet;
 pub mod reassembler;
 pub mod session;
 pub mod telemetry;
+pub mod timing;
 pub mod video;
 
 pub use audio::{AudioCodec, AudioFrameMeta, AudioPacket};
@@ -40,6 +41,9 @@ pub use session::{
 pub use telemetry::{
     AudioLatencyBreakdown, AudioStreamTelemetry, ClientConnectionMode, ClientTransportTelemetry,
     FrameLatencyBreakdown,
+};
+pub use timing::{
+    ClientFrameTiming, ClockSample, ClockSync, HostFrameTiming, MeasuredFrameLatency,
 };
 pub use video::{VideoChunk, VideoChunkMeta, VideoCodec};
 
