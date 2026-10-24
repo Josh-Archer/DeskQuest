@@ -135,6 +135,14 @@ pub trait DisplayCapture: Send + Sync {
     fn is_running(&self) -> bool {
         true
     }
+
+    /// True while a stand-in (the synthetic test pattern) is delivered in place of a real
+    /// capture that is still starting, is being restored, or waits for the user to pick a
+    /// screen. [`backend_type`](Self::backend_type) then says `Synthetic`, and
+    /// [`reselect`](Self::reselect) works. False for a capture with no real source behind it.
+    fn is_standing_in(&self) -> bool {
+        false
+    }
 }
 
 /// Deterministic synthetic screen generator for integration tests and headless benchmarking.

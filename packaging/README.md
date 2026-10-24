@@ -140,7 +140,7 @@ systemctl --user disable --now linux-quest-host
 
 - **Status**: the connection, and below it what is streaming and at what bitrate (or that it is paused), as disabled rows.
 - **Pause Streaming / Resume Streaming**: stops or restarts video to the headset. Capture keeps running, so resuming is immediate. Shown only by a daemon new enough to report it.
-- **Choose Screen…**: shows GNOME's screen-sharing dialog so you can pick what the headset's main screen shows. Disabled while the daemon streams a test pattern, and while the dialog is open.
+- **Choose Screen…**: shows GNOME's screen-sharing dialog so you can pick what the headset's main screen shows. Also works while a test pattern stands in for the screen (the screen is locked, or the capture has not started yet). Disabled while the daemon has no screen capture at all, and while the dialog is open.
 - **Open Linux Quest**: starts the desktop app (`linux-quest`), the one next to `linux-quest-host` if there is one, else the one on `PATH`. Left-click does the same.
 - **Open dashboard**: runs `linux-quest-host dashboard` in a terminal. The terminal is `$TERMINAL`, or `x-terminal-emulator` if that is unset. It must accept `-e <command>`.
 - **Restart service**: runs `systemctl --user --no-block restart linux-quest-host`.
