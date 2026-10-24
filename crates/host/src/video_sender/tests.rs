@@ -2046,3 +2046,109 @@ async fn a_new_capture_size_recreates_the_encoder_at_that_size() {
     plain.send_frame(&smaller, dest, &|| false).await.unwrap();
     assert_eq!(inits.lock().len(), 1);
 }
+
+/// Keeps every datagram's bytes.
+#[derive(Clone, Default)]
+struct BytesSink(Arc<Mutex<Vec<Vec<u8>>>>);
+
+impl DatagramSink for BytesSink {
+    fn send(&mut self, datagram: &[u8], _dest: SocketAddr) -> std::io::Result<()> {
+        self.0.lock().push(datagram.to_vec());
+        Ok(())
+    }
+}
+
+fn timing_pipeline(
+    stream_id: u16,
+    requests: Arc<KeyframeRequests>,
+) -> (FramePipeline<ScriptedEncoder, BytesSink>, BytesSink) {
+    let sink = BytesSink::default();
+    let pipeline = FramePipeline::new(
+        ScriptedEncoder::new(vec![1200], 60),
+        sink.clone(),
+        VideoSenderConfig {
+            stream_id,
+            keyframe_requests: Some(requests),
+            pacing_fraction: 0.0,
+            ..VideoSenderConfig::default()
+        },
+        Arc::new(VideoSenderStats::default()),
+    );
+    (pipeline, sink)
+}
+
+fn sent_packets(sink: &BytesSink) -> Vec<linux_quest_protocol::Packet> {
+    sink.0
+        .lock()
+        .iter()
+        .map(|d| linux_quest_protocol::Packet::from_bytes(d).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn daemon_sender_answers_clock_sync_and_reports_frame_timing_after_opt_in() {
+    use linux_quest_protocol::timing::{decode_clock_sync_response, encode_clock_sync_request};
+    let requests = KeyframeRequests::new();
+    let (mut pipeline, sink) = timing_pipeline(0, requests.clone());
+    let dest = peer("192.0.2.1:48440");
+    let raw = raw_frame(640, 360, Bytes::new(), 0);
+
+    // Before any clock-sync ping: video only, no timing reports (old clients).
+    pipeline.send_clock_sync_replies(dest);
+    let report = pipeline
+        .send_frame(&raw, dest, &|| false)
+        .await
+        .unwrap()
+        .unwrap();
+    pipeline.send_frame_timing(report.frame_id, crate::host_now_us(), dest);
+    assert!(sent_packets(&sink).iter().all(|p| !matches!(
+        p.header.packet_type,
+        PacketType::Pong | PacketType::TelemetryReport
+    )));
+    sink.0.lock().clear();
+
+    // The input receiver relays a ping; the sender answers with a Pong and starts reporting.
+    assert!(requests.clock_sync().on_ping(&encode_clock_sync_request(7)));
+    pipeline.send_clock_sync_replies(dest);
+    let captured = crate::host_now_us();
+    let report = pipeline
+        .send_frame(&raw, dest, &|| false)
+        .await
+        .unwrap()
+        .unwrap();
+    pipeline.send_frame_timing(report.frame_id, captured, dest);
+
+    let packets = sent_packets(&sink);
+    let pong = &packets[0];
+    assert_eq!(pong.header.packet_type, PacketType::Pong);
+    assert_eq!(pong.header.sequence, 0);
+    let (t1, t2, t3) = decode_clock_sync_response(&pong.payload).unwrap();
+    assert_eq!(t1, 7);
+    assert!(t3 >= t2);
+
+    let telemetry = packets.last().unwrap();
+    assert_eq!(telemetry.header.packet_type, PacketType::TelemetryReport);
+    let timing = linux_quest_protocol::HostFrameTiming::decode(&telemetry.payload).unwrap();
+    assert_eq!(timing.frame_id, report.frame_id);
+    assert_eq!(timing.stream_id, 0);
+    assert_eq!(timing.capture_us, captured);
+    assert!(timing.capture_us <= timing.encode_start_us);
+    assert!(timing.encode_start_us <= timing.encode_end_us);
+    assert!(timing.encode_end_us <= timing.send_us);
+}
+
+#[tokio::test]
+async fn only_stream_zero_answers_clock_sync() {
+    use linux_quest_protocol::timing::encode_clock_sync_request;
+    let requests = KeyframeRequests::new();
+    let (mut extra, sink) = timing_pipeline(1, requests.clone());
+    requests.clock_sync().on_ping(&encode_clock_sync_request(1));
+    let dest = peer("192.0.2.1:48440");
+    extra.send_clock_sync_replies(dest);
+    extra.send_frame_timing(1, crate::host_now_us(), dest);
+    assert!(sink.0.lock().is_empty());
+    // The request is still there for stream 0.
+    let (mut primary, sink0) = timing_pipeline(0, requests);
+    primary.send_clock_sync_replies(dest);
+    assert_eq!(sent_packets(&sink0)[0].header.packet_type, PacketType::Pong);
+}

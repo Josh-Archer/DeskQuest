@@ -371,7 +371,10 @@ impl Packetizer {
     }
 }
 
-fn encode_datagram(header: &PacketHeader, payload: &[u8]) -> Result<Bytes, VideoSendError> {
+pub(super) fn encode_datagram(
+    header: &PacketHeader,
+    payload: &[u8],
+) -> Result<Bytes, VideoSendError> {
     let size = HEADER_SIZE + payload.len();
     if size > MAX_DATAGRAM_SIZE {
         return Err(VideoSendError::DatagramTooLarge {

@@ -484,6 +484,10 @@ async fn start_stream_services(
             let usb_keyframes = keyframe_requests.clone();
             let usb_rate = rate.clone();
             usb_packet_handler = Some(Arc::new(move |packet| {
+                if packet.header.packet_type == linux_quest_protocol::PacketType::Ping {
+                    usb_keyframes.clock_sync().on_ping(&packet.payload);
+                    return;
+                }
                 if packet.header.packet_type != linux_quest_protocol::PacketType::InputEvent {
                     return;
                 }

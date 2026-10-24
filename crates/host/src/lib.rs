@@ -14,6 +14,7 @@ pub mod adb_link;
 pub mod advertise;
 pub mod audio_pipeline;
 pub mod clipboard_service;
+pub mod clock_sync;
 pub mod codec_select;
 pub mod congestion;
 pub mod headset;

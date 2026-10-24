@@ -40,7 +40,17 @@ impl<I: InputInjector> HostInputReceiver<I> {
     /// Raises the stream's flag in `requests` when the client sends a keyframe request because it
     /// lost video; that stream's video sender clears the flag and forces an IDR. Without this the
     /// request is dropped.
+    ///
+    /// Clock-sync pings on the input channel go to `requests`' [`ClockSyncRelay`] too, for the
+    /// stream 0 sender to answer on the video path.
+    ///
+    /// [`ClockSyncRelay`]: crate::clock_sync::ClockSyncRelay
     pub fn with_keyframe_requests(mut self, requests: Arc<KeyframeRequests>) -> Self {
+        let relay = requests.clone();
+        self.receiver
+            .set_ping_handler(Arc::new(move |payload: &[u8]| {
+                relay.clock_sync().on_ping(payload);
+            }));
         self.keyframe_requests = Some(requests);
         self
     }

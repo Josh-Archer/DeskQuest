@@ -37,7 +37,7 @@ pub use discovery::{
 pub use fec::{FecError, FecHeader, ReedSolomonFec, XorFec};
 pub use input_channel::{
     create_input_channel_pair, InputChannelConfig, InputChannelReceiver, InputChannelSender,
-    DEFAULT_INPUT_PORT, DEFAULT_KEY_REDUNDANCY, MAX_INPUT_PACKET_SIZE,
+    PingHandler, DEFAULT_INPUT_PORT, DEFAULT_KEY_REDUNDANCY, MAX_INPUT_PACKET_SIZE,
 };
 pub use jitter_buffer::{AdaptiveJitterBuffer, JitterBufferConfig, JitterBufferStats};
 pub use pacing::PacketPacer;

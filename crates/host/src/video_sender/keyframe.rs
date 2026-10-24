@@ -11,11 +11,16 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+use crate::clock_sync::ClockSyncRelay;
+
 /// One "keyframe wanted" flag per video stream. Shared (`Arc`) between the input receiver, which
 /// sets flags, and each stream's send loop, which takes its own.
 #[derive(Debug, Default)]
 pub struct KeyframeRequests {
     bits: AtomicU32,
+    /// Clock-sync pings travel the same way (input receiver to the stream 0 sender), so they
+    /// share this hub instead of another handle threaded through every constructor.
+    clock_sync: ClockSyncRelay,
 }
 
 impl KeyframeRequests {
@@ -49,6 +54,11 @@ impl KeyframeRequests {
     pub fn take(&self, stream_id: u16) -> bool {
         Self::mask(stream_id)
             .is_some_and(|mask| self.bits.fetch_and(!mask, Ordering::AcqRel) & mask != 0)
+    }
+
+    /// Clock-sync requests from the client, answered by the stream 0 video sender.
+    pub fn clock_sync(&self) -> &ClockSyncRelay {
+        &self.clock_sync
     }
 
     fn mask(stream_id: u16) -> Option<u32> {
