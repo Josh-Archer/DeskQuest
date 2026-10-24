@@ -397,9 +397,9 @@ impl OpenXrContext {
         }
 
         let app_info = ApplicationInfo {
-            application_name: "linux-quest",
+            application_name: "DeskQuest",
             application_version: 1,
-            engine_name: "linux-quest-engine",
+            engine_name: "DeskQuest",
             engine_version: 1,
             api_version: Version::new(1, 0, 0),
         };

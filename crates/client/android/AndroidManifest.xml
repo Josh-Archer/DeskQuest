@@ -61,7 +61,7 @@
     <application
         android:icon="@drawable/deskquest_logo"
         android:logo="@drawable/deskquest_logo"
-        android:label="linux-quest"
+        android:label="DeskQuest"
         android:hasCode="true"
         android:allowBackup="false">
         <meta-data android:name="com.oculus.supportedDevices" android:value="quest3|questpro" />
@@ -93,7 +93,7 @@
 
         <activity
             android:name=".VrActivity"
-            android:label="linux-quest"
+            android:label="DeskQuest"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
             android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|smallestScreenSize|uiMode|locale|layoutDirection|fontScale|colorMode|touchscreen|mcc|mnc"
             android:launchMode="singleTask"

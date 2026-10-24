@@ -130,7 +130,20 @@ public final class HomePanelActivity extends Activity implements SurfaceHolder.C
         Button button = new Button(this);
         button.setText(text);
         button.setOnClickListener(v -> action.run());
+        // Pointer and pinch only: a button that took keyboard focus would swallow typing meant
+        // for the desktop (Space or Enter would press it).
+        button.setFocusable(false);
+        button.setFocusableInTouchMode(false);
         toolbar.addView(button);
+    }
+
+    /**
+     * Every key goes to the desktop while it is connected, whichever view has focus: a
+     * keyboard paired with or projected by Horizon (Surface Keyboard) types into the host.
+     */
+    @Override public boolean dispatchKeyEvent(KeyEvent event) {
+        if (desktop != null && desktop.forwardKey(event)) return true;
+        return super.dispatchKeyEvent(event);
     }
 
     private void fitDesktop() {
@@ -192,6 +205,7 @@ public final class HomePanelActivity extends Activity implements SurfaceHolder.C
     }
     @Override public void onWindowFocusChanged(boolean focused) {
         super.onWindowFocusChanged(focused);
+        if (focused && desktop != null) desktop.requestFocus();
         if (!focused) nativeReleaseInput();
     }
     private final Runnable pollStatus = new Runnable() {
@@ -200,7 +214,9 @@ public final class HomePanelActivity extends Activity implements SurfaceHolder.C
             try {
                 JSONObject value = new JSONObject(nativeStatus());
                 status.setText(value.optString("message", "Connecting…"));
-                interactive = value.optBoolean("input_ready");
+                boolean ready = value.optBoolean("input_ready");
+                if (ready && !interactive && !desktop.hasFocus()) desktop.requestFocus();
+                interactive = ready;
                 int w = value.optInt("width", 1920), h = value.optInt("height", 1080);
                 if (w != videoWidth || h != videoHeight) {
                     videoWidth = w; videoHeight = h; fitDesktop();
@@ -278,7 +294,7 @@ public final class HomePanelActivity extends Activity implements SurfaceHolder.C
             }
             return e.getActionMasked() == MotionEvent.ACTION_HOVER_MOVE || super.onGenericMotionEvent(e);
         }
-        private boolean forwardKey(KeyEvent event) {
+        boolean forwardKey(KeyEvent event) {
             if (!interactive || event.isSystem() || event.getAction() == KeyEvent.ACTION_MULTIPLE) return false;
             if ((event.isAltPressed() && event.getKeyCode() == KeyEvent.KEYCODE_TAB)
                     || (event.isCtrlPressed() && event.isAltPressed() && event.getKeyCode() >= KeyEvent.KEYCODE_F1 && event.getKeyCode() <= KeyEvent.KEYCODE_F12)) return false;
