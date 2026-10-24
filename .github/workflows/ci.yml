@@ -35,15 +35,50 @@ jobs:
     name: Build, Lint & Test
     needs: runner
     runs-on: ${{ needs.runner.outputs.runner-label }}
-    timeout-minutes: 15
+    # A warm run takes 3-4 minutes. The Ubuntu mirror has been slow enough (30-80 kB/s) to make
+    # the apt steps alone take 13 minutes, which is what hit the old 15-minute limit.
+    timeout-minutes: 30
+    env:
+      # Only the PipeWire step installs these; they are downloaded up front so they are cached.
+      PIPEWIRE_BUILD_PACKAGES: pkg-config libpipewire-0.3-dev libclang-dev
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update && sudo apt-get install --no-install-recommends -y build-essential edid-decode pkg-config libgtk-4-dev libadwaita-1-dev xvfb
+      - name: Restore cached apt packages
+        id: apt-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/apt-archives
+          # Saved under a hash of the .deb names (see "Save apt packages"); the newest is used.
+          key: apt-${{ runner.os }}-${{ runner.arch }}-
+          restore-keys: apt-${{ runner.os }}-${{ runner.arch }}-
 
+      - name: Install system dependencies
+        # The .debs go to ~/apt-archives, so only packages missing from the cache (new or
+        # updated) come from the mirror.
+        run: |
+          set -euo pipefail
+          archives="$HOME/apt-archives"
+          mkdir -p "$archives/partial"
+          apt_get() { sudo apt-get -o Dir::Cache::Archives="$archives" "$@"; }
+          apt_get update
+          apt_get install --no-install-recommends -y build-essential edid-decode pkg-config libgtk-4-dev libadwaita-1-dev xvfb
+          apt_get install --no-install-recommends -y --download-only $PIPEWIRE_BUILD_PACKAGES
+          # Drop .debs the mirror no longer has (replaced by updates) so the cache does not grow.
+          apt_get autoclean
+          sudo rm -rf "$archives/partial" "$archives/lock"
+          sudo chown -R "$(id -u):$(id -g)" "$archives"
+          echo "APT_CACHE_KEY=apt-${RUNNER_OS}-${RUNNER_ARCH}-$(ls "$archives" | sha256sum | cut -c1-16)" >> "$GITHUB_ENV"
+
+      - name: Save apt packages
+        # Only main saves (a PR's cache is visible to that PR alone), and only when the set of
+        # .debs changed.
+        if: github.ref == 'refs/heads/main' && steps.apt-cache.outputs.cache-matched-key != env.APT_CACHE_KEY
+        uses: actions/cache/save@v4
+        with:
+          path: ~/apt-archives
+          key: ${{ env.APT_CACHE_KEY }}
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -54,6 +89,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "linux-quest-ci"
+          # PRs restore main's cache but do not save their own. Each copy is ~1 GB, and PR
+          # copies (usable by that PR only) filled the repository's 10 GB cache quota; over it,
+          # GitHub evicts the least recently used caches, main's included, and runs then build
+          # from scratch.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Verify code formatting
         run: cargo fmt --check
@@ -76,9 +116,11 @@ jobs:
 
       - name: Lint and test PipeWire screen capture feature
         # Builds the pipewire crate against the distro libpipewire (bindgen needs libclang).
-        # The default build above needs none of this; only this feature does.
+        # The default build above needs none of this; only this feature does. The packages were
+        # downloaded in "Install system dependencies".
         run: |
-          sudo apt-get install --no-install-recommends -y pkg-config libpipewire-0.3-dev libclang-dev
+          mkdir -p "$HOME/apt-archives/partial"
+          sudo apt-get -o Dir::Cache::Archives="$HOME/apt-archives" install --no-install-recommends -y $PIPEWIRE_BUILD_PACKAGES
           cargo clippy -p linux-quest-capture --all-targets --features pipewire-screencast -- -D warnings
           cargo test -p linux-quest-capture --features pipewire-screencast --lib
 
