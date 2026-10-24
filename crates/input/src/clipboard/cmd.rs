@@ -334,17 +334,19 @@ mod system_runner_tests {
         let marker = format!("{}", 7_000_000 + std::process::id());
         let stub = dir.join("wl-paste");
         // Forks a grandchild that sleeps forever, like a tool stuck waiting for focus.
-        std::fs::write(
-            &stub,
-            format!("#!/bin/sh\nsleep {marker} &\nsleep {marker}\n"),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&stub, format!("sleep {marker} &\nsleep {marker}\n")).unwrap();
 
+        // Run by `sh`, not exec'd: the same processes as a `#!/bin/sh` stub, but the file is
+        // only read. Exec'ing a file this process just wrote fails now and then with ETXTBSY,
+        // because a child that another test thread is forking holds a copy of the write fd
+        // until it execs. Writing elsewhere and renaming does not help (same inode).
         let started = Instant::now();
         let err = SystemCommandRunner::with_timeout(Duration::from_millis(300))
-            .run_command(stub.to_str().unwrap(), &["--no-newline", &marker], None)
+            .run_command(
+                "sh",
+                &[stub.to_str().unwrap(), "--no-newline", &marker],
+                None,
+            )
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(3));
