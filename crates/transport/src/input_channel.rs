@@ -171,7 +171,12 @@ pub struct InputChannelReceiver {
     last_peer_packet: Instant,
     /// A different sender may take over once the current peer has been silent this long.
     relatch_after: Duration,
+    /// Gets the payload of a `Ping` packet sent on this channel (clock sync, #102).
+    ping_handler: Option<PingHandler>,
 }
+
+/// Callback for `Ping` packets received on the input channel.
+pub type PingHandler = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
 /// Default silence after which the input peer may be replaced by a new sender.
 /// Matches the host's link liveness window.
@@ -188,7 +193,21 @@ impl InputChannelReceiver {
             max_seen_history: 1024,
             last_peer_packet: Instant::now(),
             relatch_after: DEFAULT_RELATCH_AFTER,
+            ping_handler: None,
         }
+    }
+
+    /// Hands `Ping` packets (a serialized `Packet`, not an input batch) from the current peer, or
+    /// from anyone before a peer is latched, to `handler`. Without a handler they are dropped as
+    /// undecodable input.
+    pub fn with_ping_handler(mut self, handler: PingHandler) -> Self {
+        self.ping_handler = Some(handler);
+        self
+    }
+
+    /// Like [`Self::with_ping_handler`] on an existing receiver.
+    pub fn set_ping_handler(&mut self, handler: PingHandler) {
+        self.ping_handler = Some(handler);
     }
 
     /// Overrides how long the current peer must be silent before a new sender can replace it.
@@ -230,6 +249,17 @@ impl InputChannelReceiver {
         let mut buf = [0u8; 2048];
         loop {
             let (len, sender_addr) = self.socket.recv_from(&mut buf).await?;
+
+            if let Some(handler) = &self.ping_handler {
+                if let Ok(packet) = linux_quest_protocol::Packet::from_bytes(&buf[..len]) {
+                    if packet.header.packet_type == linux_quest_protocol::PacketType::Ping
+                        && self.remote_addr.is_none_or(|peer| peer == sender_addr)
+                    {
+                        handler(&packet.payload);
+                    }
+                    continue;
+                }
+            }
 
             let mut relatch = false;
             if let Some(expected) = self.remote_addr {
@@ -503,5 +533,39 @@ mod tests {
         assert_eq!(ev3.len(), 2);
         assert_eq!(ev3[0], key_b); // Recovered Key B prepended
         assert_eq!(ev3[1], mouse_ev); // Mouse move
+    }
+
+    #[tokio::test]
+    async fn ping_packets_reach_the_handler_and_input_still_flows() {
+        use linux_quest_protocol::{Packet, PacketHeader, PacketType};
+        use std::sync::Mutex;
+        let rx_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rx_addr = rx_sock.local_addr().unwrap();
+        let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let sink = seen.clone();
+        let mut receiver = InputChannelReceiver::new(rx_sock, None, true).with_ping_handler(
+            Arc::new(move |p: &[u8]| sink.lock().unwrap().push(p.to_vec())),
+        );
+
+        let (mut sender, sender_addr) = sender_to(rx_addr).await;
+        let raw = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let payload = bytes::Bytes::from_static(b"LQCK-ish");
+        let ping = Packet::new(
+            PacketHeader::new(PacketType::Ping, 0, 0, 1, &payload),
+            payload,
+        );
+        raw.send_to(&ping.to_bytes(), rx_addr).await.unwrap();
+        sender.send_events(mv(3), 1).await.unwrap();
+
+        // The ping is consumed; the next input batch comes through.
+        assert_eq!(receiver.recv_events().await.unwrap(), mv(3));
+        assert_eq!(seen.lock().unwrap().as_slice(), &[b"LQCK-ish".to_vec()]);
+        assert_eq!(receiver.remote_addr(), Some(sender_addr));
+
+        // Once latched, pings from another address are ignored.
+        raw.send_to(&ping.to_bytes(), rx_addr).await.unwrap();
+        sender.send_events(mv(4), 2).await.unwrap();
+        assert_eq!(receiver.recv_events().await.unwrap(), mv(4));
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 }

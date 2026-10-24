@@ -56,3 +56,23 @@ The HUD can now show *measured* software latency instead of the estimate:
   scanout and pixel response are only covered by the optical procedure above.
 
 Wire format and math: `crates/protocol/src/timing.rs`.
+
+### Daemon path
+
+`HostStreamSession` answers on its own transport. The daemon splits the job:
+
+- The client sends the `LQCK` ping as a serialized `Packet` on the input channel: the UDP
+  input port (only from the latched peer, or anyone before one is latched) or the USB tunnel.
+  The input receiver stamps `t2` on arrival and queues it in `ClockSyncRelay`
+  (`crates/host/src/clock_sync.rs`, shared through `KeyframeRequests`).
+- The stream 0 video sender answers before its next frame with a `Pong` on the video path,
+  stamping `t3` just before sending, so time queued in the relay is host processing, not network.
+- Once a client has pinged, stream 0 sends one `LQFT` report per frame it fully sent.
+  `capture_us` is when the capture task handed the frame to the sender (the compositor-to-capture
+  delay is not covered). Encode start/end bracket the encoder call; `send_us` follows the last
+  datagram.
+- `Pong` and `LQFT` use sequence 0 so they stay outside the video sequence space. The client
+  takes them before its jitter buffer.
+
+Still pending: the Android client does not send clock-sync pings yet (`set_clock_sync_sender`
+is not wired to its UDP input socket or USB tunnel), so the HUD keeps the estimate there.

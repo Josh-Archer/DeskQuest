@@ -36,6 +36,8 @@ pub mod sink;
 mod tests;
 
 use std::io;
+
+use linux_quest_protocol::{PacketHeader, PacketType};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -219,6 +221,8 @@ pub struct FramePipeline<E: VideoEncoder, K: DatagramSink> {
     rate_window: RateWindow,
     /// Frame size the encoder is set up for (with `cfg.encoder_config`).
     encoder_size: Option<(u32, u32)>,
+    /// Host wall-clock (µs) encode start and end of the last frame, for frame-timing reports.
+    last_encode_us: (u64, u64),
 }
 
 /// Measures the video payload rate (FEC parity excluded) over fixed windows.
@@ -287,7 +291,74 @@ impl<E: VideoEncoder, K: DatagramSink> FramePipeline<E, K> {
             last_bitrate_apply: None,
             rate_window: RateWindow::new(),
             encoder_size,
+            last_encode_us: (0, 0),
         }
+    }
+
+    /// The relay whose clock-sync pings this sender answers: stream 0's only, so a client gets
+    /// one `Pong` per ping however many streams run.
+    fn clock_sync(&self) -> Option<&crate::clock_sync::ClockSyncRelay> {
+        if self.cfg.stream_id != 0 {
+            return None;
+        }
+        self.cfg
+            .keyframe_requests
+            .as_deref()
+            .map(|r| r.clock_sync())
+    }
+
+    /// Sends one datagram outside the video sequence space (sequence 0). The client consumes
+    /// `Pong` and `TelemetryReport` before its jitter buffer, so they never count as video loss.
+    fn send_side_packet(
+        &mut self,
+        packet_type: PacketType,
+        timestamp_us: u64,
+        payload: &[u8],
+        dest: SocketAddr,
+    ) {
+        let header = PacketHeader::new(packet_type, self.cfg.stream_id, 0, timestamp_us, payload);
+        match packetizer::encode_datagram(&header, payload) {
+            Ok(bytes) => {
+                if let Err(e) = self.sink.send(&bytes, dest) {
+                    debug!(error = %e, ?packet_type, "timing datagram not sent");
+                }
+            }
+            Err(e) => debug!(error = %e, ?packet_type, "timing datagram not encoded"),
+        }
+    }
+
+    /// Answers pending clock-sync pings (see [`crate::clock_sync`]) with a `Pong` to `dest`.
+    pub fn send_clock_sync_replies(&mut self, dest: SocketAddr) {
+        let Some(relay) = self.clock_sync() else {
+            return;
+        };
+        for payload in relay.take_responses() {
+            let t1 = linux_quest_protocol::timing::decode_clock_sync_request(&payload).unwrap_or(0);
+            self.send_side_packet(PacketType::Pong, t1, &payload, dest);
+        }
+    }
+
+    /// Sends the `LQFT` stage timestamps of the frame just sent, once the client opted in by
+    /// asking for clock sync. `captured_us` is when the capture task handed the frame over.
+    pub fn send_frame_timing(&mut self, frame_id: u64, captured_us: u64, dest: SocketAddr) {
+        if !self.clock_sync().is_some_and(|r| r.opted_in()) {
+            return;
+        }
+        let (encode_start_us, encode_end_us) = self.last_encode_us;
+        let timing = linux_quest_protocol::HostFrameTiming {
+            frame_id,
+            stream_id: self.cfg.stream_id,
+            capture_us: captured_us,
+            encode_start_us,
+            encode_end_us,
+            send_us: crate::host_now_us(),
+        };
+        self.send_side_packet(
+            PacketType::TelemetryReport,
+            timing.send_us,
+            &timing.encode(),
+            dest,
+        );
     }
 
     /// Applies the congestion controller's current target to the encoder and packetizer.
@@ -408,7 +479,9 @@ impl<E: VideoEncoder, K: DatagramSink> FramePipeline<E, K> {
             self.apply_rate(&rate, frame_in);
         }
         self.follow_frame_size(raw).await?;
+        let encode_start_us = crate::host_now_us();
         let encoded = self.encoder.encode(raw).await?;
+        self.last_encode_us = (encode_start_us, crate::host_now_us());
         let Some(mut plan) = self.packetizer.plan(&encoded)? else {
             return Ok(None);
         };
@@ -531,7 +604,8 @@ impl<E: VideoEncoder, K: DatagramSink> FramePipeline<E, K> {
 
 /// One-deep, newest-wins hand-off between capture and the sender.
 pub struct FrameSlot {
-    pending: Mutex<Option<RawFrame>>,
+    /// The frame and when it was handed over (host wall clock, µs; see [`crate::host_now_us`]).
+    pending: Mutex<Option<(RawFrame, u64)>>,
     notify: Notify,
     stats: Arc<VideoSenderStats>,
 }
@@ -547,7 +621,11 @@ impl FrameSlot {
 
     /// Stores `frame`, dropping the frame that was still waiting. Returns whether one was dropped.
     pub fn put(&self, frame: RawFrame) -> bool {
-        let replaced = self.pending.lock().replace(frame).is_some();
+        let replaced = self
+            .pending
+            .lock()
+            .replace((frame, crate::host_now_us()))
+            .is_some();
         if replaced {
             self.stats
                 .frames_dropped_pending
@@ -563,9 +641,14 @@ impl FrameSlot {
 
     /// Waits for and takes the pending frame.
     pub async fn take(&self) -> RawFrame {
+        self.take_timed().await.0
+    }
+
+    /// Like [`Self::take`], also returning when the capture task handed the frame over.
+    pub async fn take_timed(&self) -> (RawFrame, u64) {
         loop {
-            if let Some(frame) = self.pending.lock().take() {
-                return frame;
+            if let Some(entry) = self.pending.lock().take() {
+                return entry;
             }
             self.notify.notified().await;
         }
@@ -694,8 +777,9 @@ async fn send_loop<E, K, P>(
     loop {
         let raw = tokio::select! {
             _ = stop.wait_for(|stopped| *stopped) => break,
-            raw = slot.take() => raw,
+            raw = slot.take_timed() => raw,
         };
+        let (raw, captured_us) = raw;
         let now = Instant::now();
         let Some(ip) = peers.video_peer(now) else {
             if active.take().is_some() {
@@ -726,12 +810,18 @@ async fn send_loop<E, K, P>(
         }
 
         let dest = SocketAddr::new(ip, video_port);
+        pipeline.send_clock_sync_replies(dest);
         // Shutdown cancels a frame mid-send; nothing is left half-updated by that.
         let newer_frame_waiting = || slot.has_pending();
         let result = tokio::select! {
             _ = stop.wait_for(|stopped| *stopped) => break,
             result = pipeline.send_frame(&raw, dest, &newer_frame_waiting) => result,
         };
+        if let Ok(Some(report)) = &result {
+            if !report.abandoned {
+                pipeline.send_frame_timing(report.frame_id, captured_us, dest);
+            }
+        }
         if let Err(e) = result {
             stats.encode_errors.fetch_add(1, Ordering::Relaxed);
             encode_failures += 1;
