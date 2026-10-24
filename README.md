@@ -181,6 +181,13 @@ It needs a StatusNotifierItem host: KDE Plasma, a bar with a tray module, or on 
 
 ---
 
+## Quest Home panel and hand scrolling
+
+The Quest launcher opens a resizable desktop panel in Horizon Home. Pinch and move to
+scroll, hold to drag the mouse, or choose **Open VR** for the immersive workspace.
+In immersive VR, pinch thumb and middle finger and move the hand to scroll; index pinch
+clicks and drags. See [Home panel controls and launch commands](docs/home-panel.md).
+
 ## 🎮 Kernel Input Injection (`/dev/uinput` Setup)
 
 `linux-quest` uses the Linux kernel's `uinput` subsystem to inject input events with native kernel-level responsiveness:

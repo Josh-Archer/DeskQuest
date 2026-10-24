@@ -94,6 +94,7 @@ pub struct QuestClientRuntime {
     keyframe_requester: Option<Box<dyn Fn(u16) + Send>>,
     extra_streams: BTreeMap<u16, ExtraStream>,
     pointer_input: PointerInput,
+    hand_scroll: crate::spatial::scroll::HandScrollDetector,
     pointer_event_sink: Option<Box<dyn Fn(InputEvent) + Send>>,
     pointer_queue_latency: Option<Box<dyn Fn() -> u64 + Send>>,
     settings_panel: SettingsPanel,
@@ -196,6 +197,7 @@ impl QuestClientRuntime {
             keyframe_requester: None,
             extra_streams: BTreeMap::new(),
             pointer_input,
+            hand_scroll: Default::default(),
             pointer_event_sink: None,
             pointer_queue_latency: None,
             settings_panel,
@@ -609,7 +611,7 @@ impl QuestClientRuntime {
         // One pointer per hand: the controller when it has a pose, else the tracked hand. A
         // controller state exists even with no controller held, so inputs without a ray are
         // ignored (otherwise the right controller would always win and hands never could).
-        let pointing: Vec<InteractionInput> = [
+        let mut pointing: Vec<InteractionInput> = [
             (&candidate_inputs[0], &candidate_inputs[1]),
             (&candidate_inputs[2], &candidate_inputs[3]),
         ]
@@ -621,7 +623,7 @@ impl QuestClientRuntime {
                 .cloned()
         })
         .collect();
-        let hits: Vec<Option<crate::spatial::RayHit>> = {
+        let mut hits: Vec<Option<crate::spatial::RayHit>> = {
             let screens = visible_screens(&self.screen_transform, &self.extra_streams);
             pointing
                 .iter()
@@ -678,10 +680,36 @@ impl QuestClientRuntime {
         };
 
         let mut pointer_latency_us = 0;
-        if let Some(input) = selected_input {
+        if selected_input.is_none() || grabbing {
+            self.hand_scroll.reset();
+        }
+        if let Some(mut input) = selected_input {
             // Each position carries its stream's display id; the host rebases it onto that
             // monitor.
             let screen_refs = visible_screens(&self.screen_transform, &self.extra_streams);
+            let hand = match input.source {
+                crate::spatial::InteractionSource::Hand(Handedness::Right) => right_joints.as_ref(),
+                crate::spatial::InteractionSource::Hand(Handedness::Left) => left_joints.as_ref(),
+                _ => None,
+            };
+            let hand_scroll = if grabbing {
+                crate::spatial::scroll::HandScroll::default()
+            } else {
+                self.hand_scroll.update(&input, hand, &screen_refs)
+            };
+            if hand_scroll.suppress_buttons {
+                input.is_selecting = false;
+                input.is_grabbing = false;
+            }
+            if let Some(ray) = hand_scroll.anchor_ray {
+                input.aim_ray = Some(ray);
+                if let Some(index) = pointing.iter().position(|p| p.source == input.source) {
+                    pointing[index].aim_ray = Some(ray);
+                    hits[index] =
+                        ScreenTransform::find_closest_hit(&ray, screen_refs.iter().copied())
+                            .map(|(_, hit)| hit);
+                }
+            }
             let secondary_down = match input.source {
                 crate::spatial::InteractionSource::Controller(Handedness::Right) => {
                     right_ctrl.as_ref().is_some_and(|c| c.thumbstick_clicked)
@@ -702,9 +730,9 @@ impl QuestClientRuntime {
                 pointer_source.is_selecting = false;
             }
             let started = Instant::now();
-            let pointer_events = self.pointer_input.update(
+            let mut pointer_events = self.pointer_input.update(
                 &pointer_source,
-                secondary_down,
+                secondary_down && !hand_scroll.suppress_buttons,
                 (
                     input.thumbstick.0 * dt_seconds,
                     input.thumbstick.1 * dt_seconds,
@@ -712,6 +740,12 @@ impl QuestClientRuntime {
                 &screen_refs,
                 now,
             );
+            if hand_scroll.delta != (0.0, 0.0) {
+                pointer_events.push(InputEvent::MouseScrollHiRes {
+                    delta_x: hand_scroll.delta.0,
+                    delta_y: hand_scroll.delta.1,
+                });
+            }
             pointer_latency_us = started.elapsed().as_micros() as u64;
             if let Some(sink) = &self.pointer_event_sink {
                 for event in pointer_events {

@@ -73,6 +73,7 @@ CARGO_PROFILE_FLAG=""
 TARGET_DIR="${CARGO_TARGET_DIR}/aarch64-linux-android/debug"
 INSTALL_ON_DEVICE=false
 RUN_ON_DEVICE=false
+LAUNCH_ACTIVITY="com.linuxquest.client.HomePanelActivity"
 
 for arg in "$@"; do
     case "$arg" in
@@ -88,11 +89,15 @@ for arg in "$@"; do
             INSTALL_ON_DEVICE=true
             RUN_ON_DEVICE=true
             ;;
+        --vr)
+            LAUNCH_ACTIVITY="com.linuxquest.client.VrActivity"
+            ;;
         -h|--help)
-            echo "Usage: $0 [--release] [--install] [--run]"
+            echo "Usage: $0 [--release] [--install] [--run] [--vr]"
             echo "  --release  Build optimized release APK"
             echo "  --install  Install APK on connected Meta Quest via adb"
             echo "  --run      Install and launch APK on connected Meta Quest"
+            echo "  --vr       With --run, launch immersive VR instead of the Home panel"
             exit 0
             ;;
     esac
@@ -140,13 +145,16 @@ echo "[2/6] Packaging APK manifest and resources with aapt..."
     -0 so \
     -f
 
-# Compile the tiny Java IME bridge used by NativeActivity to expose an Android InputConnection.
+# Compile all activity/IME sources and nested classes.
 JAVA_OUT="${OUT_DIR}/java-classes"
+rm -rf "${JAVA_OUT}"
 mkdir -p "${JAVA_OUT}"
-javac -source 8 -target 8 -bootclasspath "${ANDROID_JAR}" \
-    -d "${JAVA_OUT}" "${SCRIPT_DIR}/src/com/linuxquest/client/ImeBridge.java"
+mapfile -d '' JAVA_SOURCES < <(find "${SCRIPT_DIR}/src" -name '*.java' -print0)
+javac --release 8 -classpath "${ANDROID_JAR}" \
+    -d "${JAVA_OUT}" "${JAVA_SOURCES[@]}"
+mapfile -d '' JAVA_CLASSES < <(find "${JAVA_OUT}" -name '*.class' -print0)
 "${D8}" --lib "${ANDROID_JAR}" --min-api 30 --output "${OUT_DIR}" \
-    "${JAVA_OUT}/com/linuxquest/client/ImeBridge.class"
+    "${JAVA_CLASSES[@]}"
 cd "${OUT_DIR}"
 "${AAPT}" add "${UNALIGNED_APK}" classes.dex
 cd "${CLIENT_DIR}"
@@ -206,5 +214,5 @@ fi
 
 if [[ "${RUN_ON_DEVICE}" == "true" ]]; then
     echo "Launching linux-quest client on Meta Quest..."
-    "${ADB}" shell am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n com.linuxquest.client/android.app.NativeActivity
+    "${ADB}" shell am start -a android.intent.action.MAIN -n "com.linuxquest.client/${LAUNCH_ACTIVITY}"
 fi

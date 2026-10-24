@@ -1,6 +1,10 @@
 //! Android NativeActivity integration and main entry point.
 
+#[cfg(target_os = "android")]
+mod home_panel;
 pub mod lifecycle;
+#[cfg(target_os = "android")]
+mod transport;
 
 #[cfg(target_os = "android")]
 use std::time::Duration;
@@ -700,13 +704,8 @@ pub fn android_main(app: AndroidApp) {
     let (packet_tx, packet_rx) =
         std::sync::mpsc::sync_channel::<linux_quest_protocol::packet::Packet>(PACKET_CHANNEL_DEPTH);
     let running_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let bg_running = running_flag.clone();
     let host_addr = config.host_addr;
     let transport_mode = config.transport_mode;
-    let udp_filter = udp_source_filter(&config);
-    if let Some(message) = udp_config_warning(&config) {
-        tracing::warn!("{message}");
-    }
 
     // Input/keepalive sender (Udp mode only). The receiver below acks it for each accepted
     // host datagram so it stays on the host address that works.
@@ -783,56 +782,12 @@ pub fn android_main(app: AndroidApp) {
     let tunnel_reconnect = usb_tunnel.as_ref().map(|tunnel| tunnel.reconnect_handle());
 
     let receiver_handle = (transport_mode == TransportMode::Udp).then(|| {
-        std::thread::spawn(move || {
-            let socket = match std::net::UdpSocket::bind("0.0.0.0:48440") {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(error = ?e, "Failed to bind UDP socket on 0.0.0.0:48440");
-                    return;
-                }
-            };
-            // The default receive buffer holds ~10 ms of an 80 Mbit/s stream; any stall of
-            // this thread then drops datagrams in the kernel without a trace.
-            set_receive_buffer(&socket, UDP_RECEIVE_BUFFER_BYTES);
-            let _ = socket.set_read_timeout(Some(Duration::from_millis(100)));
-            let mut buf = [0u8; 65536];
-            let mut drop_warn = DropWarnLimiter::default();
-
-            while bg_running.load(std::sync::atomic::Ordering::Relaxed) {
-                match socket.recv_from(&mut buf) {
-                    Ok((len, source)) => {
-                        if !accept_udp_source(udp_filter.as_deref(), source) {
-                            if drop_warn.should_warn(source.ip(), std::time::Instant::now()) {
-                                tracing::warn!(
-                                    %source,
-                                    allowed = ?udp_filter,
-                                    "Dropping UDP datagram from a source that is not the host \
-                                     (further drops from this source are not logged for 60s)"
-                                );
-                            }
-                            continue;
-                        }
-                        match linux_quest_protocol::packet::Packet::from_bytes(&buf[..len]) {
-                            Ok(packet) => {
-                                if let Some(control) = &receiver_ack_control {
-                                    control.ack();
-                                }
-                                let _ = packet_tx.try_send(packet);
-                            }
-                            Err(e) => {
-                                tracing::trace!(error = ?e, "Failed to parse incoming packet");
-                            }
-                        }
-                    }
-                    Err(ref e)
-                        if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::TimedOut => {}
-                    Err(e) => {
-                        tracing::trace!(error = ?e, "UDP socket recv error");
-                    }
-                }
-            }
-        })
+        transport::spawn_udp_receiver(
+            &config,
+            running_flag.clone(),
+            receiver_ack_control,
+            packet_tx,
+        )
     });
 
     // The XR session is created only once the activity has a window and is resumed (Horizon OS

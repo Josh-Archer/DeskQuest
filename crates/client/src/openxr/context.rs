@@ -898,8 +898,8 @@ impl OpenXrContext {
             // Horizon OS rejects Vulkan values here ("info format validation failure").
             format: 0,
             sample_count: 0,
-            width: width,
-            height: height,
+            width,
+            height,
             face_count: 0,
             array_size: 0,
             mip_count: 0,
