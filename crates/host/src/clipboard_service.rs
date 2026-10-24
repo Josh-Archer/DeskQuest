@@ -416,6 +416,9 @@ impl<B: ClipboardBackend + 'static> PeerContext<B> {
                     return;
                 }
                 tracing::info!(peer = %peer_addr, "USB tunnel client connected");
+                if let Some(link) = &link {
+                    link.lock().tunnel_opened(peer_addr, Instant::now());
+                }
                 // A headset that reconnects lost the frames sent into its previous connection.
                 if let Some(request) = &keyframe_request {
                     request();
@@ -488,7 +491,7 @@ impl<B: ClipboardBackend + 'static> PeerContext<B> {
                     if received.is_ok() {
                         last_received = Instant::now();
                         if let Some(link) = &link {
-                            link.lock().control_activity(last_received);
+                            link.lock().tunnel_activity(peer_addr, last_received);
                         }
                     }
                     match received {
@@ -524,7 +527,9 @@ impl<B: ClipboardBackend + 'static> PeerContext<B> {
                     }
                 }
                 if let Some(link) = link {
-                    link.lock().control_closed(peer_addr);
+                    let mut link = link.lock();
+                    link.tunnel_closed(peer_addr);
+                    link.control_closed(peer_addr);
                 }
             } else {
                 run_legacy_control_peer(

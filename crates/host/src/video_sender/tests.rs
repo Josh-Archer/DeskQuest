@@ -2046,3 +2046,247 @@ async fn a_new_capture_size_recreates_the_encoder_at_that_size() {
     plain.send_frame(&smaller, dest, &|| false).await.unwrap();
     assert_eq!(inits.lock().len(), 1);
 }
+
+// ---------------------------------------------------------------------------------------------
+// USB and Wi-Fi at once (the client's `Auto` mode)
+// ---------------------------------------------------------------------------------------------
+
+/// Sends the USB route marker into the tunnel like [`HybridSink`], and records Wi-Fi datagrams
+/// instead of sending them: the Wi-Fi peer has a documentation address.
+#[derive(Clone)]
+struct TunnelOrWifiSink {
+    tunnel: tokio::sync::broadcast::Sender<Vec<u8>>,
+    wifi: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl DatagramSink for TunnelOrWifiSink {
+    fn send(&mut self, datagram: &[u8], dest: SocketAddr) -> std::io::Result<()> {
+        if dest.ip().is_unspecified() {
+            return self
+                .tunnel
+                .send(datagram.to_vec())
+                .map(|_| ())
+                .map_err(|_| std::io::ErrorKind::BrokenPipe.into());
+        }
+        assert_eq!(
+            dest,
+            peer("192.0.2.10:48440"),
+            "Wi-Fi video goes to the headset"
+        );
+        self.wifi.lock().push(datagram.to_vec());
+        Ok(())
+    }
+}
+
+/// The headset's end of a USB tunnel: an input keepalive every 20 ms while `talking`, and every
+/// video datagram it reads, in order.
+struct TunnelHeadset {
+    received: Arc<Mutex<Vec<Vec<u8>>>>,
+    talking: Arc<AtomicBool>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl TunnelHeadset {
+    async fn connect(addr: SocketAddr) -> Self {
+        use linux_quest_transport::{negotiate_client, recv_frame, send_frame, TunnelFrame};
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+        negotiate_client(&mut reader, &mut writer).await.unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let talking = Arc::new(AtomicBool::new(true));
+        let into = received.clone();
+        let reading = tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(reader);
+            while let Ok(frame) = recv_frame(&mut reader).await {
+                if let TunnelFrame::Packet(bytes) = frame {
+                    into.lock().push(bytes);
+                }
+            }
+        });
+        let talk = talking.clone();
+        let writing = tokio::spawn(async move {
+            let mut sequence = 0u32;
+            loop {
+                if talk.load(Ordering::SeqCst) {
+                    let payload =
+                        linux_quest_protocol::InputBatch::new(u64::from(sequence), 0).encode();
+                    let header =
+                        PacketHeader::new(PacketType::InputEvent, 0, sequence, 0, &payload);
+                    let packet = Packet::new(header, payload);
+                    let frame = TunnelFrame::Packet(packet.to_bytes().to_vec());
+                    if send_frame(&mut writer, &frame).await.is_err() {
+                        return;
+                    }
+                    sequence += 1;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        Self {
+            received,
+            talking,
+            tasks: vec![reading, writing],
+        }
+    }
+
+    fn video_datagrams(&self) -> usize {
+        self.received.lock().len()
+    }
+
+    /// Pulls the cable: the connection closes in both directions.
+    fn unplug(self) {
+        for task in self.tasks {
+            task.abort();
+        }
+    }
+}
+
+/// `Some(is_keyframe)` for a video data datagram, `None` for parity and other packets.
+fn keyframe_flag(datagram: &[u8]) -> Option<bool> {
+    let info = inspect(datagram);
+    info.frame_id?;
+    Some(
+        VideoChunk::deserialize(&datagram[HEADER_SIZE..])
+            .unwrap()
+            .meta
+            .is_keyframe,
+    )
+}
+
+/// Whether the first video data datagram from `from` on is part of a keyframe.
+fn starts_with_keyframe(datagrams: &[Vec<u8>], from: usize) -> bool {
+    datagrams[from..]
+        .iter()
+        .find_map(|d| keyframe_flag(d))
+        .unwrap_or(false)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn video_moves_between_the_usb_tunnel_and_wifi_both_ways() {
+    let _serial = SERIAL.lock().await;
+    let link = tracker_with_liveness(5_000);
+    link.lock().adb_event(
+        &linux_quest_transport::AdbBridgeEvent::ReversePortEstablished {
+            serial: "QUEST".into(),
+            port: 48444,
+        },
+    );
+    let (tunnel_tx, _) = tokio::sync::broadcast::channel(1024);
+    let flags = KeyframeRequests::new();
+
+    // The control port, which serves USB tunnel peers.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let control = listener.local_addr().unwrap();
+    let (outgoing, _outgoing) = tokio::sync::mpsc::unbounded_channel();
+    let (_incoming, incoming) = tokio::sync::mpsc::unbounded_channel();
+    let tunnel_flags = flags.clone();
+    let mut service = crate::clipboard_service::HostClipboardService::new(
+        Arc::new(Mutex::new(linux_quest_input::MockClipboardBackend::new())),
+        Arc::new(Mutex::new(linux_quest_protocol::ClipboardSyncEngine::new(
+            7,
+        ))),
+        outgoing,
+        incoming,
+    )
+    .with_listener(listener)
+    .with_link_tracker(link.clone())
+    .with_tunnel_video(tunnel_tx.clone())
+    .with_tunnel_keyframe_request(Arc::new(move || {
+        let _ = tunnel_flags.request(0);
+    }));
+    let running = service.running_flag();
+    let service_task = tokio::spawn(async move {
+        let _ = service.run().await;
+    });
+
+    // The headset's UDP input keepalives, as the input receiver reports them: they never stop.
+    let keepalive_link = link.clone();
+    let keepalives = tokio::spawn(async move {
+        loop {
+            keepalive_link
+                .lock()
+                .input_packet(peer("192.0.2.10:40000"), Instant::now());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+
+    let sink = TunnelOrWifiSink {
+        tunnel: tunnel_tx.clone(),
+        wifi: Arc::default(),
+    };
+    let wifi = sink.wifi.clone();
+    let handle = spawn_video_sender(
+        TestSource::new(100_000, Duration::from_millis(10), 64),
+        ScriptedEncoder::new(vec![2400], 100),
+        sink,
+        link.clone(),
+        VideoSenderConfig {
+            pacing_fraction: 0.0,
+            keyframe_requests: Some(flags.clone()),
+            ..config_to(48440)
+        },
+    );
+
+    // Cable out: Wi-Fi only.
+    assert!(until_async(Duration::from_secs(5), || wifi.lock().len() > 10).await);
+    assert!(starts_with_keyframe(&wifi.lock(), 0));
+
+    // Plugged in: the tunnel takes video, starting with a keyframe, and Wi-Fi gets no more.
+    let headset = TunnelHeadset::connect(control).await;
+    assert!(until_async(Duration::from_secs(5), || headset.video_datagrams() > 10).await);
+    assert!(
+        starts_with_keyframe(&headset.received.lock(), 0),
+        "the tunnel's first frame is a keyframe"
+    );
+    let wifi_mark = wifi.lock().len();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        wifi.lock().len(),
+        wifi_mark,
+        "no Wi-Fi video while the tunnel is live"
+    );
+
+    // Unplugged: video is back on Wi-Fi within a few frames, starting with a keyframe.
+    let unplugged = Instant::now();
+    headset.unplug();
+    assert!(
+        until_async(Duration::from_secs(2), || wifi.lock().len()
+            > wifi_mark + 10)
+        .await
+    );
+    let switch = unplugged.elapsed();
+    assert!(
+        switch < Duration::from_millis(500),
+        "video took {switch:?} to move to Wi-Fi"
+    );
+    assert!(starts_with_keyframe(&wifi.lock(), wifi_mark));
+
+    // A tunnel that stays open but carries nothing (an unplug adb has not noticed) loses video
+    // to Wi-Fi as well, and gets it back once it carries data again.
+    let headset = TunnelHeadset::connect(control).await;
+    assert!(until_async(Duration::from_secs(5), || headset.video_datagrams() > 10).await);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let wifi_mark = wifi.lock().len();
+    headset.talking.store(false, Ordering::SeqCst);
+    assert!(
+        until_async(Duration::from_secs(3), || wifi.lock().len()
+            > wifi_mark + 10)
+        .await,
+        "a quiet tunnel kept video"
+    );
+    assert!(starts_with_keyframe(&wifi.lock(), wifi_mark));
+    let tunnel_mark = headset.video_datagrams();
+    headset.talking.store(true, Ordering::SeqCst);
+    assert!(
+        until_async(Duration::from_secs(3), || headset.video_datagrams()
+            > tunnel_mark + 10)
+        .await
+    );
+    assert!(starts_with_keyframe(&headset.received.lock(), tunnel_mark));
+
+    headset.unplug();
+    handle.stop().await;
+    keepalives.abort();
+    running.store(false, Ordering::SeqCst);
+    service_task.abort();
+}

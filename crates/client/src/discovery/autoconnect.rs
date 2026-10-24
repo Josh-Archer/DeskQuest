@@ -2,8 +2,8 @@
 //! never types an IP address.
 //!
 //! The decisions live here as plain functions so they test against the mock backend;
-//! `android::autodiscover_config` supplies the real mDNS backend, the multicast lock and the
-//! USB probe.
+//! `android::discover_lan_host` supplies the real mDNS backend and the multicast lock, and
+//! runs in the background so the USB tunnel never waits for it.
 
 use tracing::{info, warn};
 
@@ -20,7 +20,7 @@ pub const STARTUP_SCAN_ATTEMPTS: u32 = 2;
 /// How a startup auto-connect attempt ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutoConnectOutcome {
-    /// `config` now targets the named host over `Udp`.
+    /// `config` now targets the named host over Wi-Fi (see [`connect_config_to`]).
     Connected { host: String, other_hosts: usize },
     /// Browsing worked but nothing answered. `config` is unchanged.
     NoHosts,
@@ -29,11 +29,13 @@ pub enum AutoConnectOutcome {
     Unavailable(String),
 }
 
-/// Whether the client should look for a host on its own. Explicit configuration wins: a host or
-/// transport set by the user (`debug.linuxquest.*`) is never overridden, and neither is a
-/// working USB tunnel, since the cable is the lower-latency path.
-pub fn should_autodiscover(explicit_override: bool, usb_tunnel_present: bool) -> bool {
-    !explicit_override && !usb_tunnel_present
+/// Whether the client should look for its host on the LAN: its mode has a Wi-Fi path and no
+/// host is set (`host_addr` is loopback, the default). A host set by the user
+/// (`debug.linuxquest.host`) is never overridden, and USB-only mode needs no LAN address.
+/// An unspecified host (`0.0.0.0`) is a deliberate "accept video from anyone" and is left
+/// alone too.
+pub fn needs_lan_discovery(config: &ClientConfig) -> bool {
+    config.transport_mode.uses_wifi() && config.host_addr.ip().to_canonical().is_loopback()
 }
 
 /// Picks the host to connect to when several answer. Hosts that are streaming video (a video
@@ -51,14 +53,17 @@ pub fn choose_host<'a>(hosts: &[&'a DiscoveredHost]) -> Option<&'a DiscoveredHos
         })
 }
 
-/// Switches `config` to `Udp` and targets `host`: control address, the host's other addresses
-/// for the video source filter, and the input port it advertised.
+/// Targets `host` over Wi-Fi: control address, the host's other addresses for the video source
+/// filter, and the input port it advertised. `Auto` stays `Auto` (the cable still wins when it
+/// is plugged in); USB-only mode switches to `Udp`, since the host was found on the LAN.
 pub fn connect_config_to(
     config: &mut ClientConfig,
     host: &DiscoveredHost,
 ) -> crate::ClientResult<()> {
     apply_selection(config, host)?;
-    config.transport_mode = TransportMode::Udp;
+    if !config.transport_mode.uses_wifi() {
+        config.transport_mode = TransportMode::Udp;
+    }
     config.input_port = host.input_port;
     Ok(())
 }
@@ -131,10 +136,29 @@ mod tests {
     }
 
     #[test]
-    fn explicit_config_and_usb_suppress_autodiscovery() {
-        assert!(should_autodiscover(false, false));
-        assert!(!should_autodiscover(true, false));
-        assert!(!should_autodiscover(false, true));
+    fn discovery_runs_only_for_a_wifi_path_without_a_host() {
+        let auto = ClientConfig::default();
+        assert!(needs_lan_discovery(&auto), "Auto with no host set");
+        let udp = ClientConfig {
+            transport_mode: TransportMode::Udp,
+            ..Default::default()
+        };
+        assert!(needs_lan_discovery(&udp));
+        let usb = ClientConfig {
+            transport_mode: TransportMode::AdbReverseTcp,
+            ..Default::default()
+        };
+        assert!(!needs_lan_discovery(&usb), "USB only needs no LAN address");
+        let set = ClientConfig {
+            host_addr: "192.168.1.20:48444".parse().unwrap(),
+            ..Default::default()
+        };
+        assert!(!needs_lan_discovery(&set), "a host set by the user wins");
+        let open = ClientConfig {
+            host_addr: "0.0.0.0:48444".parse().unwrap(),
+            ..Default::default()
+        };
+        assert!(!needs_lan_discovery(&open));
     }
 
     #[test]
@@ -159,8 +183,10 @@ mod tests {
     #[tokio::test]
     async fn connects_to_the_only_host_over_udp() {
         let mut d = discovery(MockDiscoveryBackend::new().with_peers([host("den", 20, 48445)]));
-        let mut config = ClientConfig::default();
-        assert_eq!(config.transport_mode, TransportMode::AdbReverseTcp);
+        let mut config = ClientConfig {
+            transport_mode: TransportMode::AdbReverseTcp,
+            ..Default::default()
+        };
 
         let outcome = autoconnect(&mut d, &mut config, 2).await;
 
@@ -190,7 +216,11 @@ mod tests {
         let mut config = ClientConfig::default();
         connect_config_to(&mut config, &discovered).unwrap();
 
-        assert_eq!(config.transport_mode, TransportMode::Udp);
+        assert_eq!(
+            config.transport_mode,
+            TransportMode::Auto,
+            "Auto keeps the cable as well"
+        );
         assert_eq!(config.host_addr, "192.168.1.20:50123".parse().unwrap());
         assert_eq!(config.input_port, 50124);
         assert_eq!(
@@ -231,7 +261,7 @@ mod tests {
         );
         assert_eq!(d.backend().browse_calls(), 3);
         assert_eq!(config.host_addr, before);
-        assert_eq!(config.transport_mode, TransportMode::AdbReverseTcp);
+        assert_eq!(config.transport_mode, TransportMode::Auto);
     }
 
     #[tokio::test]
@@ -242,6 +272,6 @@ mod tests {
         let outcome = autoconnect(&mut d, &mut config, 3).await;
 
         assert!(matches!(outcome, AutoConnectOutcome::Unavailable(_)));
-        assert_eq!(config.transport_mode, TransportMode::AdbReverseTcp);
+        assert_eq!(config.transport_mode, TransportMode::Auto);
     }
 }

@@ -29,11 +29,12 @@
 //! [`DEFAULT_ACK_TIMEOUT`] (or a send fails) it moves to the next of at most
 //! [`MAX_TARGETS`] addresses (`host_addr` then `extra_host_ips`), and stays on one that is acked.
 //!
-//! # USB mode
+//! # USB and Auto modes
 //!
 //! In `TransportMode::AdbReverseTcp`, the same [`CombinedInputSource`] is polled by the TCP
 //! tunnel writer and its batches are sent as `Packet` frames. UDP mode continues to use the
-//! dedicated datagram sender below.
+//! dedicated datagram sender below. `Auto` runs both and routes each event to one of them
+//! (see `crate::transport`).
 //!
 //! # Name clash
 //!
@@ -401,11 +402,18 @@ pub fn host_targets(host: IpAddr, extra: &[IpAddr], port: u16) -> Vec<SocketAddr
     )
 }
 
-/// The sender configuration for a client config, or `None` when no sender should run: any mode
-/// other than `Udp` (`adb reverse` cannot carry UDP), or no usable host address.
+/// The sender configuration for a client config, or `None` when it names no host to send to:
+/// a mode without a Wi-Fi path (`adb reverse` cannot carry UDP), no usable host address, or, in
+/// `Auto` mode, a loopback one (the USB tunnel's end; the LAN host is not known yet).
 pub fn input_sender_config(config: &ClientConfig) -> Option<InputSenderConfig> {
     // An unspecified host IP means "unset" (same convention as the video source filter).
-    if config.transport_mode != TransportMode::Udp || config.host_addr.ip().is_unspecified() {
+    let host = config.host_addr.ip();
+    let usable = match config.transport_mode {
+        TransportMode::Udp => !host.is_unspecified(),
+        TransportMode::Auto => !host.is_unspecified() && !host.to_canonical().is_loopback(),
+        TransportMode::AdbReverseTcp => false,
+    };
+    if !usable {
         return None;
     }
     let targets = host_targets(

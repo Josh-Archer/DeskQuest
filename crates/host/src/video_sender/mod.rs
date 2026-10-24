@@ -676,6 +676,20 @@ async fn capture_loop<S: FrameSource>(
     }
 }
 
+/// How a video destination reads in the log: the USB tunnel's route marker by name, a Wi-Fi
+/// peer by address.
+struct VideoRoute(IpAddr);
+
+impl std::fmt::Display for VideoRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_unspecified() {
+            f.write_str("USB tunnel")
+        } else {
+            write!(f, "Wi-Fi {}", self.0)
+        }
+    }
+}
+
 async fn send_loop<E, K, P>(
     mut pipeline: FramePipeline<E, K>,
     slot: Arc<FrameSlot>,
@@ -699,17 +713,23 @@ async fn send_loop<E, K, P>(
         let now = Instant::now();
         let Some(ip) = peers.video_peer(now) else {
             if active.take().is_some() {
-                info!("Headset went silent; UDP video sending paused");
+                info!("Headset went silent; video sending paused");
             }
             stats.frames_skipped_no_peer.fetch_add(1, Ordering::Relaxed);
             continue;
         };
         if active != Some(ip) {
             match active {
-                None => info!(peer = %ip, port = video_port, "Starting UDP video to headset"),
-                Some(old) => {
-                    info!(old = %old, new = %ip, "Headset address changed; retargeting UDP video")
-                }
+                None => info!(
+                    route = %VideoRoute(ip),
+                    port = video_port,
+                    "Starting video to headset"
+                ),
+                Some(old) => info!(
+                    from = %VideoRoute(old),
+                    to = %VideoRoute(ip),
+                    "Headset link changed; video follows it, starting with a keyframe"
+                ),
             }
             active = Some(ip);
             // A new decoder needs an IDR to start from.

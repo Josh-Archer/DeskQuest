@@ -85,7 +85,7 @@ impl Default for ClientSettings {
     fn default() -> Self {
         Self {
             host: None,
-            transport: TransportMode::AdbReverseTcp,
+            transport: TransportMode::Auto,
             codec: ClientVideoCodec::Av1,
             bitrate_mode: BitrateMode::Adaptive,
             bitrate_mbps: 80,
