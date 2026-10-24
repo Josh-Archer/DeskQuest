@@ -26,14 +26,12 @@ use serde::Serialize;
 use crate::{
     config::{ClientVideoCodec, TransportMode},
     decoder::{create_decoder, HardwareVideoDecoder},
-    input_sender::{
-        input_sender_config, CombinedInputSource, InputSenderControl, InputSenderThread,
-        SharedInputEvents,
-    },
+    input_sender::{CombinedInputSource, SharedInputEvents},
     receiver::{
         loss_recovery::{Admit, LossRecovery},
         ClientReceiver,
     },
+    transport::InputWaker,
 };
 
 static APP_CONTEXT: Mutex<Option<GlobalRef>> = Mutex::new(None);
@@ -58,7 +56,7 @@ struct PanelStatus {
 #[derive(Default)]
 struct PanelInput {
     events: SharedInputEvents,
-    control: Mutex<Option<InputSenderControl>>,
+    control: Mutex<Option<InputWaker>>,
     keys: Mutex<BTreeMap<u32, KeyModifiers>>,
 }
 
@@ -79,7 +77,7 @@ impl PanelInput {
         }
         self.events.push(event);
         if let Some(control) = &*self.control.lock() {
-            control.notify();
+            control.wake();
         }
     }
 
@@ -98,7 +96,7 @@ impl PanelInput {
             });
         }
         if let Some(control) = &*self.control.lock() {
-            control.notify();
+            control.wake();
         }
     }
 }
@@ -135,50 +133,23 @@ fn run(
     input: Arc<PanelInput>,
     source: CombinedInputSource,
 ) {
-    let (mut config, explicit) = super::launch_config();
-    if crate::discovery::autoconnect::should_autodiscover(
-        explicit,
-        super::usb_tunnel_present(&config),
-    ) {
-        STATUS.lock().message = "Looking for your desktop on Wi-Fi…".into();
-        config = super::autodiscover_config(config);
-    }
+    let mut config = super::launch_config();
     if !running.load(Ordering::Acquire) {
         return;
     }
     let flags = source.requester();
     let (tx, rx) = std::sync::mpsc::sync_channel(super::PACKET_CHANNEL_DEPTH);
-    let (sender, tunnel, receiver_thread) = match config.transport_mode {
-        TransportMode::Udp => {
-            let sender = input_sender_config(&config).and_then(|cfg| {
-                InputSenderThread::spawn(cfg, Box::new(source))
-                    .map_err(|error| tracing::warn!(?error, "Home input sender failed"))
-                    .ok()
-            });
-            let control = sender.as_ref().map(|s| s.control().clone());
-            let receiver =
-                super::transport::spawn_udp_receiver(&config, running.clone(), control, tx);
-            (sender, None, Some(receiver))
-        }
-        TransportMode::AdbReverseTcp => {
-            let input = crate::usb_tunnel::TunnelInput {
-                source: Arc::new(std::sync::Mutex::new(source)),
-                keyframes: flags.clone(),
-            };
-            let tunnel = crate::usb_tunnel::UsbTunnel::spawn(
-                crate::usb_tunnel::UsbTunnelConfig::new(config.host_addr),
-                Some(input),
-                move |packet| {
-                    let _ = tx.try_send(packet);
-                },
-            )
-            .map_err(|error| tracing::warn!(?error, "Home USB tunnel failed"))
-            .ok();
-            (None, tunnel, None)
-        }
-    };
-    let control = sender.as_ref().map(|s| s.control().clone());
+    // USB tunnel, Wi-Fi, or both (see `crate::transport`); LAN discovery runs in the background.
+    let transport = super::start_transport(&config, tx, source, running.clone());
+    let control = transport.as_ref().map(|t| t.waker());
     *input.control.lock() = control.clone();
+    if config.transport_mode == TransportMode::Auto
+        && crate::discovery::autoconnect::needs_lan_discovery(&config)
+    {
+        STATUS.lock().message = "Looking for your desktop over USB and Wi-Fi…".into();
+    } else {
+        STATUS.lock().message = format!("Connecting to {}…", config.host_addr);
+    }
     let mut receiver = ClientReceiver::for_stream(&config, 0);
     receiver.set_focused_stream(Some(0));
     let mut loss = LossRecovery::new();
@@ -196,7 +167,6 @@ fn run(
         );
         pipeline.start(Default::default()).ok().map(|_| pipeline)
     });
-    STATUS.lock().message = format!("Connecting to {}…", config.host_addr);
 
     while running.load(Ordering::Acquire) {
         let now = Instant::now();
@@ -283,7 +253,7 @@ fn run(
         if loss.take_request(now) {
             flags.raise(0);
             if let Some(control) = &control {
-                control.notify();
+                control.wake();
             }
         }
         if let Some(decoder) = &mut decoder {
@@ -305,7 +275,7 @@ fn run(
                     }
                     let mut status = STATUS.lock();
                     status.frames += 1;
-                    status.input_ready = control.is_some() || tunnel.is_some();
+                    status.input_ready = transport.is_some();
                     status.message = "Drag to scroll · Hold to drag the mouse".into();
                 }
             }
@@ -330,14 +300,8 @@ fn run(
     // Give the sender a final poll to deliver button/key releases before closing its socket.
     std::thread::sleep(Duration::from_millis(20));
     running.store(false, Ordering::Release);
-    if let Some(receiver_thread) = receiver_thread {
-        let _ = receiver_thread.join();
-    }
-    if let Some(tunnel) = tunnel {
-        tunnel.stop();
-    }
-    if let Some(sender) = sender {
-        sender.stop();
+    if let Some(transport) = transport {
+        transport.stop();
     }
     if let Some(audio) = &mut audio {
         let _ = audio.stop();

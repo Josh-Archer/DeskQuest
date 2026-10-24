@@ -87,13 +87,69 @@ pub struct TunnelInput {
     pub keyframes: KeyframeRequestFlags,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Shared {
     running: AtomicBool,
     /// Successful negotiations so far.
     connections: AtomicU64,
     /// Streams (bit per id below 32) that have delivered packets.
     seen_streams: AtomicU32,
+    /// A negotiated connection is open.
+    connected: AtomicBool,
+    /// When the open connection last delivered a byte, in microseconds since `epoch`.
+    last_rx_us: AtomicU64,
+    /// The host of the open connection sends heartbeats.
+    heartbeats: AtomicBool,
+    epoch: Instant,
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self {
+            running: AtomicBool::new(false),
+            connections: AtomicU64::new(0),
+            seen_streams: AtomicU32::new(0),
+            connected: AtomicBool::new(false),
+            last_rx_us: AtomicU64::new(0),
+            heartbeats: AtomicBool::new(false),
+            epoch: Instant::now(),
+        }
+    }
+}
+
+impl Shared {
+    fn mark_rx(&self) {
+        let us = self.epoch.elapsed().as_micros() as u64;
+        self.last_rx_us.store(us, Ordering::Release);
+    }
+}
+
+/// The tunnel's state at one instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TunnelHealth {
+    /// A negotiated connection is open.
+    pub connected: bool,
+    /// Time since the open connection last delivered a byte.
+    pub quiet: Duration,
+    /// The host sends a heartbeat every second on this connection, so `quiet` beyond that
+    /// means trouble. Older hosts send nothing on a static screen.
+    pub heartbeats: bool,
+}
+
+/// Reads the tunnel's [`TunnelHealth`] from any thread.
+#[derive(Debug, Clone)]
+pub struct TunnelMonitor(Arc<Shared>);
+
+impl TunnelMonitor {
+    pub fn health(&self) -> TunnelHealth {
+        let shared = &self.0;
+        let last = Duration::from_micros(shared.last_rx_us.load(Ordering::Acquire));
+        TunnelHealth {
+            connected: shared.connected.load(Ordering::Acquire),
+            quiet: shared.epoch.elapsed().saturating_sub(last),
+            heartbeats: shared.heartbeats.load(Ordering::Acquire),
+        }
+    }
 }
 
 /// Handle of the tunnel thread. Stops the thread when dropped.
@@ -135,6 +191,11 @@ impl UsbTunnel {
     /// Connections negotiated so far, the first one included.
     pub fn connections(&self) -> u64 {
         self.shared.connections.load(Ordering::Acquire)
+    }
+
+    /// A handle that reads the tunnel's health.
+    pub fn monitor(&self) -> TunnelMonitor {
+        TunnelMonitor(self.shared.clone())
     }
 
     pub fn stop(mut self) {
@@ -194,6 +255,9 @@ fn run(
         };
         failures = 0;
         let opened = Instant::now();
+        shared.heartbeats.store(false, Ordering::Release);
+        shared.mark_rx();
+        shared.connected.store(true, Ordering::Release);
         let previous = shared.connections.fetch_add(1, Ordering::AcqRel);
         tracing::info!(host = %config.host_addr, reconnects = previous, "USB tunnel connected");
         if previous > 0 {
@@ -213,6 +277,7 @@ fn run(
             input.as_ref(),
             &mut on_packet,
         );
+        shared.connected.store(false, Ordering::Release);
         match &ended {
             Ended::Stopped => {}
             Ended::Closed => tracing::info!("USB tunnel closed by the host; reconnecting"),
@@ -342,6 +407,7 @@ fn read_frames(
             Ok(0) => return Ended::Closed,
             Ok(n) => {
                 last_rx = Instant::now();
+                shared.mark_rx();
                 decoder.push(&buf[..n]);
             }
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => continue,
@@ -366,6 +432,7 @@ fn read_frames(
                              reopened"
                         );
                         host_heartbeats = true;
+                        shared.heartbeats.store(true, Ordering::Release);
                     }
                 }
                 Ok(TunnelFrame::Control(message)) => {

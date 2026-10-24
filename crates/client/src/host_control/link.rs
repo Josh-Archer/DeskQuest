@@ -69,8 +69,8 @@ impl LinkConfig {
 /// Where the host's control port can be reached, best first.
 ///
 /// - USB mode: the settings channel's own USB tunnel ([`SETTINGS_TUNNEL_PORT`]).
-/// - Wi-Fi mode: the host's LAN address, then that tunnel, which works when a firewall blocks
-///   TCP on the LAN and the cable is plugged in.
+/// - Wi-Fi and Auto modes: the host's LAN address (when known), then that tunnel, which works
+///   when a firewall blocks TCP on the LAN and the cable is plugged in.
 ///
 /// The tunnel is not the control port's own (`adb reverse tcp:48444`): only a host that speaks
 /// the settings channel sets up the settings tunnel, so an older host is never reached through
@@ -83,7 +83,7 @@ pub fn control_candidates(config: &ClientConfig) -> Vec<SocketAddr> {
             vec![SocketAddr::new(config.host_addr.ip(), SETTINGS_TUNNEL_PORT)]
         }
         TransportMode::AdbReverseTcp => vec![config.host_addr],
-        TransportMode::Udp => {
+        TransportMode::Udp | TransportMode::Auto => {
             let mut out = Vec::new();
             let ip = config.host_addr.ip();
             if !ip.is_unspecified() && !ip.is_loopback() {
@@ -353,12 +353,24 @@ mod tests {
             ..udp.clone()
         };
         assert_eq!(control_candidates(&unset), vec![tunnel]);
-        let usb = ClientConfig::default();
+        let usb = ClientConfig {
+            transport_mode: TransportMode::AdbReverseTcp,
+            ..Default::default()
+        };
         assert_eq!(
             control_candidates(&usb),
             vec![tunnel],
             "never the control port's own tunnel, which an older host also has"
         );
+        // Auto: the LAN host once it is known, and the settings tunnel for the cable.
+        let auto = ClientConfig::default();
+        assert_eq!(auto.transport_mode, TransportMode::Auto);
+        assert_eq!(control_candidates(&auto), vec![tunnel]);
+        let auto_lan = ClientConfig {
+            host_addr: lan,
+            ..Default::default()
+        };
+        assert_eq!(control_candidates(&auto_lan), vec![lan, tunnel]);
     }
 
     #[test]

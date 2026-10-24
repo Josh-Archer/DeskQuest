@@ -457,8 +457,13 @@ fn sender_config_follows_transport_mode_and_input_port() {
     assert_eq!(
         input_sender_config(&ClientConfig::default()).map(|_| ()),
         None,
-        "adb reverse default: no UDP sender"
+        "Auto default: the LAN host is not known yet"
     );
+    let auto = ClientConfig {
+        transport_mode: TransportMode::Auto,
+        ..udp.clone()
+    };
+    assert_eq!(input_sender_config(&auto).unwrap().targets, cfg.targets);
     let adb = ClientConfig {
         transport_mode: TransportMode::AdbReverseTcp,
         ..udp.clone()

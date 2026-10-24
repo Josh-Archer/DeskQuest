@@ -3,7 +3,13 @@
 //! The inputs are real events only:
 //! - the control TCP listener accepting and closing a connection,
 //! - the input UDP receiver seeing a packet from a peer (with a liveness timeout),
-//! - the ADB bridge reporting that the reverse tunnel was established or dropped.
+//! - the ADB bridge reporting that the reverse tunnel was established or dropped,
+//! - a control connection negotiating the USB tunnel, sending on it, and closing.
+//!
+//! A headset in the client's `Auto` mode is reachable both ways at once: it keeps a USB tunnel
+//! open whenever the cable is plugged in and sends UDP input keepalives over Wi-Fi all the
+//! time. Video goes over the tunnel while it carries data, and moves to the Wi-Fi peer as soon
+//! as the tunnel closes or goes quiet for [`TUNNEL_VIDEO_LIVENESS`].
 //!
 //! [`LinkTracker`] records those events. [`LinkStatus`] is the derived view for one
 //! instant. Every time-dependent method takes `now` explicitly so the model is pure
@@ -28,6 +34,13 @@ use parking_lot::Mutex;
 
 /// How long input-channel silence is tolerated before the input path counts as dead.
 pub const DEFAULT_INPUT_LIVENESS: Duration = Duration::from_secs(5);
+
+/// How recently a USB tunnel peer must have sent something for video to stay on the tunnel.
+/// The headset sends an input keepalive over the tunnel every 100 ms. After an unplug adb
+/// usually closes the tunnel at once, but not always; a tunnel that carried nothing for this
+/// long loses video to a live Wi-Fi peer. It stays open (and gets video back when it carries
+/// data again) until the control service drops it.
+pub const TUNNEL_VIDEO_LIVENESS: Duration = Duration::from_secs(1);
 
 /// Transport a connected client is reached over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +83,10 @@ pub struct LinkTracker {
     input_last_seen: Option<Instant>,
     last_activity: Option<Instant>,
     adb_reverse_established: bool,
+    /// Open connections that negotiated the USB tunnel, oldest first, with the last time each
+    /// one carried data. Each is also in `control_peers`.
+    tunnel_peers: Vec<(SocketAddr, Instant)>,
+    tunnel_liveness: Duration,
 }
 
 /// Shared handle the daemon hands to the IPC server, the TUI and the transport services.
@@ -89,7 +106,49 @@ impl LinkTracker {
             input_last_seen: None,
             last_activity: None,
             adb_reverse_established: false,
+            tunnel_peers: Vec::new(),
+            tunnel_liveness: TUNNEL_VIDEO_LIVENESS,
         }
+    }
+
+    /// Changes how long a quiet USB tunnel keeps video (tests).
+    pub fn with_tunnel_liveness(mut self, liveness: Duration) -> Self {
+        self.tunnel_liveness = liveness;
+        self
+    }
+
+    /// The control connection from `peer` negotiated the USB tunnel (video, input, settings).
+    pub fn tunnel_opened(&mut self, peer: SocketAddr, now: Instant) {
+        self.tunnel_peers.retain(|(p, _)| *p != peer);
+        self.tunnel_peers.push((peer, now));
+        self.last_activity = Some(now);
+    }
+
+    /// The USB tunnel from `peer` delivered a frame.
+    pub fn tunnel_activity(&mut self, peer: SocketAddr, now: Instant) {
+        if let Some((_, seen)) = self.tunnel_peers.iter_mut().find(|(p, _)| *p == peer) {
+            *seen = now;
+        }
+        self.last_activity = Some(now);
+    }
+
+    /// The USB tunnel from `peer` closed. Its control connection is closed separately
+    /// ([`Self::control_closed`]).
+    pub fn tunnel_closed(&mut self, peer: SocketAddr) {
+        self.tunnel_peers.retain(|(p, _)| *p != peer);
+    }
+
+    /// The newest USB tunnel that carried data within [`TUNNEL_VIDEO_LIVENESS`], if the ADB
+    /// reverse tunnel is up.
+    fn live_tunnel(&self, now: Instant) -> Option<SocketAddr> {
+        if !self.adb_reverse_established {
+            return None;
+        }
+        self.tunnel_peers
+            .iter()
+            .rev()
+            .find(|(_, seen)| now.saturating_duration_since(*seen) < self.tunnel_liveness)
+            .map(|(peer, _)| *peer)
     }
 
     /// The control TCP listener accepted a connection from `peer`.
@@ -135,31 +194,36 @@ impl LinkTracker {
 
     /// Derives the link status at `now`.
     ///
-    /// The peer is the newest open control connection. If there is none, the input peer is
-    /// used while its packets are within the liveness timeout. A control connection through
-    /// the USB tunnel gives way to live input from the network. A peer only counts as connected
-    /// when it can be classified: loopback needs an established ADB reverse tunnel (USB), and
-    /// any other address is Wi-Fi.
+    /// A USB tunnel that carried data within [`TUNNEL_VIDEO_LIVENESS`] is the link. Otherwise
+    /// the peer is the newest open control connection, or, if there is none, the input peer
+    /// while its packets are within the liveness timeout. A control connection through the USB
+    /// tunnel (a quiet tunnel, or the settings channel) gives way to live input from the
+    /// network. A peer only counts as connected when it can be classified: loopback needs an
+    /// established ADB reverse tunnel (USB), and any other address is Wi-Fi.
     pub fn status(&self, now: Instant) -> LinkStatus {
         let input_alive = self
             .input_last_seen
             .is_some_and(|seen| now.saturating_duration_since(seen) < self.liveness);
 
         let live_input = self.input_peer.filter(|_| input_alive);
-        let peer = match self.control_peers.last() {
-            // The headset streams over the network (live UDP input from a LAN address) and only
-            // its control connection comes through the USB tunnel, for example because a
-            // firewall blocks TCP on the LAN. Video goes where the input comes from, so the
-            // network peer is the link.
-            Some(control)
-                if is_loopback(control.ip())
-                    && live_input.is_some_and(|input| !is_loopback(input.ip())) =>
-            {
-                live_input
-            }
-            Some(peer) => Some(*peer),
-            None => live_input,
-        };
+        // The cable is the lower-latency path: a tunnel that is carrying data wins over Wi-Fi
+        // input from the same headset.
+        let peer = self
+            .live_tunnel(now)
+            .or_else(|| match self.control_peers.last() {
+                // The headset streams over the network (live UDP input from a LAN address) and only
+                // its control connection comes through the USB tunnel, for example because a
+                // firewall blocks TCP on the LAN, or the tunnel went quiet after an unplug. Video
+                // goes where the input comes from, so the network peer is the link.
+                Some(control)
+                    if is_loopback(control.ip())
+                        && live_input.is_some_and(|input| !is_loopback(input.ip())) =>
+                {
+                    live_input
+                }
+                Some(peer) => Some(*peer),
+                None => live_input,
+            });
 
         let transport = peer.and_then(|p| classify(p, self.adb_reverse_established));
 
@@ -458,6 +522,98 @@ mod tests {
         lan.control_accepted(addr("192.168.1.21:50000"), now);
         lan.input_packet(addr("192.168.1.20:48442"), now);
         assert_eq!(lan.status(now).peer, Some(addr("192.168.1.21:50000")));
+    }
+
+    const USB_ROUTE: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+
+    fn wifi_ip() -> IpAddr {
+        "192.168.1.20".parse().unwrap()
+    }
+
+    /// A client in `Auto` mode with the cable plugged in: a USB tunnel plus the UDP input
+    /// keepalives it sends over Wi-Fi all the time.
+    fn auto_headset(now: Instant) -> LinkTracker {
+        let mut t = LinkTracker::new(LIVENESS);
+        t.adb_event(&AdbBridgeEvent::ReversePortEstablished {
+            serial: "QUEST".into(),
+            port: 48444,
+        });
+        t.control_accepted(addr("127.0.0.1:50000"), now);
+        t.tunnel_opened(addr("127.0.0.1:50000"), now);
+        t.input_packet(addr("192.168.1.20:40000"), now);
+        t
+    }
+
+    #[test]
+    fn a_live_tunnel_beats_wifi_input_and_video_moves_when_it_closes() {
+        let t0 = Instant::now();
+        let mut t = auto_headset(t0);
+        assert_eq!(t.status(t0).transport, Some(LinkTransport::UsbAdb));
+        assert_eq!(t.video_peer(t0), Some(USB_ROUTE));
+
+        // Unplugged: adb closes the tunnel, the Wi-Fi keepalives go on.
+        let t1 = t0 + Duration::from_millis(200);
+        t.input_packet(addr("192.168.1.20:40000"), t1);
+        t.tunnel_closed(addr("127.0.0.1:50000"));
+        t.control_closed(addr("127.0.0.1:50000"));
+        assert_eq!(t.status(t1).transport, Some(LinkTransport::Wifi));
+        assert_eq!(t.video_peer(t1), Some(wifi_ip()));
+
+        // Plugged back in: the new tunnel takes video back.
+        let t2 = t1 + Duration::from_secs(3);
+        t.input_packet(addr("192.168.1.20:40000"), t2);
+        t.control_accepted(addr("127.0.0.1:50100"), t2);
+        assert_eq!(
+            t.video_peer(t2),
+            Some(wifi_ip()),
+            "a control connection that has not negotiated the tunnel is not the tunnel"
+        );
+        t.tunnel_opened(addr("127.0.0.1:50100"), t2);
+        assert_eq!(t.status(t2).transport, Some(LinkTransport::UsbAdb));
+        assert_eq!(t.video_peer(t2), Some(USB_ROUTE));
+    }
+
+    #[test]
+    fn a_quiet_tunnel_loses_video_to_wifi_and_gets_it_back() {
+        let t0 = Instant::now();
+        let mut t = auto_headset(t0);
+        let tunnel = addr("127.0.0.1:50000");
+        let just_before = t0 + TUNNEL_VIDEO_LIVENESS - Duration::from_millis(1);
+        assert_eq!(t.video_peer(just_before), Some(USB_ROUTE));
+
+        // Keepalives keep coming over Wi-Fi only: the tunnel is open but carries nothing.
+        let t1 = t0 + TUNNEL_VIDEO_LIVENESS;
+        t.input_packet(addr("192.168.1.20:40000"), t1);
+        assert_eq!(t.video_peer(t1), Some(wifi_ip()));
+        assert_eq!(t.status(t1).transport, Some(LinkTransport::Wifi));
+
+        // The tunnel carries data again.
+        let t2 = t1 + Duration::from_millis(100);
+        t.tunnel_activity(tunnel, t2);
+        assert_eq!(t.video_peer(t2), Some(USB_ROUTE));
+    }
+
+    #[test]
+    fn a_tunnel_counts_only_while_adb_reverse_is_up() {
+        let now = Instant::now();
+        let mut t = auto_headset(now);
+        t.adb_event(&AdbBridgeEvent::DeviceDisconnected("QUEST".into()));
+        assert_eq!(t.video_peer(now), Some(wifi_ip()));
+        t.adb_event(&AdbBridgeEvent::ReconnectionSuccessful {
+            serial: "QUEST".into(),
+        });
+        assert_eq!(t.video_peer(now), Some(USB_ROUTE));
+    }
+
+    #[test]
+    fn a_usb_only_headset_keeps_video_on_a_quiet_tunnel() {
+        // Without Wi-Fi input there is nowhere else to send video, as before.
+        let t0 = Instant::now();
+        let mut t = usb_tracker(t0);
+        t.tunnel_opened(addr("127.0.0.1:50000"), t0);
+        let later = t0 + TUNNEL_VIDEO_LIVENESS * 2;
+        assert_eq!(t.status(later).transport, Some(LinkTransport::UsbAdb));
+        assert_eq!(t.video_peer(later), Some(USB_ROUTE));
     }
 
     #[test]

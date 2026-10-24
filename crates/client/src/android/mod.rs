@@ -3,8 +3,6 @@
 #[cfg(target_os = "android")]
 mod home_panel;
 pub mod lifecycle;
-#[cfg(target_os = "android")]
-mod transport;
 
 #[cfg(target_os = "android")]
 use std::time::Duration;
@@ -34,22 +32,19 @@ pub(crate) fn activity_jobject() -> *mut std::ffi::c_void {
 use std::net::{IpAddr, SocketAddr};
 
 use crate::config::{ClientConfig, TransportMode};
-use crate::input_sender::{
-    input_sender_config, CombinedInputSource, InputSenderThread, KeyframeRequestFlags,
-    SharedInputEvents,
-};
 use crate::runtime::QuestClientRuntime;
 
 /// Source IPs that UDP video datagrams must come from, or `None` to accept any source.
 ///
-/// Only the UDP transport filters, and only by IP: the host sends from an ephemeral port, so
+/// Only the UDP path filters, and only by IP: the host sends from an ephemeral port, so
 /// its port is not known. The ADB/USB path connects to `host_addr` and never filters.
 /// An unspecified IP (`0.0.0.0`) in `host_addr` means "unset", so no filter is applied.
 /// The list is `host_addr` plus `extra_host_ips`, all in canonical form (IPv4-mapped IPv6 is
-/// folded to IPv4).
+/// folded to IPv4). In `Auto` mode a loopback `host_addr` (the default) means the LAN host is
+/// not known yet, so only loopback is accepted until discovery sets it.
 pub fn udp_source_filter(config: &ClientConfig) -> Option<Vec<IpAddr>> {
     match config.transport_mode {
-        TransportMode::Udp if !config.host_addr.ip().is_unspecified() => {
+        TransportMode::Udp | TransportMode::Auto if !config.host_addr.ip().is_unspecified() => {
             let mut ips = vec![config.host_addr.ip().to_canonical()];
             for ip in &config.extra_host_ips {
                 let ip = ip.to_canonical();
@@ -88,47 +83,6 @@ pub fn udp_config_warning(config: &ClientConfig) -> Option<String> {
     )
 }
 
-/// Starts the UDP input/keepalive sender for `config`, or returns `None` when none should run.
-///
-/// Only `Udp` mode sends: `adb reverse` forwards TCP only, so in `AdbReverseTcp` mode the client
-/// sends no input (and no keepalive) at all. See `crate::input_sender` for the design.
-/// Returns the sender with per-stream keyframe flags, the keyboard queue, and the pointer queue.
-pub fn start_input_sender(
-    config: &ClientConfig,
-) -> Option<(
-    InputSenderThread,
-    KeyframeRequestFlags,
-    crate::input_sender::InputEventQueue,
-    SharedInputEvents,
-)> {
-    let Some(sender_config) = input_sender_config(config) else {
-        match config.transport_mode {
-            TransportMode::AdbReverseTcp => tracing::info!(
-                "UDP input sender not started in USB mode: input goes over the USB TCP tunnel \
-                 instead (adb reverse carries TCP only)"
-            ),
-            TransportMode::Udp => tracing::warn!(
-                host = %config.host_addr,
-                "input sender not started: no usable host address; the host cannot learn this \
-                 headset's address, so it will send no video"
-            ),
-        }
-        return None;
-    };
-    tracing::info!(targets = ?sender_config.targets, "starting UDP input/keepalive sender");
-    let source = CombinedInputSource::new();
-    let keyframe_flag = source.requester();
-    let keyboard_queue = source.keyboard_queue();
-    let pointer_events = source.pointer_events();
-    match InputSenderThread::spawn(sender_config, Box::new(source)) {
-        Ok(sender) => Some((sender, keyframe_flag, keyboard_queue, pointer_events)),
-        Err(e) => {
-            tracing::warn!(error = ?e, "failed to start UDP input sender");
-            None
-        }
-    }
-}
-
 /// Longest gap between repeated drop warnings for one source.
 const DROP_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// Most sources tracked at once, so spoofed sources cannot grow the table without bound.
@@ -162,45 +116,6 @@ impl DropWarnLimiter {
 #[cfg(target_os = "android")]
 const PACKET_CHANNEL_DEPTH: usize = 4096;
 
-/// Requested `SO_RCVBUF` for the UDP video socket (the kernel may cap it at `rmem_max`).
-#[cfg(target_os = "android")]
-const UDP_RECEIVE_BUFFER_BYTES: libc::c_int = 4 * 1024 * 1024;
-
-/// Best-effort `SO_RCVBUF`; logs the size the kernel actually granted.
-#[cfg(target_os = "android")]
-fn set_receive_buffer(socket: &std::net::UdpSocket, bytes: libc::c_int) {
-    use std::os::fd::AsRawFd;
-    let fd = socket.as_raw_fd();
-    // SAFETY: valid socket fd and a c_int option value of the right size.
-    let set = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &bytes as *const libc::c_int as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    let mut granted: libc::c_int = 0;
-    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-    // SAFETY: as above, with out-pointers to locals of the declared size.
-    unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &mut granted as *mut libc::c_int as *mut libc::c_void,
-            &mut len,
-        );
-    }
-    tracing::info!(
-        requested = bytes,
-        granted,
-        ok = set == 0,
-        "UDP video socket receive buffer"
-    );
-}
-
 /// Reads an Android system property, `None` if unset or empty.
 #[cfg(target_os = "android")]
 fn system_property(name: &str) -> Option<String> {
@@ -220,7 +135,7 @@ fn system_property(name: &str) -> Option<String> {
 fn pump_android_keyboard_events(
     app: &AndroidApp,
     queue: &crate::input_sender::InputEventQueue,
-    sender: Option<&crate::input_sender::InputSenderControl>,
+    waker: &crate::transport::InputWaker,
     virtual_keyboard_visible: &mut bool,
     last_virtual_text: &mut String,
 ) {
@@ -302,9 +217,7 @@ fn pump_android_keyboard_events(
         }
     }
     if queued {
-        if let Some(sender) = sender {
-            sender.notify();
-        }
+        waker.wake();
     }
 }
 
@@ -540,15 +453,12 @@ mod keyboard_shortcut_tests {
 }
 
 /// The default config with the `debug.linuxquest.*` overrides applied (see
-/// [`ClientConfig::with_launch_overrides`]), and whether any override was given. Bad values are
-/// logged and ignored.
+/// [`ClientConfig::with_launch_overrides`]). Bad values are logged and ignored.
 #[cfg(target_os = "android")]
-fn launch_config() -> (ClientConfig, bool) {
+fn launch_config() -> ClientConfig {
     use crate::config::{HOST_PROPERTY, TRANSPORT_PROPERTY};
     let host = system_property(HOST_PROPERTY);
     let transport = system_property(TRANSPORT_PROPERTY);
-    let explicit = host.as_deref().is_some_and(|v| !v.trim().is_empty())
-        || transport.as_deref().is_some_and(|v| !v.trim().is_empty());
     match ClientConfig::default().with_launch_overrides(host.as_deref(), transport.as_deref()) {
         Ok(config) => {
             tracing::info!(
@@ -556,92 +466,138 @@ fn launch_config() -> (ClientConfig, bool) {
                 transport = ?config.transport_mode,
                 "client transport configured"
             );
-            (config, explicit)
+            config
         }
         Err(e) => {
             tracing::warn!("ignoring launch override: {e}");
-            (ClientConfig::default(), false)
+            ClientConfig::default()
         }
     }
 }
 
-/// `true` when something accepts connections on the USB/ADB tunnel's loopback port, i.e.
-/// `adb reverse tcp:48444 tcp:48444` is set up. The cable is the lower-latency path, so it
-/// takes priority over LAN discovery.
+/// One LAN discovery round: the host to use, with its addresses and input port, or why none.
+/// Blocks for a few seconds at most.
 #[cfg(target_os = "android")]
-fn usb_tunnel_present(config: &ClientConfig) -> bool {
-    use std::io::{Read, Write};
-    let Ok(mut stream) =
-        std::net::TcpStream::connect_timeout(&config.host_addr, Duration::from_millis(300))
-    else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
-    if stream
-        .write_all(linux_quest_transport::USB_TUNNEL_HELLO)
-        .is_err()
-    {
-        return false;
-    }
-    let mut response = [0u8; linux_quest_transport::USB_TUNNEL_ACCEPT.len()];
-    stream.read_exact(&mut response).is_ok()
-        && response == *linux_quest_transport::USB_TUNNEL_ACCEPT
-}
-
-/// Finds a host over mDNS and points `config` at it. Blocks for at most a few seconds. The
-/// config is returned unchanged when discovery is off, blocked or finds nothing.
-#[cfg(target_os = "android")]
-#[cfg_attr(not(feature = "mdns"), allow(unused_mut))]
-fn autodiscover_config(mut config: ClientConfig) -> ClientConfig {
+fn discover_lan_host() -> Result<ClientConfig, String> {
     #[cfg(not(feature = "mdns"))]
     {
-        tracing::warn!(
-            "built without the `mdns` feature: LAN discovery is off, set debug.linuxquest.host"
-        );
-        config
+        Err("built without the `mdns` feature: set debug.linuxquest.host".into())
     }
     #[cfg(feature = "mdns")]
     {
         use crate::discovery::autoconnect::{
             autoconnect, AutoConnectOutcome, STARTUP_SCAN_ATTEMPTS,
         };
-        let runtime = match tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                tracing::warn!(error = ?e, "no async runtime for LAN discovery");
-                return config;
-            }
-        };
+            .map_err(|e| format!("no async runtime for LAN discovery: {e}"))?;
         let mut discovery =
-            match crate::discovery::mdns_discovery(crate::discovery::AndroidMulticastLock::new()) {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!(error = %e, "mDNS unavailable; set debug.linuxquest.host");
-                    return config;
-                }
-            };
+            crate::discovery::mdns_discovery(crate::discovery::AndroidMulticastLock::new())
+                .map_err(|e| format!("mDNS unavailable: {e}"))?;
+        let mut config = ClientConfig::default();
         match runtime.block_on(autoconnect(
             &mut discovery,
             &mut config,
             STARTUP_SCAN_ATTEMPTS,
         )) {
             AutoConnectOutcome::Connected { host, other_hosts } => {
-                tracing::info!(%host, other_hosts, "LAN discovery selected a host");
+                tracing::info!(%host, addr = %config.host_addr, other_hosts, "LAN discovery found the host");
+                Ok(config)
             }
-            AutoConnectOutcome::NoHosts => tracing::warn!(
-                "no host found on the LAN; is linux-quest-host (built with --features mdns) \
-                 running on the same Wi-Fi? Set debug.linuxquest.host to bypass discovery"
+            AutoConnectOutcome::NoHosts => Err(
+                "no host answered on the LAN; is linux-quest-host (built with --features mdns) \
+                 running on the same Wi-Fi? debug.linuxquest.host bypasses discovery"
+                    .into(),
             ),
             AutoConnectOutcome::Unavailable(reason) => {
-                tracing::warn!(%reason, "LAN discovery unavailable; set debug.linuxquest.host")
+                Err(format!("LAN discovery unavailable: {reason}"))
             }
         }
-        config
     }
+}
+
+/// How long LAN discovery waits between rounds that found nothing.
+#[cfg(target_os = "android")]
+const LAN_DISCOVERY_RETRY: Duration = Duration::from_secs(10);
+
+/// Looks for the host on the LAN in the background until it is found or `running` clears, and
+/// points the Wi-Fi path at it. The USB tunnel does not wait for this: with the cable plugged
+/// in, streaming starts at once, and Wi-Fi is ready by the time the cable comes out.
+#[cfg(target_os = "android")]
+fn spawn_lan_discovery(
+    wifi: crate::transport::WifiHandle,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    let spawned = std::thread::Builder::new()
+        .name("lq-lan-discovery".into())
+        .spawn(move || {
+            let mut failures = 0u32;
+            while running.load(Ordering::Acquire) && !wifi.has_host() {
+                match discover_lan_host() {
+                    Ok(found) => {
+                        wifi.set_host(
+                            found.host_addr.ip(),
+                            &found.extra_host_ips,
+                            found.input_port,
+                        );
+                        return;
+                    }
+                    Err(reason) if cfg!(not(feature = "mdns")) => {
+                        tracing::warn!("{reason}");
+                        return;
+                    }
+                    Err(reason) => {
+                        if failures == 0 {
+                            tracing::warn!(
+                                retry_s = LAN_DISCOVERY_RETRY.as_secs(),
+                                "{reason}; Wi-Fi waits for the host (USB works meanwhile)"
+                            );
+                        } else {
+                            tracing::debug!("{reason}");
+                        }
+                        failures = failures.saturating_add(1);
+                    }
+                }
+                let until = std::time::Instant::now() + LAN_DISCOVERY_RETRY;
+                while running.load(Ordering::Acquire) && std::time::Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = ?e, "could not start LAN discovery");
+    }
+}
+
+/// Starts the transport `config` asks for, and LAN discovery when its Wi-Fi path has no host.
+/// Every packet from the host goes to `packets`.
+#[cfg(target_os = "android")]
+fn start_transport(
+    config: &ClientConfig,
+    packets: std::sync::mpsc::SyncSender<linux_quest_protocol::packet::Packet>,
+    source: crate::input_sender::CombinedInputSource,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Option<crate::transport::ClientTransport> {
+    use crate::transport::{ClientTransport, TransportConfig};
+    let transport = match ClientTransport::spawn_with_source(
+        TransportConfig::for_client(config),
+        source,
+        packets,
+    ) {
+        Ok(transport) => transport,
+        Err(e) => {
+            tracing::warn!(error = ?e, "could not start the transport to the host");
+            return None;
+        }
+    };
+    if crate::discovery::autoconnect::needs_lan_discovery(config) {
+        if let Some(wifi) = transport.wifi() {
+            spawn_lan_discovery(wifi, running);
+        }
+    }
+    Some(transport)
 }
 
 /// Native entry point for Android NativeActivity on Meta Quest.
@@ -664,13 +620,9 @@ pub fn android_main(app: AndroidApp) {
     // `android_main`, for OpenXR, MediaCodec and JNI users. Initialising it again here
     // trips the "exactly once" assertion in ndk-context and aborts the app at startup.
 
-    let (mut config, explicit_override) = launch_config();
-    if crate::discovery::autoconnect::should_autodiscover(
-        explicit_override,
-        usb_tunnel_present(&config),
-    ) {
-        config = autodiscover_config(config);
-    }
+    // In Auto mode (the default) the USB tunnel and Wi-Fi run side by side; LAN discovery runs
+    // in the background, so nothing here waits for it.
+    let mut config = launch_config();
 
     // Settings and screen layout persist in the app's internal files directory. Without this
     // every change was lost on restart (issue #114).
@@ -700,95 +652,35 @@ pub fn android_main(app: AndroidApp) {
     let device_name = system_property("ro.product.model").unwrap_or_else(|| "Meta Quest".into());
     let mut next_host_status = std::time::Instant::now();
 
-    // Background transport packet receiver (bounded channel: 512 packets, drops on overflow)
+    // Packets from the host, over USB or Wi-Fi (bounded channel, drops on overflow).
     let (packet_tx, packet_rx) =
         std::sync::mpsc::sync_channel::<linux_quest_protocol::packet::Packet>(PACKET_CHANNEL_DEPTH);
     let running_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let host_addr = config.host_addr;
-    let transport_mode = config.transport_mode;
 
-    // Input/keepalive sender (Udp mode only). The receiver below acks it for each accepted
-    // host datagram so it stays on the host address that works.
-    let (input_sender, keyframe_flag, input_queue, pointer_events) =
-        match start_input_sender(&config) {
-            Some((sender, flag, queue, events)) => {
-                (Some(sender), Some(flag), Some(queue), Some(events))
-            }
-            None => (None, None, None, None),
-        };
-    let tcp_input_source = if transport_mode == TransportMode::AdbReverseTcp {
-        let source = CombinedInputSource::new();
-        let flag = source.requester();
-        let queue = source.keyboard_queue();
-        let events = source.pointer_events();
-        Some((
-            std::sync::Arc::new(std::sync::Mutex::new(source)),
-            flag,
-            queue,
-            events,
-        ))
-    } else {
-        None
-    };
-    let (keyframe_flag, input_queue, pointer_events) = tcp_input_source
-        .as_ref()
-        .map(|(_, flag, queue, events)| {
-            (
-                Some(flag.clone()),
-                Some(queue.clone()),
-                Some(events.clone()),
-            )
-        })
-        .unwrap_or((keyframe_flag, input_queue, pointer_events));
-    let ack_control: Option<crate::input_sender::InputSenderControl> =
-        input_sender.as_ref().map(|s| s.control().clone());
-    let receiver_ack_control = ack_control.clone();
+    // USB tunnel, Wi-Fi, or both (see `crate::transport`). Input goes over whichever path is
+    // live; each path reopens itself when it dies.
+    let transport = start_transport(
+        &config,
+        packet_tx,
+        crate::input_sender::CombinedInputSource::new(),
+        running_flag.clone(),
+    );
+    let input_queue = transport.as_ref().map(|t| t.keyboard_queue());
+    let pointer_events = transport.as_ref().map(|t| t.pointer_events());
+    let waker = transport.as_ref().map(|t| t.waker()).unwrap_or_default();
+    let keyframe_flag = transport.as_ref().map(|t| t.keyframe_flags());
+    let tunnel_reconnect = transport.as_ref().and_then(|t| t.tunnel_reconnect());
     // Raises the keyframe request on the input channel and sends it right away.
-    let requester_control = ack_control.clone();
+    let requester_waker = waker.clone();
     let keyframe_requester = move || -> Option<Box<dyn Fn(u16) + Send>> {
         let flags = keyframe_flag.clone()?;
-        let control = requester_control.clone();
+        let waker = requester_waker.clone();
         Some(Box::new(move |stream_id| {
             tracing::info!(stream_id, "video lost; requesting a keyframe from the host");
             flags.raise(stream_id);
-            if let Some(control) = &control {
-                control.notify();
-            }
+            waker.wake();
         }))
     };
-
-    // USB mode: video and input share one tunnel connection, which the tunnel thread reopens
-    // when it dies (see `crate::usb_tunnel`).
-    let usb_tunnel = tcp_input_source.as_ref().and_then(|(source, flag, _, _)| {
-        let input = crate::usb_tunnel::TunnelInput {
-            source: source.clone(),
-            keyframes: flag.clone(),
-        };
-        let tunnel_tx = packet_tx.clone();
-        match crate::usb_tunnel::UsbTunnel::spawn(
-            crate::usb_tunnel::UsbTunnelConfig::new(host_addr),
-            Some(input),
-            move |packet| {
-                let _ = tunnel_tx.try_send(packet);
-            },
-        ) {
-            Ok(tunnel) => Some(tunnel),
-            Err(e) => {
-                tracing::warn!(error = ?e, "could not start the USB tunnel thread");
-                None
-            }
-        }
-    });
-    let tunnel_reconnect = usb_tunnel.as_ref().map(|tunnel| tunnel.reconnect_handle());
-
-    let receiver_handle = (transport_mode == TransportMode::Udp).then(|| {
-        transport::spawn_udp_receiver(
-            &config,
-            running_flag.clone(),
-            receiver_ack_control,
-            packet_tx,
-        )
-    });
 
     // The XR session is created only once the activity has a window and is resumed (Horizon OS
     // rejects xrCreateSession / xrCreateSwapchainAndroidSurfaceKHR with "Activity is not yet in
@@ -842,13 +734,13 @@ pub fn android_main(app: AndroidApp) {
             }
         }
 
-        // Drain Bluetooth/USB keyboard input on the NativeActivity thread and forward it through
-        // the same low-latency UDP input channel used by the host injector.
+        // Drain Bluetooth/USB keyboard input on the NativeActivity thread and forward it over
+        // the live transport, like the controllers' input.
         if let Some(queue) = &input_queue {
             pump_android_keyboard_events(
                 &app,
                 queue,
-                ack_control.as_ref(),
+                &waker,
                 &mut virtual_keyboard_visible,
                 &mut last_virtual_text,
             );
@@ -887,13 +779,12 @@ pub fn android_main(app: AndroidApp) {
                             if let Some(request) = keyframe_requester() {
                                 rt.set_keyframe_requester(request);
                             }
-                            if let (Some(events), Some(control)) =
-                                (pointer_events.clone(), ack_control.clone())
-                            {
+                            if let Some(events) = pointer_events.clone() {
                                 let latency_events = events.clone();
+                                let waker = waker.clone();
                                 rt.set_pointer_event_sink(Box::new(move |event| {
                                     events.push(event);
-                                    control.notify();
+                                    waker.wake();
                                 }));
                                 rt.set_pointer_queue_latency_source(Box::new(move || {
                                     latency_events.last_queue_latency_us()
@@ -972,18 +863,12 @@ pub fn android_main(app: AndroidApp) {
     tracing::info!("{LOG_TAG}: leaving main loop");
     drop(runtime);
 
-    running_flag.store(false, std::sync::atomic::Ordering::Relaxed);
-    if let Some(handle) = receiver_handle {
-        let _ = handle.join();
-    }
-    if let Some(tunnel) = usb_tunnel {
-        tunnel.stop();
+    running_flag.store(false, std::sync::atomic::Ordering::Release);
+    if let Some(transport) = transport {
+        transport.stop();
     }
     if let Some(link) = host_link {
         link.stop();
-    }
-    if let Some(sender) = input_sender {
-        sender.stop();
     }
 
     tracing::info!("linux-quest client runtime exited cleanly");

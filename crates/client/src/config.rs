@@ -17,7 +17,30 @@ pub enum TransportMode {
     Udp,
     /// USB ADB reverse-tethering TCP tunnel (`adb reverse tcp:48444 tcp:48444`, the host control port).
     AdbReverseTcp,
+    /// Both at once: the USB tunnel on [`USB_TUNNEL_ADDR`] whenever the cable is plugged in, and
+    /// Wi-Fi to `ClientConfig::host_addr` (found by discovery when it is not set). Video and
+    /// input use the cable while it works and Wi-Fi otherwise, switching both ways without a
+    /// restart. See `crate::transport`.
+    Auto,
 }
+
+impl TransportMode {
+    /// Whether this mode runs the USB tunnel.
+    pub fn uses_usb(self) -> bool {
+        matches!(self, Self::AdbReverseTcp | Self::Auto)
+    }
+
+    /// Whether this mode runs the Wi-Fi (UDP) path.
+    pub fn uses_wifi(self) -> bool {
+        matches!(self, Self::Udp | Self::Auto)
+    }
+}
+
+/// The headset end of the USB tunnel in [`TransportMode::Auto`]: `adb reverse tcp:48444`.
+pub const USB_TUNNEL_ADDR: SocketAddr = SocketAddr::new(
+    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+    DEFAULT_CONTROL_PORT,
+);
 
 /// Preferred video compression codec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +92,9 @@ pub struct ClientConfig {
     /// - `Udp`: the host's address on the LAN. Its IP (plus `extra_host_ips`) is the only
     ///   source video datagrams are accepted from. An unspecified IP (`0.0.0.0`) means no
     ///   source filter.
+    /// - `Auto`: the host's address on the LAN for the Wi-Fi path, as in `Udp`. A loopback or
+    ///   unspecified address means "not known yet": the tunnel always uses [`USB_TUNNEL_ADDR`],
+    ///   and the Wi-Fi path waits for discovery.
     ///
     /// **The default is `127.0.0.1`, so in `Udp` mode a client that has not been pointed at a
     /// host drops every LAN video datagram** (the client logs a warning at startup). Set it by
@@ -153,7 +179,7 @@ impl Default for ClientConfig {
             ),
             extra_host_ips: Vec::new(),
             input_port: DEFAULT_INPUT_PORT,
-            transport_mode: TransportMode::AdbReverseTcp,
+            transport_mode: TransportMode::Auto,
             codec: ClientVideoCodec::Av1,
             display_mode: DisplayMode::CurvedCylinder,
             target_refresh_rate: 90.0,
@@ -180,15 +206,17 @@ impl Default for ClientConfig {
 
 /// Android system property naming the host: an IP (`192.168.1.20`) or `ip:port`.
 pub const HOST_PROPERTY: &str = "debug.linuxquest.host";
-/// Android system property choosing the transport: `udp` (Wi-Fi) or `usb` (ADB reverse TCP).
+/// Android system property choosing the transport: `auto` (the default: USB when the cable is
+/// plugged in, Wi-Fi otherwise), `udp` (Wi-Fi only) or `usb` (ADB reverse TCP only).
 pub const TRANSPORT_PROPERTY: &str = "debug.linuxquest.transport";
 
 impl ClientConfig {
     /// Applies the launch-time overrides read from [`HOST_PROPERTY`] and [`TRANSPORT_PROPERTY`]
     /// (`adb shell setprop debug.linuxquest.host 192.168.1.20`). Empty values are ignored.
     ///
-    /// A host without a transport selects `Udp`, since the USB path always dials loopback.
-    /// A host given as a bare IP keeps the default control port.
+    /// A host without a transport keeps `Auto`: the host is where the Wi-Fi path goes, and the
+    /// USB tunnel still takes over whenever the cable is plugged in. A host given as a bare IP
+    /// keeps the default control port.
     pub fn with_launch_overrides(
         mut self,
         host: Option<&str>,
@@ -204,18 +232,16 @@ impl ClientConfig {
                     .map(|ip| SocketAddr::new(ip, self.host_addr.port()))
                     .map_err(|_| format!("{HOST_PROPERTY}={host:?} is not an IP or ip:port"))?,
             };
-            if transport.is_none() {
-                self.transport_mode = TransportMode::Udp;
-            }
         }
         if let Some(transport) = transport {
             self.transport_mode = match transport.to_ascii_lowercase().as_str() {
+                "auto" => TransportMode::Auto,
                 "udp" | "wifi" => TransportMode::Udp,
                 "usb" | "adb" | "tcp" => TransportMode::AdbReverseTcp,
                 other => {
                     return Err(format!(
-                        "{TRANSPORT_PROPERTY}={other:?} is not one of udp, wifi, usb, adb, tcp"
-                    ))
+                    "{TRANSPORT_PROPERTY}={other:?} is not one of auto, udp, wifi, usb, adb, tcp"
+                ))
                 }
             };
         }
@@ -336,16 +362,16 @@ mod tests {
         let cfg = ClientConfig::default()
             .with_launch_overrides(None, Some(""))
             .unwrap();
-        assert_eq!(cfg.transport_mode, TransportMode::AdbReverseTcp);
+        assert_eq!(cfg.transport_mode, TransportMode::Auto);
         assert_eq!(cfg.host_addr, ClientConfig::default().host_addr);
     }
 
     #[test]
-    fn launch_override_bare_ip_selects_udp_and_keeps_port() {
+    fn launch_override_bare_ip_keeps_auto_and_the_port() {
         let cfg = ClientConfig::default()
             .with_launch_overrides(Some(" 192.168.211.20 "), None)
             .unwrap();
-        assert_eq!(cfg.transport_mode, TransportMode::Udp);
+        assert_eq!(cfg.transport_mode, TransportMode::Auto);
         assert_eq!(
             cfg.host_addr,
             SocketAddr::new(
@@ -362,6 +388,29 @@ mod tests {
             .unwrap();
         assert_eq!(cfg.transport_mode, TransportMode::AdbReverseTcp);
         assert_eq!(cfg.host_addr.port(), 50000);
+    }
+
+    #[test]
+    fn launch_override_transport_names() {
+        for (name, mode) in [
+            ("auto", TransportMode::Auto),
+            ("AUTO", TransportMode::Auto),
+            ("udp", TransportMode::Udp),
+            ("wifi", TransportMode::Udp),
+            ("usb", TransportMode::AdbReverseTcp),
+            ("adb", TransportMode::AdbReverseTcp),
+            ("tcp", TransportMode::AdbReverseTcp),
+        ] {
+            let cfg = ClientConfig::default()
+                .with_launch_overrides(None, Some(name))
+                .unwrap();
+            assert_eq!(cfg.transport_mode, mode, "{name}");
+        }
+        assert!(TransportMode::Auto.uses_usb() && TransportMode::Auto.uses_wifi());
+        assert!(!TransportMode::Udp.uses_usb() && TransportMode::Udp.uses_wifi());
+        assert!(
+            TransportMode::AdbReverseTcp.uses_usb() && !TransportMode::AdbReverseTcp.uses_wifi()
+        );
     }
 
     #[test]

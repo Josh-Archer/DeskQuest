@@ -168,7 +168,11 @@ impl SettingsPanel {
             }
             PanelRow::Transport => {
                 s.transport = step(
-                    &[TransportMode::Udp, TransportMode::AdbReverseTcp],
+                    &[
+                        TransportMode::Auto,
+                        TransportMode::Udp,
+                        TransportMode::AdbReverseTcp,
+                    ],
                     s.transport,
                     dir,
                 )
@@ -291,6 +295,7 @@ impl SettingsPanel {
                 .host
                 .map_or_else(|| "(auto)".to_string(), |h| h.to_string()),
             PanelRow::Transport => match s.transport {
+                TransportMode::Auto => "Auto (USB, else Wi-Fi)",
                 TransportMode::Udp => "Wi-Fi (UDP)",
                 TransportMode::AdbReverseTcp => "USB (ADB)",
             }
