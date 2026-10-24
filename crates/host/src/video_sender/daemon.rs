@@ -42,12 +42,17 @@ fn capture_kind(backend: CaptureBackendType) -> CaptureKind {
 }
 
 impl<C: DisplayCapture> CaptureFrameSource<C> {
-    /// Initializes `capture`. Unless `allow_synthetic`, a capture that fell back to the
-    /// synthetic test pattern is rejected: streaming a fake screen to a headset is never what
-    /// the user asked for.
+    /// Initializes `capture`. Unless `allow_synthetic`, a capture that has only the synthetic
+    /// test pattern is rejected: streaming a fake screen to a headset is never what the user
+    /// asked for. The test pattern standing in for a real screen capture that is still
+    /// starting, or waits to be restored or chosen, is accepted
+    /// ([`DisplayCapture::is_standing_in`]): the screen replaces it once it is there.
     pub async fn open(mut capture: C, allow_synthetic: bool) -> Result<Self, CaptureError> {
         capture.init().await?;
-        if !allow_synthetic && capture.backend_type() == CaptureBackendType::Synthetic {
+        if !allow_synthetic
+            && capture.backend_type() == CaptureBackendType::Synthetic
+            && !capture.is_standing_in()
+        {
             let hint = if cfg!(feature = "pipewire-capture") {
                 "PipeWire screencast capture was not usable (is the PipeWire socket in \
                  $XDG_RUNTIME_DIR and libpipewire-0.3 loadable?)"
@@ -122,6 +127,34 @@ impl<C: DisplayCapture> CaptureFrameSource<C> {
     pub fn capture_info(&self) -> Option<CaptureInfo> {
         self.capture.capture_info()
     }
+
+    /// True when the user can pick what is captured: a real screen is shown, or the test
+    /// pattern stands in for one.
+    fn has_screen_picker(&self) -> bool {
+        capture_kind(self.capture.backend_type()) == CaptureKind::Screen
+            || self.capture.is_standing_in()
+    }
+}
+
+/// Opens stream 0's `capture` (see [`CaptureFrameSource::open`]) and connects it to `control`:
+/// it reports what it shows, and serves Choose Screen when it has a real screen, also while
+/// the test pattern stands in for one (the screen is locked, or the portal has not answered).
+async fn open_primary_source<C: DisplayCapture>(
+    capture: C,
+    allow_synthetic: bool,
+    control: &Arc<VideoControl>,
+) -> Result<CaptureFrameSource<C>, CaptureError> {
+    let mut source = CaptureFrameSource::open(capture, allow_synthetic).await?;
+    if source.has_screen_picker() {
+        source = source.with_reselect(control.register_reselect());
+    }
+    if source.capture.is_standing_in() {
+        tracing::info!(
+            "video starts on the test pattern; the screen replaces it once the capture starts"
+        );
+    }
+    control.set_running(1, capture_kind(source.capture.backend_type()));
+    Ok(source.reporting_to(control.clone()))
 }
 
 /// Encoder size and rate for `info`: the capture's own resolution (so the whole screen is
@@ -430,19 +463,12 @@ async fn start_daemon_video_stream(
     control: Arc<VideoControl>,
 ) -> Result<VideoSenderHandle, String> {
     let defaults = EncoderConfig::default();
+    // Opening waits a few seconds at most: a capture the portal is slow to grant (the screen
+    // is locked, or its share dialog waits for an answer) starts on the test pattern.
     let capture = AutoCapture::new(display_id, defaults.width, defaults.height, defaults.fps);
-
-    let mut source = CaptureFrameSource::open(capture, options.test_pattern)
+    let source = open_primary_source(capture, options.test_pattern, &control)
         .await
         .map_err(|e| format!("capture: {e}"))?;
-    let kind = capture_kind(source.capture.backend_type());
-    if kind == CaptureKind::Screen {
-        // A real screen: the user can pick another one from the desktop app or the tray,
-        // also while the test pattern stands in for it after the screen was lost (locked).
-        source = source.with_reselect(control.register_reselect());
-    }
-    control.set_running(1, kind);
-    let source = source.reporting_to(control.clone());
     let geometry = encode_geometry(source.capture_info().as_ref(), &defaults);
     // A coordinator's share (focus-weighted) replaces the even split.
     let bitrate_kbps = rate
@@ -705,6 +731,8 @@ mod tests {
     /// Frames of [`GnomeScreen`]; the test pattern standing in for it is `PATTERN`.
     const SCREEN: (u32, u32) = (64, 32);
     const PATTERN: (u32, u32) = (16, 16);
+    /// How long the portal waits for its share dialog before the request fails.
+    const PORTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
     /// The desktop's lock screen, shared by [`GnomeScreen`] and (when the daemon can tell)
     /// the capture's lock probe.
@@ -729,13 +757,15 @@ mod tests {
 
     #[derive(Default)]
     struct Calls {
+        inits: std::sync::atomic::AtomicU32,
         restores: std::sync::atomic::AtomicU32,
         reselects: std::sync::atomic::AtomicU32,
     }
 
     /// A portal screen capture as GNOME runs it: locking the screen closes the session, and
-    /// a restore while locked gets no answer until the portal flow times out (the portal
-    /// queues its share dialog behind the lock screen). Unlocked, the restore token works.
+    /// a start or restore while locked gets no answer until the portal flow times out (the
+    /// portal queues its share dialog behind the lock screen). Unlocked, the restore token
+    /// works.
     struct GnomeScreen {
         lock: Arc<LockScreen>,
         calls: Arc<Calls>,
@@ -760,6 +790,13 @@ mod tests {
     #[async_trait]
     impl DisplayCapture for GnomeScreen {
         async fn init(&mut self) -> Result<(), CaptureError> {
+            self.calls
+                .inits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.lock.locked() {
+                tokio::time::sleep(PORTAL_TIMEOUT).await;
+                return Err(ScreenCastError::NegotiationTimeout(PORTAL_TIMEOUT).into());
+            }
             self.running = true;
             Ok(())
         }
@@ -785,9 +822,8 @@ mod tests {
                 return Err(ScreenCastError::NoRestoreToken.into());
             }
             if self.lock.locked() {
-                let timeout = std::time::Duration::from_secs(300);
-                tokio::time::sleep(timeout).await;
-                return Err(ScreenCastError::NegotiationTimeout(timeout).into());
+                tokio::time::sleep(PORTAL_TIMEOUT).await;
+                return Err(ScreenCastError::NegotiationTimeout(PORTAL_TIMEOUT).into());
             }
             self.running = true;
             Ok(())
@@ -817,13 +853,9 @@ mod tests {
     ) -> CaptureFrameSource<AutoCapture> {
         let capture =
             AutoCapture::with_capture(0, PATTERN.0, PATTERN.1, 10, Some(Box::new(screen)), lock);
-        let source = CaptureFrameSource::open(capture, false)
+        open_primary_source(capture, false, control)
             .await
-            .expect("the screen starts")
-            .with_reselect(control.register_reselect())
-            .reporting_to(control.clone());
-        control.set_running(1, CaptureKind::Screen);
-        source
+            .expect("video starts")
     }
 
     /// Pulls frames until one of the screen arrives, checking that the others are the pattern.
@@ -924,6 +956,120 @@ mod tests {
         assert_eq!(calls.restores.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(control.capture_kind(), CaptureKind::TestPattern);
 
+        let stream = tokio::spawn(async move {
+            until_screen(&mut source).await;
+            source
+        });
+        control
+            .choose_screen(std::time::Duration::from_secs(5))
+            .await
+            .expect("the picked screen is shared");
+        let mut source = stream.await.unwrap();
+        assert_eq!(calls.reselects.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(control.capture_kind(), CaptureKind::Screen);
+        assert_eq!(frame_size(&source.next_frame().await.unwrap()), SCREEN);
+    }
+
+    #[tokio::test]
+    async fn only_the_test_pattern_is_refused_as_the_daemon_s_screen() {
+        let control = VideoControl::new();
+        let capture = AutoCapture::with_capture(
+            0,
+            PATTERN.0,
+            PATTERN.1,
+            10,
+            None,
+            Arc::new(linux_quest_capture::UnknownScreenLock),
+        );
+        let err = open_primary_source(capture, false, &control)
+            .await
+            .err()
+            .expect("no real capture behind the pattern");
+        assert!(matches!(err, CaptureError::BackendUnavailable(_)));
+        assert!(!control.can_choose_screen());
+    }
+
+    /// The daemon's start on 2026-10-24 (the screen was locked, and the daemon could not tell):
+    /// the portal did not answer the restore token, and after its 300 s timeout the daemon
+    /// sent no video at all until it was restarted by hand.
+    #[tokio::test(start_paused = true)]
+    async fn video_starts_on_the_test_pattern_when_the_portal_does_not_answer_at_start_up() {
+        let lock = Arc::new(LockScreen::default());
+        lock.set(true);
+        let (screen, calls) = GnomeScreen::new(lock.clone(), true);
+        let control = VideoControl::new();
+        let started = tokio::time::Instant::now();
+        let mut source = daemon_source(
+            screen,
+            Arc::new(linux_quest_capture::UnknownScreenLock),
+            &control,
+        )
+        .await;
+        assert!(
+            started.elapsed() <= std::time::Duration::from_secs(5),
+            "start-up does not wait for the portal: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(control.capture_kind(), CaptureKind::TestPattern);
+        assert!(control.can_choose_screen(), "the picker is available");
+        assert_eq!(frame_size(&source.next_frame().await.unwrap()), PATTERN);
+
+        // Locked for 20 minutes: the pattern keeps playing, the restore keeps being retried.
+        pattern_for(&mut source, std::time::Duration::from_secs(20 * 60)).await;
+        assert_eq!(calls.inits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let tried = calls.restores.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(tried >= 2, "retried with the restore token: {tried}");
+
+        lock.set(false);
+        let unlocked = tokio::time::Instant::now();
+        until_screen(&mut source).await;
+        // At worst an attempt started just before the unlock times out first, and the next
+        // one waits the longest backoff.
+        assert!(unlocked.elapsed() <= std::time::Duration::from_secs(331));
+        assert_eq!(control.capture_kind(), CaptureKind::Screen);
+        assert_eq!(frame_size(&source.next_frame().await.unwrap()), SCREEN);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_screen_locked_at_start_up_is_captured_right_after_the_unlock() {
+        let lock = Arc::new(LockScreen::default());
+        lock.set(true);
+        let (screen, calls) = GnomeScreen::new(lock.clone(), true);
+        let control = VideoControl::new();
+        let mut source = daemon_source(screen, lock.clone(), &control).await;
+        assert_eq!(control.capture_kind(), CaptureKind::TestPattern);
+        pattern_for(&mut source, std::time::Duration::from_secs(20 * 60)).await;
+        assert_eq!(
+            calls.inits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no portal request while locked"
+        );
+
+        lock.set(false);
+        let unlocked = tokio::time::Instant::now();
+        until_screen(&mut source).await;
+        assert!(unlocked.elapsed() <= std::time::Duration::from_secs(5));
+        assert_eq!(calls.inits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(calls.restores.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(control.capture_kind(), CaptureKind::Screen);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn choose_screen_works_while_the_first_capture_is_still_starting() {
+        let lock = Arc::new(LockScreen::default());
+        lock.set(true);
+        let (screen, calls) = GnomeScreen::new(lock.clone(), true);
+        let control = VideoControl::new();
+        let mut source = daemon_source(
+            screen,
+            Arc::new(linux_quest_capture::UnknownScreenLock),
+            &control,
+        )
+        .await;
+        pattern_for(&mut source, std::time::Duration::from_secs(30)).await;
+        lock.set(false);
+
+        // The start sent at start-up still waits for the portal; the pick replaces it.
         let stream = tokio::spawn(async move {
             until_screen(&mut source).await;
             source
