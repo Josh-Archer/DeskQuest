@@ -62,6 +62,14 @@ impl MutterDisplayBackend {
     }
 }
 
+// GDBus reports an expired object as UnknownMethod, while other implementations
+// use UnknownObject. Do not hide permission errors or genuinely missing methods.
+fn session_object_gone(name: &str, detail: Option<&str>) -> bool {
+    name == "org.freedesktop.DBus.Error.UnknownObject"
+        || (name == "org.freedesktop.DBus.Error.UnknownMethod"
+            && detail.is_some_and(|d| d.contains("Object does not exist at path")))
+}
+
 impl Default for MutterDisplayBackend {
     fn default() -> Self {
         Self::new()
@@ -264,7 +272,16 @@ impl VirtualDisplayBackend for MutterDisplayBackend {
         let session_path: zbus::zvariant::OwnedObjectPath = screencast_proxy
             .call("CreateSession", &(empty_props,))
             .await
-            .map_err(|e| DisplayError::Dbus(format!("ScreenCast.CreateSession failed: {e}")))?;
+            .map_err(|e| {
+                if e.to_string().contains("Session creation inhibited") {
+                    DisplayError::Dbus(
+                        "GNOME is blocking virtual monitor creation. Unlock your Linux desktop and try again."
+                            .into(),
+                    )
+                } else {
+                    DisplayError::Dbus(format!("ScreenCast.CreateSession failed: {e}"))
+                }
+            })?;
 
         let session_path_str = session_path.as_str().to_string();
 
@@ -415,13 +432,18 @@ impl VirtualDisplayBackend for MutterDisplayBackend {
             .await
             .map_err(|e| DisplayError::Dbus(format!("Failed to bind Session proxy: {e}")))?;
 
-            let _: () = session_proxy
-                .call("Stop", &())
-                .await
-                .map_err(|e| DisplayError::Dbus(format!("ScreenCast.Session.Stop failed: {e}")))?;
+            if let Err(e) = session_proxy.call::<_, _, ()>("Stop", &()).await {
+                let gone = matches!(&e, zbus::Error::MethodError(name, detail, _)
+                    if session_object_gone(name.as_str(), detail.as_deref()));
+                if !gone {
+                    return Err(DisplayError::Dbus(format!(
+                        "ScreenCast.Session.Stop failed: {e}"
+                    )));
+                }
+            }
         }
 
-        // Only remove state after Stop succeeds
+        // Remove state after Stop succeeds or the compositor has already destroyed the session
         self.session_paths.remove(&id);
         if let Some(m) = self.monitors.remove(&id) {
             if let Some(path) = m.edid_path {
@@ -633,6 +655,38 @@ impl VirtualDisplayBackend for MutterDisplayBackend {
         Ok(())
     }
 
+    async fn refresh_monitors(&mut self) -> Result<(), DisplayError> {
+        if self.monitors.is_empty() {
+            return Ok(());
+        }
+        let conn = self.connection.as_ref().ok_or_else(|| {
+            DisplayError::BackendUnavailable("Mutter connection is not initialized".into())
+        })?;
+        let proxy = zbus::Proxy::new(
+            conn,
+            "org.gnome.Mutter.DisplayConfig",
+            "/org/gnome/Mutter/DisplayConfig",
+            "org.gnome.Mutter.DisplayConfig",
+        )
+        .await
+        .map_err(|e| DisplayError::Dbus(e.to_string()))?;
+        let state: MutterCurrentState = proxy
+            .call("GetCurrentState", &())
+            .await
+            .map_err(|e| DisplayError::Dbus(format!("GetCurrentState failed: {e}")))?;
+        let missing: Vec<_> = self
+            .monitors
+            .values()
+            .filter(|m| !state.1.iter().any(|(spec, _, _)| spec.0 == m.connector))
+            .map(|m| m.id)
+            .collect();
+        drop(proxy);
+        for id in missing {
+            self.destroy_monitor(id).await?;
+        }
+        Ok(())
+    }
+
     fn list_monitors(&self) -> Vec<VirtualMonitor> {
         let mut list: Vec<_> = self.monitors.values().cloned().collect();
         list.sort_by_key(|m| m.id);
@@ -643,6 +697,26 @@ impl VirtualDisplayBackend for MutterDisplayBackend {
 #[cfg(test)]
 mod placement_tests {
     use super::*;
+
+    #[test]
+    fn expired_sessions_can_be_removed_without_hiding_other_stop_errors() {
+        assert!(session_object_gone(
+            "org.freedesktop.DBus.Error.UnknownObject",
+            None
+        ));
+        assert!(session_object_gone(
+            "org.freedesktop.DBus.Error.UnknownMethod",
+            Some("Object does not exist at path /org/gnome/Mutter/ScreenCast/Session/u23")
+        ));
+        assert!(!session_object_gone(
+            "org.freedesktop.DBus.Error.UnknownMethod",
+            Some("No such method Stop")
+        ));
+        assert!(!session_object_gone(
+            "org.freedesktop.DBus.Error.AccessDenied",
+            None
+        ));
+    }
 
     fn rect(x: i32, y: i32, width: i32, height: i32) -> LogicalRect {
         LogicalRect {

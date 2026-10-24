@@ -51,6 +51,11 @@ pub trait VirtualDisplayBackend: Send + Sync {
     /// Applies layout positioning across active monitors.
     async fn apply_layout(&mut self, layout: &DisplayLayout) -> Result<(), DisplayError>;
 
+    /// Reconciles tracked outputs with compositor-owned sessions that may have ended.
+    async fn refresh_monitors(&mut self) -> Result<(), DisplayError> {
+        Ok(())
+    }
+
     /// Lists all currently tracked virtual monitors.
     fn list_monitors(&self) -> Vec<VirtualMonitor>;
 }

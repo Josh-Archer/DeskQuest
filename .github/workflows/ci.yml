@@ -106,8 +106,8 @@ jobs:
 
       - name: Check desktop refresh lifecycle without hardware
         run: |
-          cargo build --locked -p linux-quest-desktop
-          python3 scripts/ci/check-desktop-refresh.py target/debug/linux-quest
+          cargo build --locked -p deskquest-desktop
+          python3 scripts/ci/check-desktop-refresh.py target/debug/deskquest
 
       - name: Lint and test host tray feature
         run: |

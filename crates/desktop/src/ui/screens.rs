@@ -486,7 +486,7 @@ impl ScreensPage {
             st.backend = snapshot
                 .and_then(|s| s.status.as_ref())
                 .map(|s| s.display_backend.clone())
-                .unwrap_or_default();
+                .unwrap_or_else(|| "the host display backend".to_string());
         }
         let connected = self.state.borrow().connected;
         self.stack
@@ -1062,7 +1062,7 @@ impl ScreensPage {
         let dialog = adw::AlertDialog::new(
             Some("Add a Virtual Monitor?"),
             Some(&format!(
-                "The host creates a {w} × {h} monitor at {rate} Hz through {backend}. Your \
+                "DeskQuest creates a {w} × {h} monitor at {rate} Hz through {backend}. Your \
                  desktop gets a new monitor, and the headset can show it."
             )),
         );

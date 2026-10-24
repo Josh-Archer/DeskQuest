@@ -51,6 +51,8 @@ pub enum DaemonError {
     /// The socket did not answer: the daemon is not running.
     NotRunning,
     TimedOut,
+    /// The daemon answered using an incompatible IPC schema.
+    Incompatible,
     /// The daemon answered with an error.
     Refused(String),
     /// The daemon answered with something else (it is probably another version).
@@ -63,7 +65,8 @@ impl std::fmt::Display for DaemonError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotRunning => write!(f, "the DeskQuest daemon is not running"),
-            Self::TimedOut => write!(f, "the daemon did not answer in time"),
+            Self::TimedOut => write!(f, "the DeskQuest daemon did not answer in time"),
+            Self::Incompatible => write!(f, "the DeskQuest app and daemon use incompatible versions; update both and restart the host service"),
             Self::Refused(why) => write!(f, "{why}"),
             Self::Unexpected => write!(
                 f,
@@ -78,22 +81,29 @@ impl std::fmt::Display for DaemonError {
 pub async fn request(req: DaemonRequest, timeout: Duration) -> Result<DaemonResponse, DaemonError> {
     match tokio::time::timeout(timeout, send_daemon_request(req)).await {
         Err(_) => Err(DaemonError::TimedOut),
-        Ok(Err(e)) => {
-            let not_running = e.downcast_ref::<std::io::Error>().is_some_and(|io| {
-                matches!(
-                    io.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                )
-            });
-            if not_running {
-                Err(DaemonError::NotRunning)
-            } else {
-                tracing::debug!(error = %e, "daemon request failed");
-                Err(DaemonError::Broken(e.to_string()))
-            }
-        }
+        Ok(Err(e)) => Err(request_error(e)),
         Ok(Ok(DaemonResponse::Error(why))) => Err(DaemonError::Refused(why)),
         Ok(Ok(resp)) => Ok(resp),
+    }
+}
+
+fn request_error(e: Box<dyn std::error::Error + Send + Sync>) -> DaemonError {
+    if e.downcast_ref::<bincode::ErrorKind>().is_some()
+        || e.downcast_ref::<bincode::Error>().is_some()
+    {
+        return DaemonError::Incompatible;
+    }
+    let not_running = e.downcast_ref::<std::io::Error>().is_some_and(|io| {
+        matches!(
+            io.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        )
+    });
+    if not_running {
+        DaemonError::NotRunning
+    } else {
+        tracing::debug!(error = %e, "daemon request failed");
+        DaemonError::Broken(e.to_string())
     }
 }
 
@@ -243,4 +253,28 @@ pub async fn set_monitor_count(
 
 pub async fn remove_monitor(id: u32) -> Result<String, DaemonError> {
     success(request(DaemonRequest::Remove { id }, REQUEST_TIMEOUT).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incompatible_response_is_not_reported_as_a_stopped_daemon() {
+        // A response from a daemon with a different enum/schema cannot be decoded.
+        fn decode_like_ipc() -> Result<DaemonResponse, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(bincode::deserialize(&99u32.to_le_bytes())?)
+        }
+        assert_eq!(
+            request_error(decode_like_ipc().unwrap_err()),
+            DaemonError::Incompatible
+        );
+        let error = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        assert_eq!(request_error(Box::new(error)), DaemonError::NotRunning);
+        let error = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        assert!(matches!(
+            request_error(Box::new(error)),
+            DaemonError::Broken(_)
+        ));
+    }
 }

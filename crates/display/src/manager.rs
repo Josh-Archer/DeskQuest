@@ -176,6 +176,10 @@ impl VirtualDisplayManager {
         }
 
         base_config.validate()?;
+        // Locking the desktop can close compositor-owned virtual monitor sessions.
+        self.backend.refresh_monitors().await?;
+        let active_ids: HashSet<_> = self.backend.list_monitors().iter().map(|m| m.id).collect();
+        self.configs.retain(|c| active_ids.contains(&c.id));
         self.layout_mode = layout_mode;
         let current_count = self.configs.len() as u32;
 
@@ -470,5 +474,31 @@ mod tests {
             }
             Err(other) => panic!("unexpected error: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod session_recovery_tests {
+    use super::*;
+    use crate::backend::mock::MockDisplayBackend;
+
+    #[tokio::test]
+    async fn retry_recreates_an_output_lost_by_the_compositor() {
+        let mut manager = VirtualDisplayManager::new(Box::new(MockDisplayBackend::new()));
+        let config = VirtualMonitorConfig::preset_1440p(1, 90);
+        manager
+            .set_monitor_count(1, &config, DisplayLayoutMode::Horizontal)
+            .await
+            .unwrap();
+        // Simulate the compositor dropping its output independently of the manager.
+        manager.backend.destroy_monitor(1).await.unwrap();
+        assert_eq!(manager.configs.len(), 1);
+        let monitors = manager
+            .set_monitor_count(1, &config, DisplayLayoutMode::Horizontal)
+            .await
+            .unwrap();
+        assert_eq!(monitors.len(), 1);
+        assert_eq!(monitors[0].id, 1);
+        assert_eq!(manager.configs.len(), 1);
     }
 }

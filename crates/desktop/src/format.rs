@@ -23,7 +23,7 @@ pub fn connection_mode(mode: ClientConnectionMode) -> String {
 /// Whether video flows, and why not.
 pub fn streaming(status: &DaemonStatus) -> String {
     if status.video_streams == 0 {
-        "No video (the daemon could not start capture or the encoder)".to_string()
+        "No video yet (screen capture may be waiting for permission)".to_string()
     } else if !status.streaming_enabled {
         "Paused".to_string()
     } else if status.link == ClientConnectionMode::Disconnected {
