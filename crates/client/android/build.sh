@@ -110,9 +110,6 @@ echo "========================================================"
 # cmake-built dependencies (OpenXR loader, Opus) for this target use the NDK toolchain wrapper.
 export CMAKE_TOOLCHAIN_FILE_aarch64_linux_android="${CMAKE_TOOLCHAIN_FILE_aarch64_linux_android:-${SCRIPT_DIR}/ndk-cmake-toolchain.cmake}"
 
-# Bundled Opus still supports older CMake policies; CMake 4 needs this minimum.
-export CMAKE_POLICY_VERSION_MINIMUM="${CMAKE_POLICY_VERSION_MINIMUM:-3.5}"
-
 # Step 1: Compile native shared library with cargo-ndk
 echo "[1/6] Compiling native cdylib with cargo-ndk (arm64-v8a, API 30)..."
 cargo ndk -t arm64-v8a -P 30 build ${CARGO_PROFILE_FLAG} --locked --features mdns --manifest-path "${CLIENT_DIR}/Cargo.toml"
