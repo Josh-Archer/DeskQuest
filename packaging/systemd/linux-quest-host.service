@@ -1,6 +1,6 @@
 [Unit]
-Description=Linux Quest host daemon (virtual displays, input and clipboard streaming)
-Documentation=https://github.com/Josh-Archer/linux-quest
+Description=DeskQuest host daemon (virtual displays, input and clipboard streaming)
+Documentation=https://github.com/Josh-Archer/DeskQuest
 # Run only inside a graphical login, and stop with it.
 PartOf=graphical-session.target
 After=graphical-session.target pipewire.service

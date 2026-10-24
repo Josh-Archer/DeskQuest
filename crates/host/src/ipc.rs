@@ -189,12 +189,12 @@ pub fn daemon_runtime_dir() -> PathBuf {
     }
 }
 
-/// Returns the standard Unix domain socket path for the Linux Quest daemon.
+/// Returns the standard Unix domain socket path for the DeskQuest daemon.
 pub fn daemon_socket_path() -> PathBuf {
     daemon_runtime_dir().join("daemon.sock")
 }
 
-/// Returns the standard PID file path for the Linux Quest daemon.
+/// Returns the standard PID file path for the DeskQuest daemon.
 pub fn daemon_pid_path() -> PathBuf {
     daemon_runtime_dir().join("daemon.pid")
 }
@@ -270,7 +270,7 @@ pub async fn run_ipc_server_with(
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
     }
-    info!(path = ?socket_path, "Linux Quest daemon IPC socket bound (mode 0600)");
+    info!(path = ?socket_path, "DeskQuest daemon IPC socket bound (mode 0600)");
 
     loop {
         tokio::select! {

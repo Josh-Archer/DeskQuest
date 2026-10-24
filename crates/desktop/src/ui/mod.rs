@@ -280,16 +280,17 @@ impl Window {
                 if !self.banner.is_revealed() {
                     tracing::warn!(error = %e, "no answer from the daemon");
                 }
-                let installed = service_installed();
-                self.banner.set_title(&if installed {
+                let stopped = matches!(e, DaemonError::NotRunning);
+                let can_start = stopped && service_installed();
+                self.banner.set_title(&if can_start {
                     format!("{e}. Start it as a service?")
+                } else if stopped {
+                    format!("{e}. Install and start the DeskQuest host service.")
                 } else {
-                    format!(
-                        "{e}. Install it with `linux-quest-host service install --enable --start`"
-                    )
+                    e.to_string()
                 });
                 self.banner
-                    .set_button_label(installed.then_some("Start Service"));
+                    .set_button_label(can_start.then_some("Start Service"));
                 self.banner.set_revealed(true);
                 self.update_visible_page(None);
                 self.choose.set_sensitive(false);

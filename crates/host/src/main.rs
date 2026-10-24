@@ -33,7 +33,7 @@ use linux_quest_input::InputInjector as _;
     name = "linux-quest-host",
     author = "Josh Archer",
     version = "0.1.0",
-    about = "Linux Quest 3 VR Streaming Host & Virtual Display Daemon"
+    about = "DeskQuest VR Streaming Host & Virtual Display Daemon"
 )]
 struct Cli {
     /// Launch interactive terminal status dashboard directly
@@ -428,7 +428,7 @@ async fn run_service_command(args: ServiceArgs) -> Result<(), String> {
         ServiceCommands::Uninstall => {
             let removed = service::apply_uninstall(&unit_dir, &mut service::SystemctlRunner)?;
             if removed.is_empty() {
-                println!("No Linux Quest user units in {}", unit_dir.display());
+                println!("No DeskQuest user units in {}", unit_dir.display());
             }
             for path in removed {
                 println!("Removed {}", path.display());
@@ -630,6 +630,21 @@ fn spawn_display_map_refresh(
     });
 }
 
+/// Poll the control server while optional startup (including the portal dialog) is pending.
+/// If the server stops first, drop startup; if startup finishes, keep serving until shutdown.
+async fn serve_with_startup<S, F, T, E>(server: S, startup: F) -> (Option<T>, Result<(), E>)
+where
+    S: std::future::Future<Output = Result<(), E>>,
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(server);
+    tokio::select! {
+        biased;
+        result = &mut server => (None, result),
+        started = startup => (Some(started), server.await),
+    }
+}
+
 async fn start_video(
     args: &DaemonArgs,
     link: SharedLinkTracker,
@@ -792,10 +807,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             } else {
                 let socket = daemon_socket_path();
                 if !socket.exists() {
-                    eprintln!(
-                        "Error: Cannot connect to Linux Quest daemon at {:?}",
-                        socket
-                    );
+                    eprintln!("Error: Cannot connect to DeskQuest daemon at {:?}", socket);
                     eprintln!("Please start the host daemon first:");
                     eprintln!("  linux-quest-host daemon");
                     eprintln!("Or run the dashboard in simulation mode:");
@@ -876,7 +888,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             } else {
                 info!(
                     backend = host.backend_name().await,
-                    "Linux Quest host daemon starting"
+                    "DeskQuest host daemon starting"
                 );
 
                 let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
@@ -935,39 +947,46 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                 // Pause and resume, and the screen picker, for the IPC server.
                 let video_control = VideoControl::new();
-                let video = start_video(
-                    &daemon_args,
-                    link.clone(),
-                    keyframe_requests,
-                    rate.clone(),
-                    usb_video_tx,
-                    video_control.clone(),
-                )
-                .await;
-
-                // Advertise only the ports that were really bound above.
-                let listening = match (control_port, input_port) {
-                    (Some(control), Some(input)) => {
-                        Some(linux_quest_host::advertise::ListeningPorts { control, input })
-                    }
-                    _ => None,
-                };
-                let advertiser = linux_quest_host::advertise::advertise_daemon_with_video(
-                    !daemon_args.no_advertise,
-                    linux_quest_host::advertise::system_instance_name(),
-                    listening,
-                    video.as_ref().map(|v| v.video_port()),
-                )
-                .await;
-
+                // Serve status and monitor controls while the portal waits for permission.
+                // A shutdown or IPC bind failure must also cancel pending capture startup.
                 let ipc = IpcContext {
                     host,
-                    link,
+                    link: link.clone(),
                     headset,
-                    video: video_control,
-                    rate: video.is_some().then_some(rate),
+                    video: video_control.clone(),
+                    rate: (!daemon_args.no_video).then_some(rate.clone()),
                 };
-                let served = run_ipc_server_with(ipc, shutdown_rx).await;
+                let startup = async {
+                    let video = start_video(
+                        &daemon_args,
+                        link.clone(),
+                        keyframe_requests,
+                        rate.clone(),
+                        usb_video_tx,
+                        video_control.clone(),
+                    )
+                    .await;
+
+                    // Advertise only the ports that were really bound above.
+                    let listening = match (control_port, input_port) {
+                        (Some(control), Some(input)) => {
+                            Some(linux_quest_host::advertise::ListeningPorts { control, input })
+                        }
+                        _ => None,
+                    };
+                    let advertiser = linux_quest_host::advertise::advertise_daemon_with_video(
+                        !daemon_args.no_advertise,
+                        linux_quest_host::advertise::system_instance_name(),
+                        listening,
+                        video.as_ref().map(|v| v.video_port()),
+                    )
+                    .await;
+
+                    (video, advertiser)
+                };
+                let (started, served) =
+                    serve_with_startup(run_ipc_server_with(ipc, shutdown_rx), startup).await;
+                let (video, advertiser) = started.unwrap_or((None, None));
                 // The IPC server may have ended on its own; make sure the bridge stops too.
                 let _ = shutdown_tx.send(());
                 finish_adb_bridge(adb_handle).await;
@@ -1018,7 +1037,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Ok(resp) => resp,
                 Err(_) => {
                     eprintln!(
-                        "Error: Cannot connect to Linux Quest daemon at {:?}",
+                        "Error: Cannot connect to DeskQuest daemon at {:?}",
                         daemon_socket_path()
                     );
                     eprintln!("Please start the host daemon first:");
@@ -1069,6 +1088,45 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 #[cfg(test)]
 mod tests {
+    use super::serve_with_startup;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn pending_capture_does_not_block_control_server_or_shutdown() {
+        let (started, result) = tokio::time::timeout(
+            Duration::from_secs(1),
+            serve_with_startup(async { Ok::<_, ()>(()) }, std::future::pending::<()>()),
+        )
+        .await
+        .expect("server must run before capture finishes");
+        assert!(started.is_none());
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn completed_capture_keeps_serving_until_shutdown() {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(serve_with_startup(
+            async {
+                stop_rx.await.unwrap();
+                Ok::<_, ()>(())
+            },
+            async {
+                ready_tx.send(()).unwrap();
+                42
+            },
+        ));
+        ready_rx.await.unwrap();
+        assert!(
+            !task.is_finished(),
+            "capture startup must not stop the daemon"
+        );
+        stop_tx.send(()).unwrap();
+        let (started, result) = task.await.unwrap();
+        assert_eq!(started, Some(42));
+        assert!(result.is_ok());
+    }
     use super::{wait_for_shutdown_signal, Cli, Commands};
     use clap::Parser;
     use tokio::signal::unix::{signal, SignalKind};

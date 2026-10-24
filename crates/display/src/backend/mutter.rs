@@ -264,7 +264,16 @@ impl VirtualDisplayBackend for MutterDisplayBackend {
         let session_path: zbus::zvariant::OwnedObjectPath = screencast_proxy
             .call("CreateSession", &(empty_props,))
             .await
-            .map_err(|e| DisplayError::Dbus(format!("ScreenCast.CreateSession failed: {e}")))?;
+            .map_err(|e| {
+                if e.to_string().contains("Session creation inhibited") {
+                    DisplayError::Dbus(
+                        "GNOME is blocking virtual monitor creation. Unlock your Linux desktop and try again."
+                            .into(),
+                    )
+                } else {
+                    DisplayError::Dbus(format!("ScreenCast.CreateSession failed: {e}"))
+                }
+            })?;
 
         let session_path_str = session_path.as_str().to_string();
 
