@@ -1,0 +1,63 @@
+{
+  "blender": "5.2.2 LTS",
+  "assets": {
+    "grip": {
+      "pixels": [
+        384,
+        32
+      ],
+      "width_m": 0.24,
+      "triangles": 7452,
+      "objects": [
+        "Grip / inset",
+        "Grip / silver shell",
+        "Grip / tactile rib 1",
+        "Grip / tactile rib 2",
+        "Grip / tactile rib 3",
+        "Grip / tactile rib 4",
+        "Grip / tactile rib 5",
+        "Grip / teal inlay -1",
+        "Grip / teal inlay 1"
+      ],
+      "rgba_bytes": 49152,
+      "sha256": "831e12bb66359b283a4c6305119e3efea780f0fe024c30ebf020c16d9193821c"
+    },
+    "corner": {
+      "pixels": [
+        128,
+        128
+      ],
+      "width_m": 0.07,
+      "triangles": 6684,
+      "objects": [
+        "Corner / graphite underside",
+        "Corner / graphite underside cap 0",
+        "Corner / graphite underside cap 1",
+        "Corner / inset guide",
+        "Corner / inset guide cap 0",
+        "Corner / inset guide cap 1",
+        "Corner / satin edge",
+        "Corner / satin edge cap 0",
+        "Corner / satin edge cap 1"
+      ],
+      "rgba_bytes": 65536,
+      "sha256": "4429495935aff87e0a073d465761e301ea08bf9e1441fc35edf2934b330cd4c2"
+    },
+    "cursor": {
+      "pixels": [
+        96,
+        96
+      ],
+      "width_m": 0.025,
+      "triangles": 4628,
+      "objects": [
+        "Pointer / contrast rim",
+        "Pointer / orientation inlay",
+        "Pointer / pearl ring",
+        "Pointer / precision dot"
+      ],
+      "rgba_bytes": 36864,
+      "sha256": "b6ca2e1f448c516f4cdd3a4103eb3b0aab4b6d66c0c7fff0cdb0cef9ea1e7a3e"
+    }
+  }
+}

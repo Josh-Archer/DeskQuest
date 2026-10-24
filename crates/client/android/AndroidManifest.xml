@@ -55,6 +55,8 @@
     </queries>
 
     <application
+        android:icon="@drawable/deskquest_logo"
+        android:logo="@drawable/deskquest_logo"
         android:label="linux-quest"
         android:hasCode="true"
         android:allowBackup="false">

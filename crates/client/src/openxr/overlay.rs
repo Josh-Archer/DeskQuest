@@ -10,7 +10,7 @@ use crate::spatial::{Quat, ScreenPose, Vec3};
 /// Ray texture size (width x height pixels). The ray runs along the texture's height.
 pub const RAY_TEXTURE: (u32, u32) = (16, 256);
 /// Cursor texture size.
-pub const CURSOR_TEXTURE: (u32, u32) = (64, 64);
+pub const CURSOR_TEXTURE: (u32, u32) = (96, 96);
 /// Rounded-rectangle mask that gives each screen Horizon's rounded corners: it sets the
 /// destination alpha the desktop layer is then blended by. Stretched to the screen, whose
 /// aspect it shares.
@@ -24,7 +24,7 @@ pub const RAY_MISS_LENGTH_M: f32 = 2.0;
 pub const CURSOR_SIZE_M: f32 = 0.025;
 
 // Window chrome, after Horizon OS's own windows: rounded corners and nothing else until a
-// pointer comes near an edge, then a thin white grab pill under the bottom edge, a soft
+// pointer comes near an edge, then a satin grab pill under the bottom edge, a soft
 // glowing line just outside a side or the top, or a short arc around a corner. Sizes are
 // fractions of the screen's width, so a resized screen keeps its proportions.
 
@@ -32,7 +32,7 @@ pub const CURSOR_SIZE_M: f32 = 0.025;
 pub const CORNER_RADIUS_FRAC: f32 = 0.03;
 
 /// Grab pill texture; its aspect is the pill's.
-pub const BAR_TEXTURE: (u32, u32) = (320, 16);
+pub const BAR_TEXTURE: (u32, u32) = (384, 32);
 /// Grab pill width, and its gap below the bottom edge, as fractions of the screen's width.
 pub const BAR_WIDTH_FRAC: f32 = 0.14;
 pub const BAR_GAP_FRAC: f32 = 0.03;
@@ -53,6 +53,41 @@ pub const ARC_GAP_FRAC: f32 = 0.022;
 pub const ARC_THICKNESS_FRAC: f32 = 0.006;
 /// Half the angle the arc spans around the corner.
 pub const ARC_HALF_SPAN_RAD: f32 = 0.55;
+
+// Array lengths enforce the swapchain dimensions at compile time. Sources are
+// top-down, straight-alpha RGBA8 exported by art/spatial-controls/pack.py.
+const GRIP_BAKE: &[u8; (BAR_TEXTURE.0 * BAR_TEXTURE.1 * 4) as usize] =
+    include_bytes!("../../assets/spatial-controls/grip.rgba");
+const CORNER_BAKE: &[u8; (CORNER_TEXTURE.0 * CORNER_TEXTURE.1 * 4) as usize] =
+    include_bytes!("../../assets/spatial-controls/corner.rgba");
+const CURSOR_BAKE: &[u8; (CURSOR_TEXTURE.0 * CURSOR_TEXTURE.1 * 4) as usize] =
+    include_bytes!("../../assets/spatial-controls/cursor.rgba");
+
+/// Handle opacity when revealed near an edge, before grabbing.
+pub const HANDLE_IDLE_ALPHA: f32 = 0.60;
+/// Handle opacity during manipulation; each state is cached in its own swapchain.
+pub const HANDLE_ACTIVE_ALPHA: f32 = 0.95;
+
+/// The compositor uses premultiplied alpha (UNPREMULTIPLIED_ALPHA is not set).
+/// Scale color as well as coverage so transparent edges do not glow on passthrough.
+fn premultiply(rgb: [u8; 3], alpha: u8) -> [u8; 4] {
+    let channel = |c: u8| ((u16::from(c) * u16::from(alpha) + 127) / 255) as u8;
+    [channel(rgb[0]), channel(rgb[1]), channel(rgb[2]), alpha]
+}
+
+fn baked_rgba(source: &[u8], opacity: f32) -> Vec<u8> {
+    let opacity = if opacity.is_finite() {
+        opacity.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let mut pixels = source.to_vec();
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        let alpha = (f32::from(pixel[3]) * opacity).round() as u8;
+        *pixel = premultiply([pixel[0], pixel[1], pixel[2]], alpha);
+    }
+    pixels
+}
 
 /// How far the soft frame reaches past the window's edge, as a fraction of its width.
 pub const FRAME_MARGIN_FRAC: f32 = 0.04;
@@ -198,26 +233,9 @@ pub fn ray_rgba() -> Vec<u8> {
     px
 }
 
-/// A white dot with a soft rim.
+/// A modeled ring with a precision dot and an open annulus.
 pub fn cursor_rgba() -> Vec<u8> {
-    let (w, h) = CURSOR_TEXTURE;
-    let mut px = vec![0u8; (w * h * 4) as usize];
-    for y in 0..h {
-        for x in 0..w {
-            let dx = (x as f32 + 0.5) / w as f32 - 0.5;
-            let dy = (y as f32 + 0.5) / h as f32 - 0.5;
-            let r = (dx * dx + dy * dy).sqrt() * 2.0;
-            put(
-                &mut px,
-                w,
-                x,
-                y,
-                [255, 255, 255],
-                1.0 - smoothstep(0.55, 1.0, r),
-            );
-        }
-    }
-    px
+    baked_rgba(CURSOR_BAKE, 1.0)
 }
 
 /// The screen mask: opaque inside a rounded rectangle filling the texture, clear in the
@@ -249,27 +267,9 @@ pub fn mask_rgba() -> Vec<u8> {
     px
 }
 
-/// The grab pill: a white capsule filling the texture. `alpha` is its opacity.
+/// The modeled satin grip with recessed face and raised ribs. `alpha` is its opacity.
 pub fn bar_rgba(alpha: f32) -> Vec<u8> {
-    let (w, h) = BAR_TEXTURE;
-    let mut px = vec![0u8; (w * h * 4) as usize];
-    let r = h as f32 / 2.0;
-    for y in 0..h {
-        for x in 0..w {
-            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-            let cx = fx.clamp(r, w as f32 - r);
-            let d = ((fx - cx).powi(2) + (fy - r).powi(2)).sqrt() - (r - 1.0);
-            put(
-                &mut px,
-                w,
-                x,
-                y,
-                [255, 255, 255],
-                alpha * (1.0 - smoothstep(-0.75, 0.75, d)),
-            );
-        }
-    }
-    px
+    baked_rgba(GRIP_BAKE, alpha)
 }
 
 /// An edge handle: a thin bright line in a soft glow, brightest in the middle and fading to
@@ -292,37 +292,11 @@ pub fn edge_rgba(alpha: f32) -> Vec<u8> {
     px
 }
 
-/// A resize handle for the top-left corner: a short white arc with round ends, concentric
+/// A modeled resize rail for the top-left corner with round ends, concentric
 /// with the screen's rounded corner and just outside it. The texture's centre is the centre
 /// of the corner's rounding. `alpha` is its opacity.
 pub fn corner_rgba(alpha: f32) -> Vec<u8> {
-    use std::f32::consts::{PI, TAU};
-    let (w, h) = CORNER_TEXTURE;
-    let mut px = vec![0u8; (w * h * 4) as usize];
-    // Lengths are fractions of the screen's width.
-    let side = corner_handle_frac();
-    let radius = CORNER_RADIUS_FRAC + ARC_GAP_FRAC + ARC_THICKNESS_FRAC * 0.5;
-    let half_thick = ARC_THICKNESS_FRAC * 0.5;
-    let aa = 0.75 * side / w as f32;
-    // Up and to the left (texture y grows downwards).
-    let centre_angle = (-1.0f32).atan2(-1.0);
-    for y in 0..h {
-        for x in 0..w {
-            let dx = ((x as f32 + 0.5) / w as f32 - 0.5) * side;
-            let dy = ((y as f32 + 0.5) / h as f32 - 0.5) * side;
-            let off = (dy.atan2(dx) - centre_angle + PI).rem_euclid(TAU) - PI;
-            let dist = if off.abs() <= ARC_HALF_SPAN_RAD {
-                ((dx * dx + dy * dy).sqrt() - radius).abs()
-            } else {
-                // Past an end of the arc: distance to its round cap.
-                let a = centre_angle + off.signum() * ARC_HALF_SPAN_RAD;
-                ((dx - radius * a.cos()).powi(2) + (dy - radius * a.sin()).powi(2)).sqrt()
-            };
-            let a = alpha * (1.0 - smoothstep(half_thick - aa, half_thick + aa, dist));
-            put(&mut px, w, x, y, [255, 255, 255], a);
-        }
-    }
-    px
+    baked_rgba(CORNER_BAKE, alpha)
 }
 
 /// Bottom band of the screen, as a fraction of its height, where pointing shows the grab
@@ -839,5 +813,84 @@ mod tests {
         assert!(window_chrome(&screen, None, false, Some((0.0, 0.0)))
             .frame
             .is_some());
+    }
+    #[test]
+    fn compositor_textures_are_premultiplied_and_have_clear_edges() {
+        for (pixels, (width, height)) in [
+            (cursor_rgba(), CURSOR_TEXTURE),
+            (bar_rgba(HANDLE_IDLE_ALPHA), BAR_TEXTURE),
+            (bar_rgba(HANDLE_ACTIVE_ALPHA), BAR_TEXTURE),
+            (corner_rgba(HANDLE_IDLE_ALPHA), CORNER_TEXTURE),
+            (corner_rgba(HANDLE_ACTIVE_ALPHA), CORNER_TEXTURE),
+            (ray_rgba(), RAY_TEXTURE),
+            (edge_rgba(0.6), EDGE_TEXTURE),
+        ] {
+            assert_eq!(pixels.len(), (width * height * 4) as usize);
+            for pixel in pixels.as_chunks::<4>().0 {
+                assert!(pixel[..3].iter().all(|&channel| channel <= pixel[3]));
+                if pixel[3] == 0 {
+                    assert_eq!(pixel, &[0, 0, 0, 0], "no color in transparent texels");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn baked_resize_rail_matches_the_window_corner_geometry() {
+        let pixels = corner_rgba(1.0);
+        let (w, h) = CORNER_TEXTURE;
+        let radius = CORNER_RADIUS_FRAC + ARC_GAP_FRAC + ARC_THICKNESS_FRAC * 0.5;
+        let alpha_at = |offset: f32, r: f32| {
+            let angle = -3.0 * std::f32::consts::FRAC_PI_4 + offset;
+            let x = ((0.5 + r * angle.cos() / corner_handle_frac()) * w as f32) as u32;
+            let y = ((0.5 + r * angle.sin() / corner_handle_frac()) * h as f32) as u32;
+            pixels[((y * w + x) * 4 + 3) as usize]
+        };
+        for offset in [-0.8 * ARC_HALF_SPAN_RAD, 0.0, 0.8 * ARC_HALF_SPAN_RAD] {
+            assert!(
+                alpha_at(offset, radius) > 200,
+                "rail follows the rounded corner"
+            );
+            assert_eq!(
+                alpha_at(offset, CORNER_RADIUS_FRAC),
+                0,
+                "screen stays clear"
+            );
+        }
+        for offset in [-1.0, 1.0] {
+            assert_eq!(
+                alpha_at(offset * (ARC_HALF_SPAN_RAD + 0.2), radius),
+                0,
+                "rail ends before the adjacent edge"
+            );
+        }
+    }
+
+    #[test]
+    fn pointer_ring_leaves_space_around_the_exact_hit_visible() {
+        let pixels = cursor_rgba();
+        let (width, height) = CURSOR_TEXTURE;
+        let alpha = |x, y| pixels[((y * width + x) * 4 + 3) as usize];
+        assert!(alpha(width / 2, height / 2) > 200, "precise center dot");
+        assert_eq!(alpha(width / 2 + width / 5, height / 2), 0, "open annulus");
+        assert!(
+            alpha(width / 2 + width / 3, height / 2) > 200,
+            "visible ring"
+        );
+    }
+
+    #[test]
+    fn handle_states_preserve_coverage_and_scale_color_with_opacity() {
+        for make in [bar_rgba, corner_rgba] {
+            let idle = make(HANDLE_IDLE_ALPHA);
+            let active = make(HANDLE_ACTIVE_ALPHA);
+            assert!(idle.iter().zip(&active).all(|(a, b)| a <= b));
+            assert!(idle.iter().zip(&active).any(|(a, b)| a < b));
+            for alpha in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+                assert!(make(alpha).iter().all(|&channel| channel == 0));
+            }
+            assert_eq!(make(2.0), make(1.0));
+        }
+        assert_eq!(premultiply([200, 100, 50], 128), [100, 50, 25, 128]);
     }
 }
