@@ -1,13 +1,13 @@
-//! The Linux Quest logo with a connection badge, embedded as small RGBA buffers.
+//! The DeskQuest logo with a connection badge, embedded as small RGBA buffers.
 //! No image decoder, installed icon theme, or filesystem access is needed.
 
 use super::model::ConnectionState;
 
 pub const ICON_SIZES: [u32; 2] = [22, 32];
 const LOGO_22: &[u8; 22 * 22 * 4] =
-    include_bytes!("../../../../packaging/icons/tray/linux-quest-22.rgba");
+    include_bytes!("../../../../packaging/icons/tray/deskquest-22.rgba");
 const LOGO_32: &[u8; 32 * 32 * 4] =
-    include_bytes!("../../../../packaging/icons/tray/linux-quest-32.rgba");
+    include_bytes!("../../../../packaging/icons/tray/deskquest-32.rgba");
 
 const BLUE: [u8; 3] = [0x00, 0x64, 0xed];
 const CYAN: [u8; 3] = [0x00, 0xd2, 0xf0];

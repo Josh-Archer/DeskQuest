@@ -168,14 +168,21 @@ pub const MAX_IPC_FRAME_SIZE: usize = 1024 * 1024;
 /// Overrides [`daemon_runtime_dir`] (for a test or demo daemon next to the real one).
 pub const RUNTIME_DIR_ENV: &str = "LINUX_QUEST_RUNTIME_DIR";
 
-/// Returns the private runtime directory for the Linux Quest daemon:
-/// `$LINUX_QUEST_RUNTIME_DIR` if set, else `$XDG_RUNTIME_DIR/linux-quest`.
+/// Returns the private runtime directory for the DeskQuest daemon:
+/// `$LINUX_QUEST_RUNTIME_DIR` if set, else the active DeskQuest socket directory when present,
+/// falling back to `$XDG_RUNTIME_DIR/linux-quest` for older installs.
 pub fn daemon_runtime_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os(RUNTIME_DIR_ENV).filter(|d| !d.is_empty()) {
         return PathBuf::from(dir);
     }
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        Path::new(&runtime_dir).join("linux-quest")
+        let runtime_dir = Path::new(&runtime_dir);
+        let deskquest_dir = runtime_dir.join("deskquest");
+        if deskquest_dir.join("daemon.sock").exists() {
+            deskquest_dir
+        } else {
+            runtime_dir.join("linux-quest")
+        }
     } else {
         let uid = unsafe { libc::getuid() };
         PathBuf::from(format!("/tmp/linux-quest-{uid}"))

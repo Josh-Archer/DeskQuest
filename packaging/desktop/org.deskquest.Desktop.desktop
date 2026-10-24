@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=Linux Quest
+Name=DeskQuest
 Comment=Arrange your Quest's screens and change what the headset shows
-Exec=linux-quest
-Icon=org.linuxquest.Desktop
+Exec=deskquest
+Icon=org.deskquest.Desktop
 Terminal=false
 Categories=Settings;HardwareSettings;GTK;
 Keywords=VR;Quest;Headset;Streaming;Monitor;

@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <gresources>
-  <gresource prefix="/org/linuxquest/Desktop/icons">
-    <file alias="512x512/apps/org.linuxquest.Desktop.png">hicolor/512x512/apps/org.linuxquest.Desktop.png</file>
+  <gresource prefix="/org/deskquest/Desktop/icons">
+    <file alias="hicolor/512x512/apps/org.deskquest.Desktop.png">hicolor/512x512/apps/org.deskquest.Desktop.png</file>
   </gresource>
-  <gresource prefix="/org/linuxquest/Desktop">
+  <gresource prefix="/org/deskquest/Desktop">
     <file alias="theme.css">src/theme.css</file>
     <file alias="theme-modern.css">src/theme-modern.css</file>
   </gresource>

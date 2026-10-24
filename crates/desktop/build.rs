@@ -7,10 +7,10 @@ fn main() {
     println!("cargo:rerun-if-changed={manifest}");
     println!("cargo:rerun-if-changed=src/theme.css");
     println!("cargo:rerun-if-changed=src/theme-modern.css");
-    println!("cargo:rerun-if-changed={icons}/hicolor/512x512/apps/org.linuxquest.Desktop.png");
+    println!("cargo:rerun-if-changed={icons}/hicolor/512x512/apps/org.deskquest.Desktop.png");
 
     let output = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"))
-        .join("linux-quest.gresource");
+        .join("deskquest.gresource");
     let status = Command::new("glib-compile-resources")
         .arg(manifest)
         .arg(format!("--sourcedir={icons}"))

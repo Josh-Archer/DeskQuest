@@ -591,6 +591,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e9de72ce2ad1f90dc62fa25f0f430ef85eb4b0d8fa0be4f30373bc40a21d28e"
 
 [[package]]
+name = "deskquest-desktop"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "gtk4",
+ "libadwaita",
+ "linux-quest-client",
+ "linux-quest-display",
+ "linux-quest-host",
+ "linux-quest-input",
+ "linux-quest-protocol",
+ "parking_lot",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1447,24 +1465,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "linux-quest-desktop"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "gtk4",
- "libadwaita",
- "linux-quest-client",
- "linux-quest-display",
- "linux-quest-host",
- "linux-quest-input",
- "linux-quest-protocol",
- "parking_lot",
  "tokio",
  "tracing",
  "tracing-subscriber",

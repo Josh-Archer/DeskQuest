@@ -142,7 +142,7 @@ impl ScreensPage {
             .icon_name("video-display-symbolic")
             .title("No Headset Layout")
             .description(
-                "Start the Linux Quest app on the headset. Its screens appear here once it \
+                "Start the DeskQuest app on the headset. Its screens appear here once it \
                  reports them to the host.",
             )
             .build();
@@ -447,16 +447,16 @@ impl ScreensPage {
             self.empty.set_description(Some(if identity.app_connected {
                 "Waiting for the headset to report its screen layout."
             } else {
-                "USB is available. Start Linux Quest on the headset and connect the host to see its screen layout."
+                "USB is available. Start DeskQuest on the headset and connect the host to see its screen layout."
             }));
         } else {
             self.empty_preview.widget().set_visible(false);
             self.empty.set_icon_name(Some("video-display-symbolic"));
             self.empty.set_title("No Headset Layout");
             self.empty.set_description(Some(if *self.usb.borrow() == UsbDetection::Multiple {
-                "Multiple Quest headsets are visible over USB. Connect one through its Linux Quest app to select its layout."
+                "Multiple Quest headsets are visible over USB. Connect one through its DeskQuest app to select its layout."
             } else {
-                "Start Linux Quest on the headset. Its model and screens appear here when it connects."
+                "Start DeskQuest on the headset. Its model and screens appear here when it connects."
             }));
         }
         {

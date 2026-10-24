@@ -272,7 +272,7 @@ where
                 if let Err(err) = spawned {
                     warn!(
                         error = %err,
-                        "could not open the Linux Quest app; install it with \
+                        "could not open the DeskQuest app; install it with \
                          `cargo install --path crates/desktop`"
                     );
                 }
@@ -748,7 +748,7 @@ mod tests {
         let calls = calls.lock();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "detached");
-        assert!(calls[0].1.program.ends_with("linux-quest"));
+        assert!(calls[0].1.program.ends_with("deskquest"));
     }
 
     #[test]

@@ -56,7 +56,7 @@ impl SettingsPage {
 
         let offline = adw::PreferencesGroup::builder()
             .description(
-                "The headset is not on the settings channel. Start the Linux Quest app on the \
+                "The headset is not on the settings channel. Start the DeskQuest app on the \
                  headset; it reaches the host over Wi-Fi or the USB cable. Until then only the \
                  host's bitrate can change.",
             )

@@ -16,7 +16,7 @@ use super::icon::{render_argb, ICON_SIZES};
 use super::model::{menu_entries, MenuEntry, TrayAction, TrayView, TRAY_TITLE};
 use crate::tui::TelemetrySource;
 
-const TRAY_ID: &str = "linux-quest-host";
+const TRAY_ID: &str = "deskquest-host";
 
 /// Runs the tray until the user picks Quit or the process receives SIGINT or SIGTERM.
 ///
@@ -37,7 +37,7 @@ where
     let mut term = signal(SignalKind::terminate())?;
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    info!(?interval, "linux-quest tray started");
+    info!(?interval, "DeskQuest tray started");
 
     loop {
         tokio::select! {
@@ -56,7 +56,7 @@ where
     }
 
     controller.shutdown().await;
-    info!("linux-quest tray stopped");
+    info!("DeskQuest tray stopped");
     Ok(())
 }
 
