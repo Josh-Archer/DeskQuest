@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:metavr="http://schemas.meta.com/metavr-sdk"
     package="com.linuxquest.client"
     android:versionCode="1"
     android:versionName="0.1.0"
@@ -8,6 +9,9 @@
     <uses-sdk
         android:minSdkVersion="32"
         android:targetSdkVersion="34" />
+    <metavr:uses-metavr-sdk metavr:minSdkVersion="69" metavr:targetSdkVersion="69" />
+    <permission android:name="com.linuxquest.client.MODE_SWITCH" android:protectionLevel="signature" />
+    <uses-permission android:name="com.linuxquest.client.MODE_SWITCH" />
 
     <!-- Permissions required for high-speed streaming -->
     <uses-permission android:name="android.permission.INTERNET" />
@@ -58,9 +62,35 @@
         android:label="linux-quest"
         android:hasCode="true"
         android:allowBackup="false">
+        <meta-data android:name="com.oculus.supportedDevices" android:value="quest3|questpro" />
+
+        <!-- Each presentation process owns its native activity context. -->
+        <activity
+            android:name=".HomePanelActivity"
+            android:label="DeskQuest"
+            android:theme="@android:style/Theme.Material.NoActionBar"
+            android:process=":home"
+            android:taskAffinity="com.linuxquest.client.home"
+            android:launchMode="singleTask"
+            android:screenOrientation="landscape"
+            android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|keyboard|keyboardHidden"
+            android:windowSoftInputMode="stateAlwaysHidden|adjustNothing"
+            android:exported="true">
+            <layout android:defaultWidth="1280dp" android:defaultHeight="800dp"
+                android:minWidth="640dp" android:minHeight="400dp" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="com.oculus.intent.category.2D" />
+                <category android:name="com.oculus.intent.category.VR_HOME_LAUNCHER" />
+                <category android:name="com.oculus.intent.category.OVERLAY_LAUNCHER" />
+            </intent-filter>
+        </activity>
 
         <activity
-            android:name="android.app.NativeActivity"
+            android:name=".VrActivity"
             android:label="linux-quest"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
             android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|smallestScreenSize|uiMode|locale|layoutDirection|fontScale|colorMode|touchscreen|mcc|mnc"
@@ -78,13 +108,9 @@
             <meta-data
                 android:name="com.oculus.vr.focusaware"
                 android:value="true" />
-            <meta-data
-                android:name="com.oculus.supportedDevices"
-                android:value="quest3|questpro" />
-
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="com.oculus.intent.category.VR" />
                 <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
             </intent-filter>

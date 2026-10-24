@@ -8,6 +8,7 @@ pub mod limits;
 pub mod pointer;
 pub mod pose;
 pub mod ray;
+pub mod scroll;
 pub mod transform;
 
 pub use arrangement::{
