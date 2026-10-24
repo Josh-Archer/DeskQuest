@@ -423,10 +423,22 @@ mod tests {
         assert!(!frame_empty.is_zero_copy());
     }
 
+    /// `AutoCapture` with no real capture streams the test pattern. Built without
+    /// `AutoCapture::new`: with `pipewire-screencast` on a desktop that has PipeWire, `new`
+    /// starts a real portal screen cast, which can show the share dialog and waits up to 300 s
+    /// for it. The real capture failing to start is covered by `auto::tests`.
     #[tokio::test]
     async fn test_auto_capture_initialization() {
-        let mut auto = AutoCapture::new(0, 1280, 720, 60);
+        let mut auto = AutoCapture::with_capture(
+            0,
+            1280,
+            720,
+            60,
+            None,
+            std::sync::Arc::new(UnknownScreenLock),
+        );
         auto.init().await.expect("Auto capture init failed");
+        assert_eq!(auto.backend_type(), CaptureBackendType::Synthetic);
         let frame = auto.capture_frame().await.expect("Capture frame failed");
         assert_eq!(frame.width, 1280);
         assert_eq!(frame.height, 720);

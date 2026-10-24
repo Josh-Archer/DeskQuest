@@ -328,21 +328,54 @@ mod tests {
         address: String,
     }
 
+    /// The test bus's config: the stock session config without its service directories.
+    /// With them, a call to a name nobody owns starts the installed service, so on a desktop
+    /// `missing_portal_is_unavailable` would start the real xdg-desktop-portal and its GNOME
+    /// backend on the test bus and ask them for a screen cast.
+    const BUS_CONFIG: &str = r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:tmpdir=/tmp</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+"#;
+
     impl Bus {
         fn start() -> Option<Self> {
-            let mut child = Command::new("dbus-daemon")
-                .args(["--session", "--nofork", "--print-address=1"])
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let config = std::env::temp_dir().join(format!(
+                "lq-test-bus-{}-{}.conf",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::write(&config, BUS_CONFIG).ok()?;
+            let started = Command::new("dbus-daemon")
+                .arg(format!("--config-file={}", config.display()))
+                .args(["--nofork", "--print-address=1"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
-                .spawn()
-                .ok()?;
+                .spawn();
+            let Ok(mut child) = started else {
+                let _ = std::fs::remove_file(&config);
+                return None;
+            };
+            // The daemon has read its config once it prints the address.
             let mut line = String::new();
-            BufReader::new(child.stdout.take()?)
-                .read_line(&mut line)
-                .ok()?;
+            let read = child
+                .stdout
+                .take()
+                .map(|out| BufReader::new(out).read_line(&mut line));
+            let _ = std::fs::remove_file(&config);
             let address = line.trim().to_owned();
-            if address.is_empty() {
+            if !matches!(read, Some(Ok(_))) || address.is_empty() {
                 let _ = child.kill();
+                let _ = child.wait();
                 return None;
             }
             Some(Self { child, address })
