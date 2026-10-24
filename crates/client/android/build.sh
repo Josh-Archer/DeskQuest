@@ -60,10 +60,17 @@ if [[ ! -f "${ANDROID_JAR}" ]]; then
     exit 1
 fi
 
+# Honor isolated build directories, including relative paths, before changing directory.
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${WORKSPACE_ROOT}/target}"
+if [[ "${CARGO_TARGET_DIR}" != /* ]]; then
+    CARGO_TARGET_DIR="${PWD}/${CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR
+
 # Parse arguments
 BUILD_MODE="debug"
 CARGO_PROFILE_FLAG=""
-TARGET_DIR="${WORKSPACE_ROOT}/target/aarch64-linux-android/debug"
+TARGET_DIR="${CARGO_TARGET_DIR}/aarch64-linux-android/debug"
 INSTALL_ON_DEVICE=false
 RUN_ON_DEVICE=false
 
@@ -72,7 +79,7 @@ for arg in "$@"; do
         --release)
             BUILD_MODE="release"
             CARGO_PROFILE_FLAG="--release"
-            TARGET_DIR="${WORKSPACE_ROOT}/target/aarch64-linux-android/release"
+            TARGET_DIR="${CARGO_TARGET_DIR}/aarch64-linux-android/release"
             ;;
         --install)
             INSTALL_ON_DEVICE=true
@@ -103,6 +110,9 @@ echo "========================================================"
 # cmake-built dependencies (OpenXR loader, Opus) for this target use the NDK toolchain wrapper.
 export CMAKE_TOOLCHAIN_FILE_aarch64_linux_android="${CMAKE_TOOLCHAIN_FILE_aarch64_linux_android:-${SCRIPT_DIR}/ndk-cmake-toolchain.cmake}"
 
+# Bundled Opus still supports older CMake policies; CMake 4 needs this minimum.
+export CMAKE_POLICY_VERSION_MINIMUM="${CMAKE_POLICY_VERSION_MINIMUM:-3.5}"
+
 # Step 1: Compile native shared library with cargo-ndk
 echo "[1/6] Compiling native cdylib with cargo-ndk (arm64-v8a, API 30)..."
 cargo ndk -t arm64-v8a -P 30 build ${CARGO_PROFILE_FLAG} --locked --features mdns --manifest-path "${CLIENT_DIR}/Cargo.toml"
@@ -128,6 +138,7 @@ rm -f "${UNALIGNED_APK}" "${ALIGNED_APK}" "${FINAL_APK}"
 echo "[2/6] Packaging APK manifest and resources with aapt..."
 "${AAPT}" package -F "${UNALIGNED_APK}" \
     -M "${SCRIPT_DIR}/AndroidManifest.xml" \
+    -S "${SCRIPT_DIR}/res" \
     -I "${ANDROID_JAR}" \
     -0 so \
     -f

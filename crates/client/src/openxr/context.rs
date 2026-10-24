@@ -848,16 +848,16 @@ impl OpenXrContext {
                 mask: tex(MASK_TEXTURE, mask_rgba())?,
                 frame: tex(frame_texture_size(16.0 / 9.0), frame_rgba(16.0 / 9.0))?,
                 bar: [
-                    tex(BAR_TEXTURE, bar_rgba(0.55))?,
-                    tex(BAR_TEXTURE, bar_rgba(0.95))?,
+                    tex(BAR_TEXTURE, bar_rgba(HANDLE_IDLE_ALPHA))?,
+                    tex(BAR_TEXTURE, bar_rgba(HANDLE_ACTIVE_ALPHA))?,
                 ],
                 edge: [
                     tex(EDGE_TEXTURE, edge_rgba(0.6))?,
                     tex(EDGE_TEXTURE, edge_rgba(1.0))?,
                 ],
                 corner: [
-                    tex(CORNER_TEXTURE, corner_rgba(0.75))?,
-                    tex(CORNER_TEXTURE, corner_rgba(1.0))?,
+                    tex(CORNER_TEXTURE, corner_rgba(HANDLE_IDLE_ALPHA))?,
+                    tex(CORNER_TEXTURE, corner_rgba(HANDLE_ACTIVE_ALPHA))?,
                 ],
             })
         })();
